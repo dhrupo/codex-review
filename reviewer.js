@@ -953,11 +953,12 @@ function clampConfidenceScore(score) {
 function normalizeConfidenceScore(rawScore, findings, context) {
   const reviewedFiles = context.reviewedFilesCount || 0;
   const deepReviewedFiles = context.codexReviewedFilesCount || 0;
-  const hasHighConfidenceFinding = findings.some((item) => item.confidence === 'high');
   const hasCriticalFinding = findings.some((item) => item.severity === 'critical');
-  const hasImportantFinding = findings.some((item) => item.severity === 'important' && item.confidence !== 'low');
+  const importantFindings = findings.filter((item) => item.severity === 'important');
+  const mediumFindings = findings.filter((item) => item.severity === 'medium');
   const isCodexReview = context.engine === 'codex' && !context.fallbackUsed;
   const isHeuristicOnly = context.engine === 'heuristic' || context.fallbackUsed;
+  const touchedHighRiskPaths = Boolean(context.highRiskTouched);
   let score = clampConfidenceScore(rawScore || buildConfidence(findings));
 
   if (!reviewedFiles) {
@@ -969,34 +970,43 @@ function normalizeConfidenceScore(rawScore, findings, context) {
       return 3;
     }
 
-    if (hasHighConfidenceFinding || hasImportantFinding || hasCriticalFinding) {
-      return 3;
+    if (hasCriticalFinding || importantFindings.length >= 2) {
+      return 2;
     }
 
+    return 3;
+  }
+
+  if (!isCodexReview) {
+    return clampConfidenceScore(score);
+  }
+
+  if (hasCriticalFinding || importantFindings.length >= 3) {
     return 2;
   }
 
-  if (isCodexReview) {
-    if (!findings.length) {
-      score = Math.max(score, context.reviewDepth === 'thorough' ? 4 : 3);
-    } else if (hasCriticalFinding) {
-      score = Math.max(score, 5);
-    } else if (hasImportantFinding || hasHighConfidenceFinding) {
-      score = Math.max(score, 4);
-    } else {
-      score = Math.max(score, 3);
+  if (findings.length) {
+    if (importantFindings.length || mediumFindings.length) {
+      return 3;
     }
 
-    if (context.reviewDepth === 'thorough' && deepReviewedFiles) {
-      score += 1;
-    }
-
-    if (deepReviewedFiles && deepReviewedFiles < reviewedFiles) {
-      score -= deepReviewedFiles < Math.min(3, reviewedFiles) ? 1 : 0;
-    }
+    return 3;
   }
 
-  return clampConfidenceScore(score);
+  if (touchedHighRiskPaths) {
+    return 4;
+  }
+
+  if (
+    context.reviewDepth === 'thorough' &&
+    deepReviewedFiles &&
+    deepReviewedFiles === reviewedFiles &&
+    reviewedFiles <= 2
+  ) {
+    return 5;
+  }
+
+  return 4;
 }
 
 function buildSummary(findings, scope, options) {
@@ -1834,7 +1844,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     fallbackUsed: report.fallbackUsed,
     reviewDepth: report.reviewDepth,
     reviewedFilesCount: report.scope.reviewedFiles.length,
-    codexReviewedFilesCount: report.scope.codexReviewedFiles ? report.scope.codexReviewedFiles.length : 0
+    codexReviewedFilesCount: report.scope.codexReviewedFiles ? report.scope.codexReviewedFiles.length : 0,
+    highRiskTouched: fileEntries.some((entry) => isHighRiskPath(entry.path, options.highRiskPaths))
   });
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit);
