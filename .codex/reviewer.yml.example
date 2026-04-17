@@ -1,0 +1,26 @@
+base: origin/dev
+mode: full
+engine: auto
+review_depth: thorough
+max_findings: 12
+focus_areas:
+  - security
+  - payments
+  - regression
+  - compatibility
+paths:
+  ignore:
+    - public/mix-manifest.json
+    - dist/**
+    - vendor/**
+    - builds/**
+  high_risk:
+    - src/Payments/**
+    - src/Integrations/**
+    - src/classes/**
+    - app/Http/**
+    - app/Services/**
+notes:
+  - Payment path changes should include verification for strict and non-strict flows.
+  - Webhook changes should be reviewed with verification and replay risks in mind.
+  - Settings or meta shape changes should be checked for backward compatibility.

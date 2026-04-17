@@ -67,6 +67,8 @@ codex-review --help
 
 Recommended for WPManageNinja dev machines.
 
+If you want the shortest teammate onboarding path, use [SETUP.md](./SETUP.md).
+
 ## Quick Start
 
 Go to the target plugin repository, then run:
@@ -253,6 +255,8 @@ For WPManageNinja repos, `origin/dev` is typically the correct default.
 ## Repo Config
 
 You can tune defaults with `.codex/reviewer.yml` inside the target repository.
+
+You can start by copying [`.codex/reviewer.yml.example`](./.codex/reviewer.yml.example).
 
 Example:
 

@@ -10,9 +10,11 @@
     "test": "node bin/review.js --help"
   },
   "files": [
+    ".codex/",
     "bin/",
     "reviewer.js",
     "README.md",
+    "SETUP.md",
     "CODEX_REVIEWER_PLAN.md",
     "LICENSE"
   ],
