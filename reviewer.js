@@ -96,11 +96,17 @@ const REVIEW_SCHEMA = {
           impact: {
             type: 'string'
           },
+          explanation: {
+            type: 'string'
+          },
+          verification: {
+            type: 'string'
+          },
           fix_direction: {
             type: 'string'
           }
         },
-        required: ['severity', 'confidence', 'file', 'line', 'title', 'evidence', 'impact', 'fix_direction'],
+        required: ['severity', 'confidence', 'file', 'line', 'title', 'evidence', 'impact', 'explanation', 'verification', 'fix_direction'],
         additionalProperties: false
       }
     }
@@ -698,6 +704,8 @@ function analyzeFile(context) {
       title: 'REST route is missing permission_callback',
       evidence: 'The file registers a REST route without an explicit permission callback.',
       impact: 'WordPress REST routes can become callable without the intended authorization boundary.',
+      explanation: 'Without a permission callback, authorization falls back to permissive behavior or unclear defaults. On plugin routes that mutate settings or expose submission data, that can turn a normal endpoint into an accidental privilege boundary bypass.',
+      verification: 'Confirm every register_rest_route() call in this change defines a permission_callback that rejects unauthorized users and matches the intended capability model.',
       fixDirection: 'Add a strict permission_callback for each registered route.'
     });
   }
@@ -715,6 +723,8 @@ function analyzeFile(context) {
         title: 'Mutation path does not show a capability check',
         evidence: 'The file mutates WordPress state and also reads request input, but no capability check was detected nearby.',
         impact: 'Request validation may rely only on routing or nonce checks, which is often too weak for admin mutations.',
+        explanation: 'Nonce checks only prove request origin, not user privilege. If this path updates options, post meta, or other persisted state, a missing capability gate can let the wrong authenticated user reach admin-only behavior.',
+        verification: 'Verify that the mutation path is protected by current_user_can() or an equivalent capability check before any write occurs.',
         fixDirection: 'Add an explicit current_user_can() check before mutation logic.'
       });
     }
@@ -728,6 +738,8 @@ function analyzeFile(context) {
         title: 'Request-driven mutation path does not show nonce verification',
         evidence: 'The file reads request input and mutates state, but no nonce verification helper was detected.',
         impact: 'Cross-site request risks increase when privileged state changes are not bound to a nonce.',
+        explanation: 'This pattern often appears in admin AJAX, webhook helpers, or settings update flows. If the request reaches a privileged mutation path without nonce verification, an attacker can sometimes induce an authenticated browser to perform unintended writes.',
+        verification: 'Check the request entry point and confirm it verifies a nonce before processing user-controlled input or persisting data.',
         fixDirection: 'Add check_ajax_referer() or wp_verify_nonce() at the request boundary.'
       });
     }
@@ -742,6 +754,8 @@ function analyzeFile(context) {
       title: 'Raw database query does not show prepare() usage',
       evidence: 'A $wpdb query call was found without a matching $wpdb->prepare() in the file.',
       impact: 'Interpolated SQL is easy to get wrong and can create injection or malformed query risks.',
+      explanation: 'Even when the current inputs seem trusted, SQL built without prepare() tends to become unsafe as code evolves. It also makes numeric casting and string escaping assumptions harder to audit in payment and reporting paths.',
+      verification: 'Inspect the exact query construction and confirm every dynamic value is either hard-cast or routed through $wpdb->prepare().',
       fixDirection: 'Route dynamic SQL values through $wpdb->prepare() before execution.'
     });
   }
@@ -755,6 +769,8 @@ function analyzeFile(context) {
       title: 'str_contains() may break older PHP targets',
       evidence: 'str_contains() requires newer PHP versions than some WordPress plugins still support.',
       impact: 'If the plugin still supports older PHP versions, this can become a fatal runtime error.',
+      explanation: 'WordPress plugin compatibility is often broader than the local development runtime. A helper that exists locally can still fatal on customer sites if the supported PHP floor is lower.',
+      verification: 'Check the repo minimum PHP version and release policy. If older versions are still supported, replace this with a compatibility-safe substring check.',
       fixDirection: 'Confirm the minimum PHP version or use a compatibility-safe substring check.'
     });
   }
@@ -769,6 +785,8 @@ function analyzeFile(context) {
       title: 'Changed code echoes request input directly',
       evidence: 'A changed line outputs a request variable directly with echo.',
       impact: 'Direct output of request data is a common XSS path.',
+      explanation: 'Request data is attacker-controlled by default. Echoing it directly into HTML, attributes, or inline scripts can turn a normal admin or frontend page into a stored or reflected XSS sink.',
+      verification: 'Check the rendering context and ensure the value is sanitized on input and escaped with the correct WordPress helper on output.',
       fixDirection: 'Sanitize on input and escape on output with the right WordPress helper.'
     });
   }
@@ -783,6 +801,8 @@ function analyzeFile(context) {
       title: 'Changed code reads request input without visible sanitization',
       evidence: 'A changed line accesses a request superglobal without a sanitizer on the same line.',
       impact: 'This often leads to unsafe persistence, unsafe SQL parameters, or unsafe rendering later.',
+      explanation: 'Boundary sanitization is easier to reason about than delayed sanitization. When raw request data travels deeper into payment, settings, or integration code, it becomes much harder to prove every downstream use is safe.',
+      verification: 'Trace this value from request read to persistence or rendering and confirm it is normalized immediately with the correct sanitizer or type cast.',
       fixDirection: 'Sanitize request data as close to the boundary as possible.'
     });
   }
@@ -798,6 +818,8 @@ function analyzeFile(context) {
         title: 'Review looped I/O or query work in changed logic',
         evidence: 'The changed code adds iteration in a file that also performs fetch, query, or remote work.',
         impact: 'Looped I/O often creates avoidable performance regressions or request fan-out.',
+        explanation: 'This pattern is easy to miss in review because the loop itself looks harmless, but once it wraps remote requests or database reads it can scale poorly with entry count or field count.',
+        verification: 'Estimate the worst-case loop size and confirm expensive work is cached, batched, or moved outside the iteration.',
         fixDirection: 'Check whether expensive work can be cached, batched, or moved outside the loop.'
       });
     }
@@ -812,6 +834,8 @@ function analyzeFile(context) {
       title: 'New high-risk file should get focused review coverage',
       evidence: 'The change introduces a new high-risk path in the repository.',
       impact: 'New auth, routing, service, or persistence code usually deserves targeted verification before merge.',
+      explanation: 'Brand new high-risk files tend to have the highest chance of missing edge-case coverage because no previous behavior existed to constrain the implementation.',
+      verification: 'Confirm there is a manual test checklist or automated coverage for the key happy path, failure path, and permission path before PR.',
       fixDirection: 'Add or update tests and manually verify the changed path before opening a PR.'
     });
   }
@@ -947,8 +971,10 @@ function renderText(report) {
         lines.push(`${index + 1}. ${finding.title}`);
         lines.push(`   File: ${finding.file}:${finding.line}`);
         lines.push(`   Confidence: ${finding.confidence}`);
-        lines.push(`   Why: ${finding.impact}`);
         lines.push(`   Evidence: ${finding.evidence}`);
+        lines.push(`   Why it matters: ${finding.impact}`);
+        lines.push(`   Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
+        lines.push(`   What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
         lines.push(`   Fix: ${finding.fixDirection}`);
       });
     });
@@ -1007,6 +1033,8 @@ function renderMarkdown(report) {
     lines.push(`- File: \`${finding.file}:${finding.line}\``);
     lines.push(`- Evidence: ${finding.evidence}`);
     lines.push(`- Impact: ${finding.impact}`);
+    lines.push(`- Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
+    lines.push(`- What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
     lines.push(`- Fix direction: ${finding.fixDirection}`);
     lines.push('');
   });
@@ -1043,6 +1071,8 @@ function normalizeCodexFinding(finding) {
     title: finding.title,
     evidence: finding.evidence,
     impact: finding.impact,
+    explanation: finding.explanation,
+    verification: finding.verification,
     fixDirection: finding.fix_direction
   };
 }
@@ -1077,6 +1107,8 @@ function buildPrompt(payload) {
     'Do not emit style-only feedback.',
     'Do not speculate without evidence from the provided diff or file contents.',
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
+    'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
+    'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
     '',
     'Severity rules:',
     '- critical: confirmed security issue, destructive data corruption, or severe payment flaw',
@@ -1240,6 +1272,8 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
       title: 'High-risk changes landed without matching test changes',
       evidence: 'The current diff touches high-risk paths but does not include test file changes.',
       impact: 'Risky changes are harder to trust before PR review when no targeted verification moves with them.',
+      explanation: 'This does not prove the code is wrong, but it does mean a risky path changed without any nearby automated verification. In payment, auth, routing, or persistence code, that usually increases the chance of shipping a silent regression.',
+      verification: 'Add targeted tests or document the exact manual scenarios that were verified before opening the PR.',
       fixDirection: 'Add targeted tests or document the manual verification steps before opening the PR.'
     });
   }
@@ -1283,6 +1317,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     title: finding.title,
     evidence: finding.evidence,
     impact: finding.impact,
+    explanation: finding.explanation,
+    verification: finding.verification,
     fixDirection: finding.fixDirection
   }))).slice(0, options.maxFindings);
   const scope = summarizeScope(fileEntries, instructions);
