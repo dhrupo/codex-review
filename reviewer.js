@@ -91,6 +91,71 @@ const PRODUCT_PROFILES = {
       'question-type UI changes must preserve submit gating and cleanup behavior',
       'state transitions must still work on slow devices and large uploads'
     ]
+  },
+  'fluentforms-pdf': {
+    name: 'Fluent Forms PDF',
+    focus: [
+      'PDF template rendering, entry-to-document mapping, and output formatting stability',
+      'attachment/download generation paths and file naming/storage behavior',
+      'invoice/report template data completeness and formatting regressions'
+    ],
+    regressionChecks: [
+      'new template fields must be available in the template data map before rendering',
+      'PDF generation changes should preserve attachment/download and filename behavior',
+      'invoice/report formatting changes must be checked against totals, currencies, and empty-field handling'
+    ]
+  },
+  'multilingual-forms-fluent-forms-wpml': {
+    name: 'Fluent Forms WPML',
+    focus: [
+      'translation package registration, field mapping, and string synchronization',
+      'language-specific form metadata and translated submission/render behavior',
+      'WPML hook wiring without losing original-form fallback behavior'
+    ],
+    regressionChecks: [
+      'new translatable fields must be added to WPML package/string extraction paths',
+      'translation sync changes must preserve fallback to source-language data when translations are absent',
+      'form meta/key mapping changes must still keep translated and source forms aligned'
+    ]
+  },
+  'fluentform-signature': {
+    name: 'Fluent Forms Signature',
+    focus: [
+      'signature capture lifecycle, PNG/data URL generation, and persistence shape',
+      'frontend pad initialization and clear/redraw behavior',
+      'saved signature attachment or field-value compatibility with core Fluent Forms flows'
+    ],
+    regressionChecks: [
+      'signature field changes must preserve the stored payload format expected by submission/render flows',
+      'canvas/data URL handling must still work after clear, redraw, and empty-signature validation cases',
+      'frontend signature assets and field renderer hooks must stay aligned'
+    ]
+  },
+  'fluent-player': {
+    name: 'Fluent Player',
+    focus: [
+      'player initialization, shortcode/block attribute mapping, and frontend playback behavior',
+      'video source, subtitle, and chapter/metadata configuration round-trips',
+      'public asset bootstrap and browser-side player controls/state changes'
+    ],
+    regressionChecks: [
+      'new player settings must survive save/load and reach frontend initialization payloads',
+      'source/subtitle/chapter changes must keep player config and rendered UI in sync',
+      'asset/bootstrap changes must still initialize the player for shortcode and block paths'
+    ]
+  },
+  'fluent-player-pro': {
+    name: 'Fluent Player Pro',
+    focus: [
+      'Pro player feature wiring such as analytics, DRM/protected media, and premium UI overlays',
+      'free/pro shared player bootstrapping and config compatibility',
+      'paid or restricted playback flows where config mismatches break real users silently'
+    ],
+    regressionChecks: [
+      'Pro-only settings must extend, not break, the shared frontend player config contract',
+      'analytics/protection changes must preserve playback start, resume, and event reporting behavior',
+      'shared player changes should be checked against both free and pro feature entry points'
+    ]
   }
 };
 const REVIEW_SCHEMA = {
@@ -965,6 +1030,108 @@ function buildProductSpecificFindings(options, reviewContext) {
           fixDirection: 'Guard the image.onload callback with the cleanup flag before creating Cropper and return early after teardown.'
         });
       }
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluentforms-pdf') {
+    const changedTemplateFiles = changedPathList.filter((filePath) => /template|invoice|report|pdf/i.test(filePath));
+    const changedGenerationFiles = changedPathList.filter((filePath) => /pdf|download|attachment|generator/i.test(filePath));
+
+    if (changedTemplateFiles.length && !changedGenerationFiles.some((filePath) => /data|mapper|provider/i.test(filePath))) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'app/Services',
+        line: 1,
+        title: 'Template changes may need matching PDF data-map updates',
+        explanation: 'In Fluent Forms PDF, template/UI changes often depend on a separate entry-to-template data map. If only the template/render side changes, documents can render with blank placeholders or partial totals even though the layout diff looks correct.',
+        verification: 'Check that any new placeholders, invoice fields, or report values are provided by the PDF data/preparation layer before rendering.',
+        fixDirection: 'Update the PDF data provider/mapping layer so every new template field is available at render time.'
+      });
+    }
+
+    if (changedGenerationFiles.length && !getChangedTestFiles(fileEntries).length) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'medium',
+        file: changedGenerationFiles[0],
+        line: 1,
+        title: 'PDF generation change needs output verification coverage',
+        evidence: 'The diff changes PDF template/generation paths, but there is no matching automated verification in the changed files.',
+        impact: 'PDF regressions are easy to miss in code review because the break often appears only in the generated file: wrong totals, missing placeholders, broken attachments, or malformed downloads.',
+        explanation: 'This plugin is output-driven. A code change can look safe while still breaking actual document generation, attachment naming, or template rendering for invoices and reports.',
+        verification: 'Generate at least one representative PDF after this change and verify totals, placeholders, attachment/download behavior, and empty-field handling.',
+        fixDirection: 'Add fixture-based PDF verification or document the exact generation scenarios checked before PR.'
+      });
+    }
+  }
+
+  if (productProfile.repoLabel === 'multilingual-forms-fluent-forms-wpml') {
+    const changedTranslationFiles = changedPathList.filter((filePath) => /wpml|translation|package|string|language/i.test(filePath));
+
+    if (changedTranslationFiles.length && !repoSearch(cwd, 'package|register_strings|translate|icl_', changedTranslationFiles)) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'low',
+        file: changedTranslationFiles[0],
+        line: 1,
+        title: 'Translation-path change does not show package/string registration updates',
+        evidence: 'The diff touches multilingual/WPML handling, but the changed files do not clearly show matching package or string registration logic.',
+        impact: 'A multilingual feature can look correct in source-language code while translated forms silently stop syncing labels, choices, or metadata.',
+        explanation: 'WPML integrations are contract-heavy: field changes usually need to reach package extraction and registration so translated content can round-trip. Missing that bridge often causes silent fallback to source language or stale translations.',
+        verification: 'Confirm new or changed form fields/metadata are still registered with WPML string/package extraction and render correctly in translated forms.',
+        fixDirection: 'Update the WPML package/string registration path so translated forms receive the changed data.'
+      });
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluentform-signature') {
+    const changedSignatureFiles = changedPathList.filter((filePath) => /signature|pad|canvas/i.test(filePath));
+
+    if (changedSignatureFiles.length && !getChangedTestFiles(fileEntries).length) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'medium',
+        file: changedSignatureFiles[0],
+        line: 1,
+        title: 'Signature workflow change needs payload-format verification',
+        evidence: 'The diff changes signature-related code without matching verification coverage.',
+        impact: 'Signature regressions often appear only after a real draw/clear/save cycle, where the stored PNG/data URL shape no longer matches what Fluent Forms expects for rendering or submission persistence.',
+        explanation: 'This add-on depends on a stable contract between frontend capture, stored signature payload, and later rendering/export. Changing any one side without verification can break saved signatures even if the field still renders.',
+        verification: 'Verify draw, clear, redraw, submit, and re-render behavior, and confirm the stored signature payload format is unchanged where downstream code expects it.',
+        fixDirection: 'Add or document end-to-end signature field verification for capture, persistence, and render paths.'
+      });
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluent-player' || productProfile.repoLabel === 'fluent-player-pro') {
+    const changedPlayerFiles = changedPathList.filter((filePath) => /player|subtitle|chapter|playlist|shortcode|block|analytics|drm/i.test(filePath));
+    const isProRepo = productProfile.repoLabel === 'fluent-player-pro';
+
+    if (changedPlayerFiles.length && !getChangedTestFiles(fileEntries).length) {
+      pushFinding(findings, {
+        severity: isProRepo ? 'important' : 'medium',
+        confidence: 'medium',
+        file: changedPlayerFiles[0],
+        line: 1,
+        title: `${productProfile.name} config change needs frontend playback verification`,
+        evidence: 'The diff changes player-facing config or runtime files without matching verification coverage.',
+        impact: 'Player regressions usually surface only in the browser: wrong source config, missing subtitles/chapters, failed initialization, or broken pro overlays/analytics after save.',
+        explanation: 'These repos are heavily config-contract driven. A mismatch between saved settings, shortcode/block attributes, and the frontend player bootstrap can leave the admin side looking correct while playback breaks for users.',
+        verification: 'Verify the changed player config on a real rendered player, including initialization, source loading, and any touched subtitle/chapter/analytics/protection path.',
+        fixDirection: 'Add product-specific playback verification or document the exact rendered-player scenarios checked before PR.'
+      });
+    }
+
+    if (isProRepo && changedPlayerFiles.length && !changedPathList.some((filePath) => /shared|common|base|bootstrap/i.test(filePath))) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'shared player bootstrap',
+        line: 1,
+        title: 'Pro player change may need a shared free/pro config compatibility check',
+        explanation: 'Fluent Player Pro often extends a shared frontend player contract. A Pro-only change can be locally correct but still diverge from the base config shape expected by the shared bootstrap path.',
+        verification: 'Check the same config keys against the shared/base player bootstrap to confirm the Pro extension still composes cleanly with the core player config.',
+        fixDirection: 'Validate the changed Pro config against the shared player bootstrap and align any diverging config keys or defaults.'
+      });
     }
   }
 
