@@ -2,76 +2,122 @@
 
 Internal pre-PR reviewer for WPManageNinja repositories.
 
-`codex-review` is meant to be run locally by developers before pushing code or opening a pull request. It compares your current branch or working tree against a base branch, loads repo context, and produces a review report focused on the kinds of issues that matter most in WPManageNinja codebases.
+`codex-review` is meant to be installed once on a developer machine and then run locally inside any supported WPManageNinja repo before pushing code or opening a pull request.
 
-This tool is intentionally optimized for:
+It is optimized for WPManageNinja product workflows, not for public general-purpose use.
 
-- WordPress plugin repositories
-- payment and subscription code paths
-- REST and AJAX handlers
-- settings, options, post meta, and data-shape regressions
-- nonce, capability, sanitization, and escaping issues
-- pre-PR review on repositories like Fluent Forms and Fluent Forms Pro
+## Who Should Use This
 
-It is not intended to be a polished public general-purpose reviewer.
+WPManageNinja developers working on:
+
+- `fluentform`
+- `fluentformpro`
+- `fluent-conversational-js`
+- `fluentforms-pdf`
+- `multilingual-forms-fluent-forms-wpml`
+- `fluentform-signature`
+- `fluent-player`
+- `fluent-player-pro`
 
 ## What It Does
 
-`codex-review` has two review layers:
+`codex-review` reviews your local branch or worktree against a base branch and produces a report designed to catch the kinds of regressions that matter in WPManageNinja products.
 
-1. Heuristic review
-   Fast local checks for common WordPress and WPManageNinja risks.
-2. Codex review
-   A deeper model-backed pass over the most relevant files in the current diff.
+It combines:
 
-You can run either engine directly, or use `auto` mode to prefer Codex and fall back to heuristics if Codex is unavailable or fails.
+- heuristic review for fast local product-aware checks
+- Codex-backed review for deeper reasoning over the most relevant changed files
+- recheck-aware output so a second run after fixes behaves like a follow-up review, not a fresh scan
+
+The report includes:
+
+- summary
+- merge stance
+- confidence score
+- key changes
+- findings
+- outside-diff follow-ups
+- prompt to fix each finding
+- prompt to fix all findings
+- recheck status against the previous local review
+
+## Supported Product Awareness
+
+The reviewer now applies repo-specific rules for WPManageNinja products.
+
+Examples:
+
+- `fluentform`
+  checks upload/crop settings producers, save-time settings persistence, and form-setting round-trips
+- `fluentformpro`
+  checks payment processor changes, product-specific verification gaps, Pro uploader/bootstrap wiring, and shared image-flow risks
+- `fluent-conversational-js`
+  checks crop modal lifecycle and async image-load race conditions
+- `fluentforms-pdf`
+  checks template/data-map mismatches and PDF output verification gaps
+- `multilingual-forms-fluent-forms-wpml`
+  checks WPML package/string registration risks
+- `fluentform-signature`
+  checks signature payload-format and draw/save/render workflow risks
+- `fluent-player`
+  checks player config/bootstrap/playback verification gaps
+- `fluent-player-pro`
+  checks Pro player config plus shared free/pro compatibility risks
 
 ## Requirements
 
 - Node.js 18+
 - `git`
-- Codex CLI installed and authenticated if you want the Codex-backed review path
+- Codex CLI installed and authenticated if you want model-backed review
 
-Heuristic-only review works without Codex CLI.
+Heuristic mode works without Codex CLI, but the recommended team workflow is to use the Codex engine.
 
-## Installation
+## Team Installation
 
-### Option 1: Local clone for development
+Each WPManageNinja developer should do this once on their machine.
+
+### 1. Clone the repo
 
 ```bash
 git clone https://github.com/dhrupo/codex-review.git
 cd codex-review
-npm install
 ```
 
-Run directly:
-
-```bash
-node bin/review.js --help
-```
-
-### Option 2: Link globally on your machine
-
-From inside the cloned `codex-review` repository:
+### 2. Install dependencies
 
 ```bash
 npm install
+```
+
+### 3. Link the command globally
+
+```bash
 npm link
 ```
 
-Then you can run:
+Now this should work from any supported repo:
 
 ```bash
 codex-review --help
 ```
 
-Recommended for WPManageNinja dev machines.
+### 4. Confirm Codex CLI is installed
 
-If you want the shortest teammate onboarding path, use [SETUP.md](./SETUP.md).
+```bash
+codex --help
+```
 
-## Quick Start
+If Codex CLI is not available yet, developers can still use:
 
-Go to the target plugin repository, then run:
+```bash
+codex-review --engine heuristic
+```
+
+For a shorter setup checklist, see [SETUP.md](./SETUP.md).
+
+## First Run
+
+Go into the target repository and run:
 
 ```bash
 codex-review --base origin/dev --engine codex --thorough
@@ -84,76 +130,64 @@ cd /path/to/fluentformpro
 codex-review --base origin/dev --engine codex --thorough
 ```
 
-If you want a faster first pass:
+Recommended default for most WPManageNinja repos:
 
-```bash
-codex-review --base origin/dev --engine heuristic
-```
-
-If you only want to review staged changes:
-
-```bash
-codex-review --staged --engine codex
-```
+- base: `origin/dev`
+- engine: `codex`
+- depth: `--thorough`
 
 ## Recommended WPManageNinja Workflow
 
-### For Fluent Forms / Fluent Forms Pro style repos
+Use this before asking for review or opening a PR.
 
-Use this before opening a PR:
+1. Make your code changes.
+2. Run:
 
 ```bash
 codex-review --base origin/dev --engine codex --thorough
 ```
 
-Use this for a quick first pass while still coding:
+3. Fix the findings.
+4. Commit your changes.
+5. Run the same command again.
+6. Read the recheck section:
+   - cleared findings
+   - still-present findings
+   - newly introduced findings
+7. When the report is clean enough, push and open/update the PR.
 
-```bash
-codex-review --base origin/dev --engine heuristic
-```
-
-### When to run it
-
-- before commit when touching payment logic
-- before push when changing auth, nonce, capability, or route logic
-- before PR when changing settings, persistence, integrations, exports, or payment flows
-
-### Practical guidance
-
-- Use `origin/dev` as the base for WPManageNinja repos unless that repo has a different integration branch.
-- Use `--thorough` for payment, subscription, webhook, and security-sensitive changes.
-- Use `--report` if you want a markdown artifact you can attach to task notes or share with teammates.
+This mirrors the same workflow you already use with PR bots, but locally before the PR.
 
 ## Common Commands
 
-Basic local review:
+Basic review:
 
 ```bash
 codex-review --base origin/dev
 ```
 
-Force Codex-backed review:
+Codex-backed review:
 
 ```bash
 codex-review --base origin/dev --engine codex
 ```
 
-Heuristic-only review:
-
-```bash
-codex-review --base origin/dev --engine heuristic
-```
-
-Thorough Codex review:
+Thorough review:
 
 ```bash
 codex-review --base origin/dev --engine codex --thorough
 ```
 
-Security-focused pass:
+Fast heuristic pass:
 
 ```bash
-codex-review --base origin/dev --mode security --engine codex
+codex-review --base origin/dev --engine heuristic
+```
+
+Review only staged changes:
+
+```bash
+codex-review --staged --engine codex
 ```
 
 Write a markdown report:
@@ -174,75 +208,102 @@ Review only specific files:
 codex-review --base origin/dev --files src/Payments/AjaxEndpoints.php,src/Payments/PaymentMethods/RazorPay/RazorPayProcessor.php
 ```
 
-## Output Formats
+## When Developers Should Run It
 
-### Text
+Run it before PR for any meaningful change.
 
-Default terminal output. Good for normal local use.
+Especially important for:
 
-### Markdown
+- payment and subscription logic
+- route, AJAX, REST, nonce, or capability changes
+- settings persistence and sanitization changes
+- uploader, crop, export, PDF, or attachment flows
+- multilingual/WPML mapping changes
+- signature capture or render changes
+- player config/bootstrap/playback changes
 
-Useful when you want a report artifact:
+## Understanding The Report
+
+The report is not just a pass/fail output.
+
+Important sections:
+
+- `Summary`
+  quick top-level judgment
+- `Merge stance`
+  `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`
+- `Confidence score`
+  calibrated to behave similarly to the current WPManageNinja PR bot pattern
+- `Key Changes`
+  what looks correct or intentional in the patch
+- `Findings`
+  actionable issues in the changed code
+- `Outside Diff Follow-ups`
+  closely related issues that may live outside the current diff
+- `Recheck Status`
+  what cleared, what remains, what is new
+
+## Confidence Score Meaning
+
+The confidence score is intentionally calibrated to feel similar to the existing review bot behavior in Fluent Forms repos.
+
+- `3/5`
+  the common case; reviewed code with some issues or meaningful caution
+- `4/5`
+  clean review with no meaningful issues, but not an extremely narrow trivial change
+- `5/5`
+  rare; very narrow and clean change with strong confidence
+- `2/5`
+  indicates significantly worse review health
+
+Do not read `3/5` as “bad.” In this workflow it is often the normal score.
+
+## Recheck Behavior
+
+`codex-review` stores previous review state locally so the next run can behave like a follow-up review.
+
+State location:
 
 ```bash
-codex-review --base origin/dev --format markdown --report codex-review.md
+~/.codex/codex-review/state/
 ```
 
-### JSON
+That lets the tool report:
 
-Useful for automation, experimentation, or comparing outputs:
+- cleared findings
+- still-present findings
+- new findings introduced since the previous run
+
+This is especially useful after:
+
+- fixing issues
+- making a new commit
+- running review again before re-requesting PR review
+
+## Repo Config
+
+Each target repo can include `.codex/reviewer.yml` for local defaults.
+
+Start from:
+
+- [`.codex/reviewer.yml.example`](./.codex/reviewer.yml.example)
+
+Typical usage:
 
 ```bash
-codex-review --base origin/dev --format json
+mkdir -p .codex
+cp /path/to/codex-review/.codex/reviewer.yml.example .codex/reviewer.yml
 ```
 
-## How To Read The Result
+For most WPManageNinja repos, the main useful defaults are:
 
-The report includes:
+- `base: origin/dev`
+- `engine: codex`
+- `review_depth: thorough`
 
-- `verdict`
-- `confidence`
-- `baseRef`
-- `mode`
-- `reviewDepth`
-- `engine`
-- `summary`
-- `findings`
+## Base Branch Behavior
 
-If Codex scope is narrowed for prompt-size control, the report also shows:
-
-- full changed file scope
-- `codexReviewedFiles` for the deep-review subset
-
-This is expected behavior on larger branches.
-
-## Engines
-
-- `auto`
-  Prefer Codex, fall back to heuristics on failure.
-- `codex`
-  Require a Codex-backed review.
-- `heuristic`
-  Run only local heuristic checks.
-
-## Review Depth
-
-- `balanced`
-  Narrower Codex scope for faster reviews.
-- `thorough`
-  Broader Codex scope for slower but deeper pre-PR review.
-
-Use `--thorough` for:
-
-- payment changes
-- webhook verification changes
-- auth/capability changes
-- settings persistence changes
-- security-sensitive fixes
-
-## Base Selection
-
-If no `--base` is passed, the reviewer prefers:
+If `--base` is not provided, the tool prefers:
 
 1. repo config `base`
 2. `origin/dev`
@@ -250,115 +311,46 @@ If no `--base` is passed, the reviewer prefers:
 4. `origin/main`
 5. `origin/master`
 
-For WPManageNinja repos, `origin/dev` is typically the correct default.
+For WPManageNinja product repos, `origin/dev` is usually correct.
 
-## Repo Config
+## Engine Modes
 
-You can tune defaults with `.codex/reviewer.yml` inside the target repository.
+- `auto`
+  prefer Codex, fall back to heuristics
+- `codex`
+  require Codex review
+- `heuristic`
+  local checks only
 
-You can start by copying [`.codex/reviewer.yml.example`](./.codex/reviewer.yml.example).
-
-Example:
-
-```yaml
-base: origin/dev
-mode: full
-engine: auto
-review_depth: balanced
-max_findings: 12
-focus_areas:
-  - security
-  - regression
-  - compatibility
-  - payments
-paths:
-  ignore:
-    - dist/**
-    - vendor/**
-    - builds/**
-  high_risk:
-    - app/Http/**
-    - app/Services/**
-    - src/Payments/**
-    - src/Integrations/**
-notes:
-  - Payments changes must be checked for subscription regressions.
-  - Webhook changes should be reviewed with strict verification expectations.
-```
-
-CLI flags override config values.
-
-## Recommended Config For Fluent Forms Pro
-
-```yaml
-base: origin/dev
-engine: auto
-review_depth: thorough
-max_findings: 12
-focus_areas:
-  - security
-  - payments
-  - regression
-paths:
-  ignore:
-    - public/mix-manifest.json
-    - builds/**
-    - vendor/**
-  high_risk:
-    - src/Payments/**
-    - src/Integrations/**
-    - src/classes/**
-notes:
-  - Payment path changes should include verification for strict and non-strict flows.
-```
-
-## Current Limitations
-
-- Large diffs may force Codex review to focus on a narrowed subset of files.
-- Heuristic mode is intentionally WordPress/WPManageNinja biased and can be noisy outside that context.
-- The tool does not post to GitHub. It is strictly a local pre-PR review tool.
-
-## Troubleshooting
-
-### Codex review does not run
-
-Check:
-
-- Codex CLI is installed
-- Codex CLI is authenticated
-- you are inside a git repository
-
-If needed, force heuristic mode:
+Recommended team default:
 
 ```bash
-codex-review --engine heuristic
+codex-review --base origin/dev --engine codex --thorough
 ```
 
-### Review is using the wrong base branch
+## Output Formats
 
-Pass the base explicitly:
+Text output is the normal default.
+
+Markdown output is useful for sharing:
 
 ```bash
-codex-review --base origin/dev
+codex-review --base origin/dev --engine codex --format markdown --report codex-review.md
 ```
 
-Or set it in `.codex/reviewer.yml`.
+JSON output is useful for automation or experiments:
 
-### Review is too broad or too slow
+```bash
+codex-review --base origin/dev --format json
+```
 
-Use:
+## Team Recommendation
 
-- `--engine heuristic` for a fast pass
-- `--files ...` to constrain scope
-- repo config `paths.ignore` to skip generated artifacts
+For WPManageNinja developers, the easiest adoption path is:
 
-## Internal Notes
+1. install once with `npm link`
+2. keep `codex-review` updated with `git pull`
+3. run it locally before PRs
+4. rerun after fixes until the recheck report looks acceptable
 
-This repository is meant for WPManageNinja internal use. The intended usage model is:
-
-- clone privately
-- `npm install`
-- `npm link`
-- run `codex-review` inside WPManageNinja repos
-
-See [CODEX_REVIEWER_PLAN.md](./CODEX_REVIEWER_PLAN.md) for the broader implementation direction.
+That gives the team a local reviewer that behaves much closer to your PR bot workflow, but catches issues before the PR is opened.

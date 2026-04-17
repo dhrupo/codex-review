@@ -2,6 +2,19 @@
 
 Quick setup for WPManageNinja developers.
 
+## Supported Repos
+
+This setup is intended for developers working on:
+
+- `fluentform`
+- `fluentformpro`
+- `fluent-conversational-js`
+- `fluentforms-pdf`
+- `multilingual-forms-fluent-forms-wpml`
+- `fluentform-signature`
+- `fluent-player`
+- `fluent-player-pro`
+
 ## 1. Clone the repo
 
 ```bash
@@ -21,7 +34,7 @@ npm install
 npm link
 ```
 
-Now this should work from any repository:
+Now this should work from anywhere:
 
 ```bash
 codex-review --help
@@ -29,28 +42,34 @@ codex-review --help
 
 ## 4. Confirm Codex CLI is available
 
-If you want the Codex-backed review path:
-
 ```bash
 codex --help
 ```
 
-If Codex is not available, `codex-review --engine heuristic` still works.
+If Codex is not installed yet, heuristic mode still works:
 
-## 5. Add repo config to the target repository
+```bash
+codex-review --engine heuristic
+```
 
-Inside the target plugin repository:
+## 5. Optional repo config in the target repo
+
+Inside the repo you want to review:
 
 ```bash
 mkdir -p .codex
 cp /path/to/codex-review/.codex/reviewer.yml.example .codex/reviewer.yml
 ```
 
-Then adjust the config if needed.
+Recommended defaults for most WPManageNinja repos:
+
+- `base: origin/dev`
+- `engine: codex`
+- `review_depth: thorough`
 
 ## 6. Run the reviewer
 
-Recommended command for WPManageNinja plugin repos:
+Recommended command:
 
 ```bash
 codex-review --base origin/dev --engine codex --thorough
@@ -62,7 +81,24 @@ Fast first pass:
 codex-review --base origin/dev --engine heuristic
 ```
 
-## 7. Optional markdown report
+## 7. Use it before PR and after fixes
+
+Recommended workflow:
+
+1. Make changes
+2. Run:
+
+```bash
+codex-review --base origin/dev --engine codex --thorough
+```
+
+3. Fix findings
+4. Commit
+5. Run the same command again
+6. Read the `Recheck Status` section
+7. Push or request PR review after blockers are cleared
+
+## 8. Optional markdown report
 
 ```bash
 codex-review --base origin/dev --engine codex --format markdown --report codex-review.md
@@ -70,6 +106,18 @@ codex-review --base origin/dev --engine codex --format markdown --report codex-r
 
 ## Notes
 
-- Use `origin/dev` for repos that flow into dev before PR merge.
-- Use `--thorough` for payment, webhook, auth, and persistence changes.
-- Use `--files` when you only want to review a narrow slice of a large branch.
+- For most WPManageNinja repos, `origin/dev` is the correct base.
+- Use `--thorough` for payments, auth, uploader/crop flows, export/PDF flows, multilingual mapping, and player config changes.
+- Review state is stored locally at:
+
+```bash
+~/.codex/codex-review/state/
+```
+
+- Update the tool later with:
+
+```bash
+cd /path/to/codex-review
+git pull
+npm install
+```
