@@ -52,6 +52,47 @@ const CODEX_FILE_LIMITS = {
   balanced: 12,
   thorough: 24
 };
+const PRODUCT_PROFILES = {
+  fluentform: {
+    name: 'Fluent Forms',
+    focus: [
+      'form setting round-trips through sanitizers and JS payload producers',
+      'route policy and capability enforcement on REST/admin mutations',
+      'public uploader and crop flow integration between PHP settings and frontend JS'
+    ],
+    regressionChecks: [
+      'new field settings must survive save-time sanitizers in app/Services/Form/Updater.php and app/Modules/Form/Form.php',
+      'frontend upload/crop flows must have a matching PHP producer or settings export path',
+      'uploader or crop UI changes must preserve runtime asset/bootstrap wiring'
+    ]
+  },
+  fluentformpro: {
+    name: 'Fluent Forms Pro',
+    focus: [
+      'payment acceptance, transaction totals, and subscription/payment workflow regressions',
+      'Pro uploader bootstrap and shared image/crop settings between input_image and featured_image',
+      'asset registration for bundled frontend libraries under public/'
+    ],
+    regressionChecks: [
+      'payment processor changes need evidence for both happy-path and mismatch-path payload shapes',
+      'crop/upload enhancements must wire both settings export and packaged asset bundles',
+      'changes in shared upload components should be checked against featured_image and other Pro-only renderers'
+    ]
+  },
+  'fluent-conversational-js': {
+    name: 'Fluent Conversational JS',
+    focus: [
+      'Vue 3 conversational question flows and question-type runtime behavior',
+      'crop modal lifecycle, async image handling, and cleanup race conditions',
+      'frontend-only regressions with no PHP safety net'
+    ],
+    regressionChecks: [
+      'image.onload and cropper creation must be guarded against late cleanup',
+      'question-type UI changes must preserve submit gating and cleanup behavior',
+      'state transitions must still work on slow devices and large uploads'
+    ]
+  }
+};
 const REVIEW_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object',
@@ -197,6 +238,11 @@ function safeReadFile(filePath) {
 
 function writeJsonFile(filePath, data) {
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+function getProductProfile(repoLabel) {
+  const profile = PRODUCT_PROFILES[repoLabel];
+  return profile ? { repoLabel, ...profile } : null;
 }
 
 function parseArgs(argv) {
@@ -526,6 +572,16 @@ function runGitQuiet(args, options = {}) {
   }
 }
 
+function repoSearch(cwd, pattern, fileGlobs = []) {
+  const args = ['grep', '-n', '-I', '-E', pattern];
+
+  if (fileGlobs.length) {
+    args.push('--', ...fileGlobs);
+  }
+
+  return runGitQuiet(args, { cwd });
+}
+
 function buildFileEntries(filePaths, statusByPath, ignorePaths, cwd) {
   const expandedPaths = [];
 
@@ -724,6 +780,199 @@ function pushFinding(findings, finding) {
     return;
   }
   findings.push(finding);
+}
+
+function pushOutsideDiffFinding(findings, finding) {
+  const key = [finding.file, finding.line, finding.title].join(':');
+  if (findings.some((item) => [item.file, item.line, item.title].join(':') === key)) {
+    return;
+  }
+  findings.push(finding);
+}
+
+function getChangedPathsSet(fileEntries) {
+  return new Set(fileEntries.map((entry) => entry.path));
+}
+
+function findChangedEntry(fileEntries, matcher) {
+  return fileEntries.find((entry) => matcher(entry.path));
+}
+
+function buildProductSpecificKeyChanges(reviewContext, findings) {
+  const { productProfile, fileEntries } = reviewContext;
+  const changes = [];
+
+  if (!productProfile) {
+    return changes;
+  }
+
+  const changedPaths = getChangedPathsSet(fileEntries);
+
+  if (productProfile.repoLabel === 'fluentformpro') {
+    if (Array.from(changedPaths).some((filePath) => filePath.includes('/Payments/PaymentMethods/'))) {
+      changes.push('Touches a payment gateway processor, so acceptance, mismatch handling, and stored transaction totals were reviewed as a single workflow.');
+    }
+
+    if (Array.from(changedPaths).some((filePath) => /Uploader|FeaturedImage|crop/i.test(filePath))) {
+      changes.push('Touches shared upload/crop behavior, so asset bootstrap and image-field wiring were treated as cross-component regression risks.');
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluentform') {
+    if (Array.from(changedPaths).some((filePath) => /file-uploader|Uploader|crop/i.test(filePath))) {
+      changes.push('Touches the public uploader crop flow, so save-time setting persistence and JS settings production were treated as part of the same feature path.');
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluent-conversational-js') {
+    if (Array.from(changedPaths).some((filePath) => /FileType\.vue$/i.test(filePath))) {
+      changes.push('Touches the conversational file-upload question type, so modal teardown and asynchronous image/cropper lifecycle behavior were reviewed together.');
+    }
+  }
+
+  if (!changes.length && findings.length) {
+    changes.push(`This repository matches the ${productProfile.name} profile, so the review emphasized ${productProfile.focus[0]}.`);
+  }
+
+  return changes.slice(0, 2);
+}
+
+function buildProductSpecificFindings(options, reviewContext) {
+  const findings = [];
+  const outsideDiffFindings = [];
+  const notes = [];
+  const { cwd, fileEntries, productProfile } = reviewContext;
+
+  if (!productProfile) {
+    return { findings, outsideDiffFindings, notes };
+  }
+
+  const changedPaths = getChangedPathsSet(fileEntries);
+  const changedPathList = Array.from(changedPaths);
+  const hasCropChange = changedPathList.some((filePath) => /crop|file-uploader|Uploader|FeaturedImage/i.test(filePath));
+  const hasPaymentProcessorChange = changedPathList.some((filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath));
+
+  if (productProfile.repoLabel === 'fluentform') {
+    const touchesUploaderSettingsContract = changedPathList.some((filePath) => /file-uploader\.js$|Component\.php$/i.test(filePath));
+    const referencesSettingsPayload = repoSearch(cwd, 'file_upload_settings|fluentform/file_upload_settings_for_js', [
+      'app/Modules/Component/Component.php',
+      'resources/assets/public/Pro/file-uploader.js'
+    ]);
+    const producerExists = repoSearch(cwd, "add_filter\\s*\\(\\s*['\"]fluentform/file_upload_settings_for_js['\"]");
+
+    if (touchesUploaderSettingsContract && referencesSettingsPayload && !producerExists) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: findChangedEntry(fileEntries, (filePath) => /Component\.php$/i.test(filePath))?.path || 'app/Modules/Component/Component.php',
+        line: 1,
+        title: 'Uploader settings payload has no producer for runtime crop configuration',
+        evidence: 'The changed uploader flow references the file_upload_settings payload, but the repository does not currently expose a matching add_filter() producer for fluentform/file_upload_settings_for_js.',
+        impact: 'The frontend crop flow can be wired correctly in JS but still never activate at runtime if the per-field settings payload is never produced on the PHP side.',
+        explanation: 'This is the same class of break where a feature appears complete in the diff but the data contract stops one step earlier. In Fluent Forms, upload-field runtime behavior often depends on PHP building a JS payload keyed by field name. If that producer is missing, the frontend waits on settings that never arrive.',
+        verification: 'Confirm the repo contains a producer that maps saved upload/crop field settings into file_upload_settings for the uploader runtime path.',
+        fixDirection: 'Add or update the PHP settings producer so the uploader receives per-field crop configuration at runtime.'
+      });
+    }
+
+    const cropSettingKeysTouched = repoSearch(cwd, 'enable_crop|crop_mode|crop_ratio|crop_width|crop_height|enforce_image_dimensions', [
+      ...changedPathList
+    ]);
+    if (hasCropChange && cropSettingKeysTouched && !changedPaths.has('app/Services/Form/Updater.php') && !changedPaths.has('app/Modules/Form/Form.php')) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'important',
+        file: 'app/Services/Form/Updater.php',
+        line: 138,
+        title: 'New crop settings may still be stripped during form save',
+        explanation: 'Fluent Forms persists field settings through sanitizer/whitelist logic in the form update path. When new crop keys are introduced in UI/runtime code but the save-time whitelist is untouched, forms can appear to support the feature until the next edit/save silently removes those settings.',
+        verification: 'Check both app/Services/Form/Updater.php and app/Modules/Form/Form.php to confirm the new crop settings are preserved and sanitized during form save.',
+        fixDirection: 'Mirror any new upload/crop setting keys into the save-time field settings whitelist and sanitization logic.'
+      });
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluentformpro') {
+    if (hasCropChange && repoSearch(cwd, 'Cropper|cropperjs', changedPathList) && !repoSearch(cwd, 'cropper\\.min\\.(js|css)|fluentform-cropperjs', [
+      'fluentformpro.php',
+      'public/libs/cropperjs/cropper.min.js',
+      'public/libs/cropperjs/cropper.min.css'
+    ])) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'medium',
+        file: findChangedEntry(fileEntries, (filePath) => /Uploader|FeaturedImage|crop/i.test(filePath))?.path || 'fluentformpro.php',
+        line: 1,
+        title: 'Crop UI changes do not show a matching bundled asset/bootstrap path',
+        evidence: 'The changed Pro uploader flow references Cropper-based behavior, but the repo does not show the expected packaged cropper asset files or registration handles.',
+        impact: 'A working crop flow in component code still fails at runtime if the packaged JS/CSS bundle is missing or never enqueued on the rendered field path.',
+        explanation: 'Fluent Forms Pro relies on bundled public assets and explicit registration in fluentformpro.php. If a crop-capable uploader path changes without those packaged assets or handles lining up, the UI can render but never initialize for users.',
+        verification: 'Confirm public/libs/cropperjs assets exist in the packaged path and that fluentformpro.php registers/enqueues them for every affected upload renderer.',
+        fixDirection: 'Add the packaged cropper assets or update the registration/bootstrap path to the real built asset location.'
+      });
+    }
+
+    if (hasCropChange && changedPathList.some((filePath) => /UploaderSettings|input_image|crop/i.test(filePath)) && !changedPathList.some((filePath) => /FeaturedImage/i.test(filePath))) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'src/Components/Post/Components/FeaturedImage.php',
+        line: 1,
+        title: 'Shared crop/upload changes may not be wired through featured_image',
+        explanation: 'Fluent Forms Pro has multiple image-upload entry points. A crop-flow improvement that only touches input_image-side settings or bootstrapping can leave featured_image on the old path, creating inconsistent runtime behavior between two user-visible image components.',
+        verification: 'Check whether featured_image receives the same crop settings export and crop-capable uploader bootstrap as input_image after this change.',
+        fixDirection: 'Route featured_image through the same settings export and uploader bootstrap path, or document why it intentionally differs.'
+      });
+    }
+
+    if (hasPaymentProcessorChange && !getChangedTestFiles(fileEntries).length) {
+      const paymentEntry = findChangedEntry(fileEntries, (filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath));
+      if (paymentEntry) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          file: paymentEntry.path,
+          line: 1,
+          title: 'Payment processor change needs product-specific verification coverage',
+          evidence: 'A Fluent Forms Pro payment gateway file changed, but the diff does not include matching automated verification files or a product-specific test path.',
+          impact: 'Gateway processors sit directly on real checkout acceptance paths. Product-specific regressions here tend to show up only after live callbacks, redirect confirmations, or refund/reconciliation flows.',
+          explanation: 'For Fluent Forms Pro, generic code review is not enough on payment processors. The same code can pass a local read and still break strict mismatch handling, coupon-adjusted totals, recurring flags, or paid-total recalculation in real gateway payloads.',
+          verification: 'Verify the changed processor against the exact gateway payload shapes used by Fluent Forms Pro, including mismatch, redirect/callback, and persisted total behavior.',
+          fixDirection: 'Add product-specific payment verification or document the exact gateway scenarios covered before PR.'
+        });
+      }
+    }
+  }
+
+  if (productProfile.repoLabel === 'fluent-conversational-js') {
+    const fileTypeEntry = findChangedEntry(fileEntries, (filePath) => /FileType\.vue$/i.test(filePath));
+    if (fileTypeEntry) {
+      const content = getCurrentContent(cwd, fileTypeEntry.path);
+      const hasImageOnload = /image\.onload\s*=/.test(content);
+      const hasCropperCreate = /new\s+Cropper\s*\(/.test(content);
+      const hasCleanupFlag = /isClosed|cleanedUp|destroyed|isDestroyed/.test(content);
+      const hasOnloadGuard = /image\.onload\s*=\s*\(\)\s*=>\s*\{\s*if\s*\(([^)]*(isClosed|cleanedUp|destroyed|isDestroyed))/s.test(content);
+
+      if (hasImageOnload && hasCropperCreate && hasCleanupFlag && !hasOnloadGuard) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          file: fileTypeEntry.path,
+          line: findLineNumber(content, /image\.onload\s*=/),
+          title: 'Crop modal image-load callback may outlive cleanup state',
+          evidence: 'The changed conversational file-upload flow creates Cropper inside image.onload while also tracking modal cleanup state, but the onload callback does not show an early return when cleanup already happened.',
+          impact: 'Users who close the crop dialog before the image finishes loading can still trigger late cropper creation against detached DOM, which causes flaky crop sessions or leaked instances on slower devices.',
+          explanation: 'This is a product-specific race in the conversational uploader because there is no PHP fallback or second render pass to hide it. If the modal closes first and the image finishes later, the late callback still executes unless it checks the cleanup flag before creating Cropper.',
+          verification: 'Close the crop dialog quickly on a large image or slow device and confirm no cropper instance is created after teardown.',
+          fixDirection: 'Guard the image.onload callback with the cleanup flag before creating Cropper and return early after teardown.'
+        });
+      }
+    }
+  }
+
+  if (productProfile.repoLabel && !findings.length && !outsideDiffFindings.length) {
+    notes.push(`Applied ${productProfile.name} product-specific review rules: ${productProfile.regressionChecks.join('; ')}.`);
+  }
+
+  return { findings, outsideDiffFindings, notes };
 }
 
 function analyzeFile(context) {
@@ -1602,6 +1851,9 @@ function buildPrompt(payload) {
     `Review mode: ${payload.mode}`,
     `Base ref: ${payload.baseRef}`,
     '',
+    'Product profile:',
+    JSON.stringify(payload.productProfile || null, null, 2),
+    '',
     'Priority focus areas:',
     JSON.stringify(payload.focusAreas, null, 2),
     '',
@@ -1724,6 +1976,7 @@ function runCodexReview(payload, options, cwd) {
 function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuristic', fallbackUsed = false) {
   const { baseRef, fileEntries, instructions, diffText } = reviewContext;
   const findings = [];
+  const outsideDiffFindings = [];
   const changedTestFiles = getChangedTestFiles(fileEntries);
 
   for (const entry of fileEntries) {
@@ -1758,6 +2011,22 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
     });
   }
 
+  const productReview = buildProductSpecificFindings(options, reviewContext);
+  productReview.findings.forEach((finding) => pushFinding(findings, finding));
+  productReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
+  notes.push(...productReview.notes);
+
+  if (
+    reviewContext.productProfile &&
+    reviewContext.productProfile.repoLabel === 'fluentformpro' &&
+    findings.some((finding) => finding.title === 'Payment processor change needs product-specific verification coverage')
+  ) {
+    const genericIndex = findings.findIndex((finding) => finding.title === 'High-risk changes landed without matching test changes');
+    if (genericIndex !== -1) {
+      findings.splice(genericIndex, 1);
+    }
+  }
+
   const rankedFindings = rankFindings(findings).slice(0, options.maxFindings);
   return {
     engine,
@@ -1768,9 +2037,9 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
     summary: buildSummary(rankedFindings, summarizeScope(fileEntries, instructions), {
       base: baseRef || '--staged'
     }),
-    keyChanges: [],
+    keyChanges: buildProductSpecificKeyChanges(reviewContext, rankedFindings),
     findings: rankedFindings,
-    outsideDiffFindings: []
+    outsideDiffFindings
   };
 }
 
@@ -1780,16 +2049,19 @@ function createReviewContext(options, cwd) {
   const instructions = getRepoInstructions(cwd, options.repoConfigPath);
   const diffText = getUnifiedDiff(cwd, baseRef, options, fileEntries.map((entry) => entry.path));
   const repoRoot = getRepoRoot(cwd);
+  const repoLabel = getRepoLabel(cwd);
+  const productProfile = getProductProfile(repoLabel);
 
   return {
     cwd,
     repoRoot,
+    productProfile,
     baseRef,
     fileEntries,
     instructions,
     diffText,
     reviewedCommit: getCurrentCommit(cwd),
-    repoLabel: getRepoLabel(cwd)
+    repoLabel
   };
 }
 
@@ -1914,6 +2186,7 @@ function createReviewReport(options, cwd = process.cwd()) {
     const payload = {
       mode: resolvedOptions.mode,
       baseRef: reviewContext.baseRef || '--staged',
+      productProfile: reviewContext.productProfile,
       focusAreas: resolvedOptions.focusAreas,
       instructions: reviewContext.instructions,
       heuristicHotspots: heuristicSeed.findings.slice(0, 8).map((finding) => ({
