@@ -32,12 +32,17 @@ const DEFAULT_CONFIG = {
   engine: 'auto',
   model: null,
   maxFindings: DEFAULT_MAX_FINDINGS,
+  base: null,
+  reviewDepth: 'balanced',
   focusAreas: [],
   ignorePaths: [],
   highRiskPaths: [],
   notes: []
 };
-const CODEX_FILE_LIMIT = 12;
+const CODEX_FILE_LIMITS = {
+  balanced: 12,
+  thorough: 24
+};
 const REVIEW_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object',
@@ -153,6 +158,7 @@ function parseArgs(argv) {
     failOn: null,
     engine: 'auto',
     model: null,
+    reviewDepth: 'balanced',
     help: false,
     version: false,
     _explicit: {}
@@ -168,6 +174,12 @@ function parseArgs(argv) {
 
     if (arg === '--version' || arg === '-v') {
       options.version = true;
+      continue;
+    }
+
+    if (arg === '--thorough') {
+      options.reviewDepth = 'thorough';
+      options._explicit.reviewDepth = true;
       continue;
     }
 
@@ -304,6 +316,19 @@ function parseArgs(argv) {
     if (arg.startsWith('--model=')) {
       options.model = arg.slice('--model='.length);
       options._explicit.model = true;
+      continue;
+    }
+
+    if (arg === '--review-depth' && argv[i + 1]) {
+      options.reviewDepth = argv[i + 1];
+      options._explicit.reviewDepth = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--review-depth=')) {
+      options.reviewDepth = arg.slice('--review-depth='.length);
+      options._explicit.reviewDepth = true;
     }
   }
 
@@ -311,7 +336,7 @@ function parseArgs(argv) {
 }
 
 function resolveDefaultBase(cwd) {
-  const candidates = ['origin/main', 'origin/master', 'origin/development', 'main', 'master', 'development'];
+  const candidates = ['origin/dev', 'origin/development', 'origin/main', 'origin/master', 'dev', 'development', 'main', 'master'];
 
   for (const candidate of candidates) {
     try {
@@ -359,9 +384,11 @@ function loadRepoConfig(cwd) {
   return {
     configPath,
     config: {
+      base: typeof parsed.base === 'string' ? parsed.base : DEFAULT_CONFIG.base,
       mode: typeof parsed.mode === 'string' ? parsed.mode : DEFAULT_CONFIG.mode,
       engine: typeof parsed.engine === 'string' ? parsed.engine : DEFAULT_CONFIG.engine,
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_CONFIG.model,
+      reviewDepth: typeof (parsed.review_depth || parsed.reviewDepth) === 'string' ? (parsed.review_depth || parsed.reviewDepth) : DEFAULT_CONFIG.reviewDepth,
       maxFindings: Math.max(1, parseInt(parsed.max_findings || parsed.maxFindings, 10) || DEFAULT_CONFIG.maxFindings),
       focusAreas: normalizeStringArray(parsed.focus_areas || parsed.focusAreas),
       ignorePaths: normalizeStringArray((parsed.paths && parsed.paths.ignore) || parsed.ignore_paths || parsed.ignorePaths),
@@ -374,9 +401,11 @@ function loadRepoConfig(cwd) {
 function resolveOptions(rawOptions, repoConfig) {
   const options = {
     ...rawOptions,
+    base: rawOptions._explicit.base ? rawOptions.base : (repoConfig.base || rawOptions.base),
     mode: rawOptions._explicit.mode ? rawOptions.mode : repoConfig.mode,
     engine: rawOptions._explicit.engine ? rawOptions.engine : repoConfig.engine,
     model: rawOptions._explicit.model ? rawOptions.model : repoConfig.model,
+    reviewDepth: rawOptions._explicit.reviewDepth ? rawOptions.reviewDepth : repoConfig.reviewDepth,
     maxFindings: rawOptions._explicit.maxFindings ? rawOptions.maxFindings : repoConfig.maxFindings
   };
 
@@ -869,6 +898,7 @@ function renderText(report) {
     `Confidence: ${report.confidenceScore}/5`,
     `Base: ${report.baseRef}`,
     `Mode: ${report.mode}`,
+    `Review Depth: ${report.reviewDepth}`,
     `Engine: ${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}`,
     '',
     report.summary
@@ -877,6 +907,11 @@ function renderText(report) {
   if (report.scope.reviewedFiles.length) {
     lines.push('', 'Files Reviewed:');
     report.scope.reviewedFiles.forEach((filePath) => lines.push(`- ${filePath}`));
+  }
+
+  if (report.scope.codexReviewedFiles && report.scope.codexReviewedFiles.length) {
+    lines.push('', 'Codex Deep Review Scope:');
+    report.scope.codexReviewedFiles.forEach((filePath) => lines.push(`- ${filePath}`));
   }
 
   if (report.notes.length) {
@@ -924,6 +959,7 @@ function renderMarkdown(report) {
     `- Confidence: \`${report.confidenceScore}/5\``,
     `- Base: \`${report.baseRef}\``,
     `- Mode: \`${report.mode}\``,
+    `- Review depth: \`${report.reviewDepth}\``,
     `- Engine: \`${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}\``,
     '',
     report.summary
@@ -932,6 +968,11 @@ function renderMarkdown(report) {
   if (report.scope.reviewedFiles.length) {
     lines.push('', '## Files Reviewed', '');
     report.scope.reviewedFiles.forEach((filePath) => lines.push(`- \`${filePath}\``));
+  }
+
+  if (report.scope.codexReviewedFiles && report.scope.codexReviewedFiles.length) {
+    lines.push('', '## Codex Deep Review Scope', '');
+    report.scope.codexReviewedFiles.forEach((filePath) => lines.push(`- \`${filePath}\``));
   }
 
   if (report.scope.instructions.length) {
@@ -1108,7 +1149,8 @@ function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
 
   reviewContext.fileEntries.forEach((entry) => tryAdd(entry.path));
 
-  return selected.slice(0, CODEX_FILE_LIMIT);
+  const limit = options.reviewDepth === 'thorough' ? CODEX_FILE_LIMITS.thorough : CODEX_FILE_LIMITS.balanced;
+  return selected.slice(0, limit);
 }
 
 function runCodexReview(payload, options, cwd) {
@@ -1241,6 +1283,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     confidenceScore: reviewResult.confidenceScore || buildConfidence(rankedFindings),
     baseRef: baseRef || '--staged',
     mode: options.mode,
+    reviewDepth: options.reviewDepth,
     engine: reviewResult.engine,
     fallbackUsed: Boolean(reviewResult.fallbackUsed),
     notes: reviewResult.notes || [],
@@ -1254,6 +1297,10 @@ function buildFinalReport(options, reviewContext, reviewResult) {
       testsChanged: getChangedTestFiles(fileEntries).length
     }
   };
+
+  if (reviewResult.codexReviewedFiles && reviewResult.codexReviewedFiles.length) {
+    report.scope.codexReviewedFiles = reviewResult.codexReviewedFiles;
+  }
 
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
@@ -1312,7 +1359,7 @@ function createReviewReport(options, cwd = process.cwd()) {
     const selectedDiff = getUnifiedDiff(cwd, reviewContext.baseRef, resolvedOptions, selectedEntries.map((entry) => entry.path));
 
     if (selectedEntries.length < reviewContext.fileEntries.length) {
-      notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for prompt size control.`);
+      notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for ${resolvedOptions.reviewDepth} review depth.`);
     }
 
     const payload = {
@@ -1338,6 +1385,7 @@ function createReviewReport(options, cwd = process.cwd()) {
     try {
       const codexResult = runCodexReview(payload, resolvedOptions, cwd);
       codexResult.notes = notes.slice();
+      codexResult.codexReviewedFiles = selectedEntries.map((entry) => entry.path);
       return buildFinalReport(resolvedOptions, reviewContext, codexResult);
     } catch (error) {
       if (resolvedOptions.engine === 'codex') {

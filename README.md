@@ -22,6 +22,7 @@ Useful variants:
 node bin/review.js --staged
 node bin/review.js --engine codex
 node bin/review.js --engine heuristic
+node bin/review.js --base origin/dev --engine codex --thorough
 node bin/review.js --mode security
 node bin/review.js --model gpt-5.4
 node bin/review.js --format markdown --report codex-review.md
@@ -41,6 +42,8 @@ You can tune defaults with `.codex/reviewer.yml` in the target repository:
 ```yaml
 mode: full
 engine: auto
+base: origin/dev
+review_depth: balanced
 max_findings: 12
 focus_areas:
   - security
@@ -64,6 +67,21 @@ CLI flags override config values.
 - `auto`: prefer Codex, fall back to heuristics on failure
 - `codex`: require a Codex-backed review run
 - `heuristic`: run only local heuristic checks
+
+## Base Selection
+
+If no `--base` is passed, the reviewer now prefers:
+
+1. repo config `base`
+2. `origin/dev`
+3. `origin/development`
+4. `origin/main`
+5. `origin/master`
+
+## Review Depth
+
+- `balanced`: narrower Codex scope for faster reviews
+- `thorough`: broader Codex scope for slower but deeper pre-PR review
 
 ## Scope
 
