@@ -1525,6 +1525,10 @@ function buildFindingFingerprint(finding) {
   ].join('|');
 }
 
+function encodeMetadataComment(payload) {
+  return `<!-- pr-reviewer-meta:${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')} -->`;
+}
+
 function loadPreviousReviewState(repoRoot) {
   const statePath = getStatePath(repoRoot);
 
@@ -1789,6 +1793,7 @@ function renderText(report) {
       lines.push(`${index + 1}. ${finding.title}`);
       lines.push(`   Severity: ${finding.severity}`);
       lines.push(`   Confidence: ${finding.confidence}`);
+      lines.push(`   Fingerprint: ${finding.fingerprint}`);
       lines.push(`   File: ${finding.file}:${finding.line}`);
       lines.push(`   What is wrong: ${finding.evidence}`);
       lines.push(`   Why it matters: ${finding.impact}`);
@@ -1811,6 +1816,7 @@ function renderText(report) {
     report.outsideDiffFindings.forEach((finding, index) => {
       lines.push(`${index + 1}. ${finding.title}`);
       lines.push(`   Severity: ${finding.severity}`);
+      lines.push(`   Fingerprint: ${finding.fingerprint}`);
       lines.push(`   Location: ${finding.file}:${finding.line}`);
       lines.push(`   Why it matters: ${finding.explanation}`);
       lines.push(`   What to verify: ${finding.verification}`);
@@ -1910,6 +1916,7 @@ function renderMarkdown(report) {
     lines.push('');
     lines.push(`- Severity: \`${finding.severity}\``);
     lines.push(`- Confidence: \`${finding.confidence}\``);
+    lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
     lines.push(`- File: \`${finding.file}:${finding.line}\``);
     lines.push(`- What is wrong: ${finding.evidence}`);
     lines.push(`- Why it matters: ${finding.impact}`);
@@ -1942,6 +1949,7 @@ function renderMarkdown(report) {
       lines.push(`### ${index + 1}. ${finding.title}`);
       lines.push('');
       lines.push(`- Severity: \`${finding.severity}\``);
+      lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
       lines.push(`- Location: \`${finding.file}:${finding.line}\``);
       lines.push(`- Why it matters: ${finding.explanation}`);
       lines.push(`- What to verify: ${finding.verification}`);
@@ -1961,6 +1969,128 @@ function renderMarkdown(report) {
   if (report.reviewedCommit) {
     lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
   }
+
+  return lines.join('\n');
+}
+
+function renderGitHub(report) {
+  const counts = buildFindingSummary(report.findings);
+  const blockerCount = countBlockerFindings(report.findings);
+  const metadata = {
+    version: 2,
+    repo: report.repoLabel,
+    commitId: report.reviewedCommit,
+    state: report.verdict,
+    blockers: report.findings
+      .filter((finding) => finding.severity === 'critical' || (finding.severity === 'important' && finding.confidence !== 'low'))
+      .map((finding) => ({
+        fingerprint: finding.fingerprint,
+        severity: finding.severity,
+        label: finding.title,
+        location: `${finding.file}:${finding.line}`
+      })),
+    relatedBlockers: report.outsideDiffFindings.map((finding) => ({
+      fingerprint: finding.fingerprint,
+      severity: finding.severity,
+      label: finding.title,
+      location: `${finding.file}:${finding.line}`
+    }))
+  };
+
+  const lines = [
+    '<h3>Summary</h3>',
+    `<p>${buildNarrativeSummary(report)}</p>`
+  ];
+
+  if (report.keyChanges.length) {
+    lines.push('<p><strong>Key changes:</strong></p>');
+    lines.push('<ul>');
+    report.keyChanges.forEach((item) => lines.push(`<li>${item}</li>`));
+    lines.push('</ul>');
+  }
+
+  lines.push('<h3>Findings</h3>');
+  lines.push(`<p>${blockerCount ? 'Must fix before merge.' : 'No confirmed blocker-level findings, but there are still issues worth resolving before PR.'}</p>`);
+
+  if (report.findings.length) {
+    lines.push('<ul>');
+    report.findings.forEach((finding) => {
+      lines.push(`<li>${finding.title} (<code>${finding.file}:${finding.line}</code>, fingerprint <code>${finding.fingerprint}</code>)</li>`);
+    });
+    lines.push('</ul>');
+  } else {
+    lines.push('<p>No findings.</p>');
+  }
+
+  lines.push(`<h3>Confidence Score: ${report.confidenceScore}/5</h3>`);
+  lines.push('<ul>');
+  lines.push(`<li>Merge stance: <code>${report.verdict}</code>${blockerCount ? ` with ${blockerCount} confirmed blocker-level finding(s).` : ' with no confirmed blocker-level findings.'}</li>`);
+  lines.push(`<li>Verification confirmed ${counts.critical} Critical, ${counts.important} Important, ${counts.medium} Medium, and ${counts.low} Low finding(s) in the changed files.</li>`);
+  lines.push('</ul>');
+
+  if (report.outsideDiffFindings.length) {
+    lines.push('<details>');
+    lines.push(`<summary>Comments Outside Diff (${report.outsideDiffFindings.length})</summary>`);
+    lines.push('');
+    lines.push('<p>Not part of this diff. Follow up separately.</p>');
+    lines.push('<ol>');
+    report.outsideDiffFindings.forEach((finding) => {
+      lines.push('<li>');
+      lines.push(`<p><code>${finding.file}</code>, line ${finding.line}</p>`);
+      lines.push(`<p><code>${finding.severity}</code> ${finding.title}</p>`);
+      lines.push(`<p>${finding.explanation}</p>`);
+      lines.push(`<p><strong>Fingerprint:</strong> <code>${finding.fingerprint}</code></p>`);
+      lines.push('<details>');
+      lines.push('<summary>Prompt To Fix With AI</summary>');
+      lines.push('');
+      lines.push('```text');
+      lines.push(buildOutsideDiffPrompt(report, finding));
+      lines.push('```');
+      lines.push('</details>');
+      lines.push('</li>');
+    });
+    lines.push('</ol>');
+    lines.push('</details>');
+  }
+
+  if (report.findings.length) {
+    lines.push('<details><summary>Prompt To Fix All With AI</summary>');
+    lines.push('');
+    lines.push('```text');
+    lines.push(buildFixAllPrompt(report));
+    lines.push('```');
+    lines.push('</details>');
+  }
+
+  lines.push('');
+  lines.push('## Inline Comment Candidates');
+  lines.push('');
+  report.findings.forEach((finding, index) => {
+    lines.push(`### ${index + 1}. ${finding.title}`);
+    lines.push('');
+    lines.push(`- Path: \`${finding.file}\``);
+    lines.push(`- Line: \`${finding.line}\``);
+    lines.push(`- Severity: \`${finding.severity}\``);
+    lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
+    lines.push('');
+    lines.push('```md');
+    lines.push(`**${finding.title}**`);
+    lines.push('');
+    lines.push(finding.explanation || finding.evidence);
+    lines.push('');
+    lines.push(`**Why it matters:** ${finding.impact}`);
+    lines.push('');
+    lines.push(`**Fix:** ${finding.fixDirection}`);
+    lines.push('```');
+    lines.push('');
+  });
+
+  if (report.reviewedCommit) {
+    lines.push(`<p><sub>Last reviewed commit: <code>${report.reviewedCommit}</code></sub></p>`);
+  }
+
+  lines.push('');
+  lines.push(encodeMetadataComment(metadata));
 
   return lines.join('\n');
 }
@@ -2334,6 +2464,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
 
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
+  } else if (options.format === 'github') {
+    report.rendered = renderGitHub(report);
   } else if (options.format === 'markdown') {
     report.rendered = renderMarkdown(report);
   } else {

@@ -27,7 +27,7 @@ function printHelp() {
     --model <name>         Codex model override for engine=auto or codex
     --thorough             Increase Codex deep-review scope
     --review-depth <name>  Review depth: balanced or thorough
-    --format <name>        Output format: text, markdown, json
+    --format <name>        Output format: text, markdown, github, json
     --report <path>        Write the rendered report to a file
     --max-findings <n>     Limit the number of findings in the output
     --fail-on <severity>   Exit non-zero for low, medium, important, or critical findings
