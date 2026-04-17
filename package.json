@@ -1,0 +1,33 @@
+{
+  "name": "codex-review",
+  "version": "0.1.0",
+  "description": "Local pre-PR reviewer powered by Codex with heuristic fallback",
+  "main": "reviewer.js",
+  "bin": {
+    "codex-review": "bin/review.js"
+  },
+  "scripts": {
+    "test": "node bin/review.js --help"
+  },
+  "files": [
+    "bin/",
+    "reviewer.js",
+    "README.md",
+    "CODEX_REVIEWER_PLAN.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "codex",
+    "code-review",
+    "pre-pr",
+    "git",
+    "wordpress"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
