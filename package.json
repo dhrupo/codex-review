@@ -1,7 +1,7 @@
 {
   "name": "codex-review",
   "version": "0.1.0",
-  "description": "Local pre-PR reviewer powered by Codex with heuristic fallback",
+  "description": "Internal WPManageNinja pre-PR reviewer powered by Codex with heuristic fallback",
   "main": "reviewer.js",
   "bin": {
     "codex-review": "bin/review.js"
@@ -23,7 +23,9 @@
     "code-review",
     "pre-pr",
     "git",
-    "wordpress"
+    "wordpress",
+    "wpmanageninja",
+    "internal"
   ],
   "license": "MIT",
   "dependencies": {
