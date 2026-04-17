@@ -924,17 +924,80 @@ function buildSummary(findings, scope, options) {
   return `Reviewed ${scope.reviewedFiles.length} changed file(s) against ${options.base}. Found ${parts.join(', ')} issue(s).`;
 }
 
-function renderText(report) {
-  const lines = [
-    `Verdict: ${report.verdict}`,
-    `Confidence: ${report.confidenceScore}/5`,
-    `Base: ${report.baseRef}`,
-    `Mode: ${report.mode}`,
-    `Review Depth: ${report.reviewDepth}`,
-    `Engine: ${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}`,
+function getCurrentCommit(cwd) {
+  try {
+    return runGit(['rev-parse', '--short', 'HEAD'], { cwd }).trim();
+  } catch (error) {
+    return null;
+  }
+}
+
+function getRepoLabel(cwd) {
+  try {
+    const root = runGit(['rev-parse', '--show-toplevel'], { cwd }).trim();
+    return path.basename(root);
+  } catch (error) {
+    return path.basename(cwd);
+  }
+}
+
+function buildConfidenceLabel(score) {
+  if (score >= 4) {
+    return 'high';
+  }
+
+  if (score === 3) {
+    return 'moderate';
+  }
+
+  return 'low';
+}
+
+function buildFindingSummary(findings) {
+  const counts = {
+    critical: 0,
+    important: 0,
+    medium: 0,
+    low: 0
+  };
+
+  findings.forEach((finding) => {
+    counts[finding.severity] += 1;
+  });
+
+  return counts;
+}
+
+function buildFixPrompt(report, finding) {
+  return [
+    `This is a local pre-PR review comment for ${report.repoLabel}.`,
+    `Path: ${finding.file}`,
+    `Line: ${finding.line}`,
     '',
-    report.summary
-  ];
+    `Issue: ${finding.title}`,
+    `What is wrong: ${finding.evidence}`,
+    `Why it matters: ${finding.impact}`,
+    `Explanation: ${finding.explanation || 'Review the changed logic carefully and confirm the current behavior is still correct.'}`,
+    `What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`,
+    `Fix direction: ${finding.fixDirection}`,
+    '',
+    'Apply a concise fix without changing unrelated behavior.'
+  ].join('\n');
+}
+
+function renderText(report) {
+  const lines = [];
+  const counts = buildFindingSummary(report.findings);
+
+  lines.push('Summary', '');
+  lines.push(report.summary);
+  lines.push('');
+  lines.push(`Merge stance: ${report.verdict}`);
+  lines.push(`Confidence score: ${report.confidenceScore}/5 (${buildConfidenceLabel(report.confidenceScore)})`);
+  lines.push(`Base: ${report.baseRef}`);
+  lines.push(`Mode: ${report.mode}`);
+  lines.push(`Review depth: ${report.reviewDepth}`);
+  lines.push(`Engine: ${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}`);
 
   if (report.scope.reviewedFiles.length) {
     lines.push('', 'Files Reviewed:');
@@ -947,56 +1010,55 @@ function renderText(report) {
   }
 
   if (report.notes.length) {
-    lines.push('', 'Notes:');
+    lines.push('', 'Outside Diff Follow-ups:');
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
   if (report.findings.length) {
-    const grouped = {
-      critical: [],
-      important: [],
-      medium: [],
-      low: []
-    };
+    lines.push('', 'Findings', '');
+    lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
 
-    report.findings.forEach((finding) => grouped[finding.severity].push(finding));
-
-    Object.keys(grouped).forEach((severity) => {
-      if (!grouped[severity].length) {
-        return;
-      }
-
-      lines.push('', `${severity[0].toUpperCase()}${severity.slice(1)} Findings`);
-      grouped[severity].forEach((finding, index) => {
-        lines.push(`${index + 1}. ${finding.title}`);
-        lines.push(`   File: ${finding.file}:${finding.line}`);
-        lines.push(`   Confidence: ${finding.confidence}`);
-        lines.push(`   Evidence: ${finding.evidence}`);
-        lines.push(`   Why it matters: ${finding.impact}`);
-        lines.push(`   Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
-        lines.push(`   What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
-        lines.push(`   Fix: ${finding.fixDirection}`);
-      });
+    report.findings.forEach((finding, index) => {
+      lines.push('');
+      lines.push(`${index + 1}. ${finding.title}`);
+      lines.push(`   Severity: ${finding.severity}`);
+      lines.push(`   Confidence: ${finding.confidence}`);
+      lines.push(`   File: ${finding.file}:${finding.line}`);
+      lines.push(`   What is wrong: ${finding.evidence}`);
+      lines.push(`   Why it matters: ${finding.impact}`);
+      lines.push(`   Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
+      lines.push(`   What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
+      lines.push(`   Fix: ${finding.fixDirection}`);
+      lines.push('   Prompt To Fix With AI:');
+      lines.push('');
+      buildFixPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
     });
   } else {
-    lines.push('', 'No findings.');
+    lines.push('', 'Findings', '', 'No findings.');
+  }
+
+  if (report.reviewedCommit) {
+    lines.push('', `Last reviewed commit: ${report.reviewedCommit}`);
   }
 
   return lines.join('\n');
 }
 
 function renderMarkdown(report) {
+  const counts = buildFindingSummary(report.findings);
   const lines = [
     '# Codex Review Report',
     '',
-    `- Verdict: \`${report.verdict}\``,
-    `- Confidence: \`${report.confidenceScore}/5\``,
+    '## Summary',
+    '',
+    report.summary,
+    '',
+    `- Merge stance: \`${report.verdict}\``,
+    `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
     `- Base: \`${report.baseRef}\``,
     `- Mode: \`${report.mode}\``,
     `- Review depth: \`${report.reviewDepth}\``,
-    `- Engine: \`${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}\``,
-    '',
-    report.summary
+    `- Engine: \`${report.engine}${report.fallbackUsed ? ' (heuristic fallback)' : ''}\``
   ];
 
   if (report.scope.reviewedFiles.length) {
@@ -1015,29 +1077,46 @@ function renderMarkdown(report) {
   }
 
   if (report.notes.length) {
-    lines.push('', '## Notes', '');
+    lines.push('', '## Outside Diff Follow-ups', '');
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
   if (!report.findings.length) {
     lines.push('', '## Findings', '', 'No findings.');
+    if (report.reviewedCommit) {
+      lines.push('', `Last reviewed commit: \`${report.reviewedCommit}\``);
+    }
     return lines.join('\n');
   }
 
   lines.push('', '## Findings', '');
+  lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
+  lines.push('');
   report.findings.forEach((finding, index) => {
     lines.push(`### ${index + 1}. ${finding.title}`);
     lines.push('');
     lines.push(`- Severity: \`${finding.severity}\``);
     lines.push(`- Confidence: \`${finding.confidence}\``);
     lines.push(`- File: \`${finding.file}:${finding.line}\``);
-    lines.push(`- Evidence: ${finding.evidence}`);
-    lines.push(`- Impact: ${finding.impact}`);
+    lines.push(`- What is wrong: ${finding.evidence}`);
+    lines.push(`- Why it matters: ${finding.impact}`);
     lines.push(`- Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
     lines.push(`- What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
     lines.push(`- Fix direction: ${finding.fixDirection}`);
     lines.push('');
+    lines.push('<details>');
+    lines.push('<summary>Prompt To Fix With AI</summary>');
+    lines.push('');
+    lines.push('```text');
+    lines.push(buildFixPrompt(report, finding));
+    lines.push('```');
+    lines.push('</details>');
+    lines.push('');
   });
+
+  if (report.reviewedCommit) {
+    lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
+  }
 
   return lines.join('\n');
 }
@@ -1303,12 +1382,14 @@ function createReviewContext(options, cwd) {
     baseRef,
     fileEntries,
     instructions,
-    diffText
+    diffText,
+    reviewedCommit: getCurrentCommit(cwd),
+    repoLabel: getRepoLabel(cwd)
   };
 }
 
 function buildFinalReport(options, reviewContext, reviewResult) {
-  const { baseRef, fileEntries, instructions } = reviewContext;
+  const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel } = reviewContext;
   const rankedFindings = rankFindings((reviewResult.findings || []).map((finding) => ({
     severity: finding.severity,
     confidence: finding.confidence,
@@ -1334,6 +1415,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     summary: reviewResult.summary || buildSummary(rankedFindings, scope, {
       base: baseRef || '--staged'
     }),
+    reviewedCommit,
+    repoLabel,
     scope,
     findings: rankedFindings,
     diffStats: {
