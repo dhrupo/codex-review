@@ -3,6 +3,14 @@ mode: full
 engine: auto
 review_depth: thorough
 max_findings: 12
+product_profile:
+  name: WPManageNinja Product
+  focus:
+    - key product workflow 1
+    - key product workflow 2
+  regression_checks:
+    - product-specific regression expectation 1
+    - product-specific regression expectation 2
 focus_areas:
   - security
   - payments

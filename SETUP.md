@@ -67,6 +67,15 @@ Recommended defaults for most WPManageNinja repos:
 - `engine: codex`
 - `review_depth: thorough`
 
+If your repo is not built into `codex-review` yet, define a local `product_profile` in `.codex/reviewer.yml` so the team can calibrate review focus and regression expectations for that repo.
+
+Typical cases:
+
+- `fluent-cart`
+  checkout, payment callback, totals, coupon, and order-state regressions
+- `fluent-crm`
+  contact sync, automation state, campaign scheduling, and idempotent background processing
+
 ## 6. Run the reviewer
 
 Recommended command:

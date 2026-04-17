@@ -43,6 +43,7 @@ const DEFAULT_CONFIG = {
   maxFindings: DEFAULT_MAX_FINDINGS,
   base: null,
   reviewDepth: 'balanced',
+  productProfile: null,
   focusAreas: [],
   ignorePaths: [],
   highRiskPaths: [],
@@ -310,6 +311,29 @@ function getProductProfile(repoLabel) {
   return profile ? { repoLabel, ...profile } : null;
 }
 
+function buildCustomProductProfile(repoLabel, configProfile) {
+  if (!configProfile || typeof configProfile !== 'object') {
+    return null;
+  }
+
+  const name = typeof configProfile.name === 'string' && configProfile.name.trim()
+    ? configProfile.name.trim()
+    : repoLabel;
+  const focus = normalizeStringArray(configProfile.focus);
+  const regressionChecks = normalizeStringArray(configProfile.regression_checks || configProfile.regressionChecks);
+
+  if (!focus.length && !regressionChecks.length) {
+    return null;
+  }
+
+  return {
+    repoLabel,
+    name,
+    focus,
+    regressionChecks
+  };
+}
+
 function parseArgs(argv) {
   const options = {
     base: null,
@@ -555,6 +579,9 @@ function loadRepoConfig(cwd) {
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_CONFIG.model,
       reviewDepth: typeof (parsed.review_depth || parsed.reviewDepth) === 'string' ? (parsed.review_depth || parsed.reviewDepth) : DEFAULT_CONFIG.reviewDepth,
       maxFindings: Math.max(1, parseInt(parsed.max_findings || parsed.maxFindings, 10) || DEFAULT_CONFIG.maxFindings),
+      productProfile: typeof parsed.product_profile === 'object' || typeof parsed.productProfile === 'object'
+        ? (parsed.product_profile || parsed.productProfile)
+        : DEFAULT_CONFIG.productProfile,
       focusAreas: normalizeStringArray(parsed.focus_areas || parsed.focusAreas),
       ignorePaths: normalizeStringArray((parsed.paths && parsed.paths.ignore) || parsed.ignore_paths || parsed.ignorePaths),
       highRiskPaths: normalizeStringArray((parsed.paths && parsed.paths.high_risk) || parsed.high_risk_paths || parsed.highRiskPaths),
@@ -574,6 +601,7 @@ function resolveOptions(rawOptions, repoConfig) {
     maxFindings: rawOptions._explicit.maxFindings ? rawOptions.maxFindings : repoConfig.maxFindings
   };
 
+  options.productProfile = repoConfig.productProfile;
   options.focusAreas = repoConfig.focusAreas;
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
@@ -2217,7 +2245,7 @@ function createReviewContext(options, cwd) {
   const diffText = getUnifiedDiff(cwd, baseRef, options, fileEntries.map((entry) => entry.path));
   const repoRoot = getRepoRoot(cwd);
   const repoLabel = getRepoLabel(cwd);
-  const productProfile = getProductProfile(repoLabel);
+  const productProfile = buildCustomProductProfile(repoLabel, options.productProfile) || getProductProfile(repoLabel);
 
   return {
     cwd,

@@ -64,6 +64,8 @@ Examples:
 - `fluent-player-pro`
   checks Pro player config plus shared free/pro compatibility risks
 
+For repos that are not hardcoded yet, such as `fluent-cart` or `fluent-crm`, you can calibrate the reviewer locally with `.codex/reviewer.yml`.
+
 ## Requirements
 
 - Node.js 18+
@@ -300,6 +302,70 @@ For most WPManageNinja repos, the main useful defaults are:
 - `base: origin/dev`
 - `engine: codex`
 - `review_depth: thorough`
+
+You can also define a repo-specific product profile there. This is the calibration path for teams working on repos that are not built into `codex-review` yet.
+
+Example for a repo like `fluent-cart`:
+
+```yaml
+base: origin/dev
+engine: codex
+review_depth: thorough
+product_profile:
+  name: Fluent Cart
+  focus:
+    - checkout, cart totals, coupon, and order-state regressions
+    - payment callback, webhook, and persisted order amount consistency
+    - frontend cart config and API payload compatibility
+  regression_checks:
+    - checkout changes must preserve totals, discounts, taxes, and final persisted order values
+    - payment/webhook changes must be checked against success, failure, retry, and duplicate-callback paths
+    - cart or checkout UI changes must keep frontend payloads aligned with backend validation
+focus_areas:
+  - payments
+  - checkout
+  - persistence
+paths:
+  high_risk:
+    - src/Payments/**
+    - src/Checkout/**
+    - src/Orders/**
+    - app/Http/**
+notes:
+  - Checkout and payment changes should be verified with coupon, tax, and retry scenarios.
+```
+
+Example for a repo like `fluent-crm`:
+
+```yaml
+base: origin/dev
+engine: codex
+review_depth: thorough
+product_profile:
+  name: FluentCRM
+  focus:
+    - contact sync, automation state, and campaign/event regressions
+    - segment/filter logic, background jobs, and idempotent processing
+    - email or workflow config round-trips between UI, API, and persistence
+  regression_checks:
+    - automation changes must preserve re-entry, retry, and duplicate-processing behavior
+    - contact or segment changes must be checked against query filters and background sync paths
+    - campaign or email config changes must survive save/load and scheduled execution
+focus_areas:
+  - automation
+  - background-jobs
+  - persistence
+paths:
+  high_risk:
+    - app/Services/**
+    - app/Http/**
+    - app/Models/**
+    - app/Hooks/**
+notes:
+  - Automation changes should be reviewed for duplicate processing and scheduler/idempotency risks.
+```
+
+That lets each WPManageNinja team tune review priorities in their own repo without waiting for a codex-review release.
 
 ## Base Branch Behavior
 
