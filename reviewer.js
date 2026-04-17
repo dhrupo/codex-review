@@ -3,6 +3,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
@@ -941,6 +942,81 @@ function getRepoLabel(cwd) {
   }
 }
 
+function getRepoRoot(cwd) {
+  try {
+    return runGit(['rev-parse', '--show-toplevel'], { cwd }).trim();
+  } catch (error) {
+    return cwd;
+  }
+}
+
+function getStateDirectory() {
+  return path.join(os.homedir(), '.codex', 'codex-review', 'state');
+}
+
+function getStatePath(repoRoot) {
+  const key = crypto.createHash('sha1').update(repoRoot).digest('hex');
+  return path.join(getStateDirectory(), `${key}.json`);
+}
+
+function normalizeFingerprintPart(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .replace(/\s+/g, '-');
+}
+
+function buildFindingFingerprint(finding) {
+  return [
+    normalizeFingerprintPart(finding.severity),
+    normalizeFingerprintPart(finding.title),
+    normalizeFingerprintPart(finding.file)
+  ].join('|');
+}
+
+function loadPreviousReviewState(repoRoot) {
+  const statePath = getStatePath(repoRoot);
+
+  if (!fileExists(statePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(safeReadFile(statePath));
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveReviewState(repoRoot, report) {
+  const stateDir = getStateDirectory();
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const state = {
+    repoRoot,
+    repoLabel: report.repoLabel,
+    baseRef: report.baseRef,
+    mode: report.mode,
+    reviewDepth: report.reviewDepth,
+    engine: report.engine,
+    reviewedCommit: report.reviewedCommit,
+    verdict: report.verdict,
+    confidenceScore: report.confidenceScore,
+    savedAt: new Date().toISOString(),
+    findings: report.findings.map((finding) => ({
+      fingerprint: finding.fingerprint || buildFindingFingerprint(finding),
+      severity: finding.severity,
+      confidence: finding.confidence,
+      file: finding.file,
+      line: finding.line,
+      title: finding.title
+    }))
+  };
+
+  writeJsonFile(getStatePath(repoRoot), state);
+}
+
 function buildConfidenceLabel(score) {
   if (score >= 4) {
     return 'high';
@@ -985,11 +1061,107 @@ function buildFixPrompt(report, finding) {
   ].join('\n');
 }
 
+function buildFixAllPrompt(report) {
+  if (!report.findings.length) {
+    return '';
+  }
+
+  const header = [
+    `Apply the confirmed review fixes for ${report.repoLabel}${report.reviewedCommit ? ` at commit ${report.reviewedCommit}` : ''}.`,
+    'Keep behavior unchanged outside these issues.',
+    ''
+  ];
+
+  const issues = report.findings.map((finding, index) => [
+    `${index + 1}. ${finding.title}`,
+    `What: ${finding.evidence}`,
+    `Why: ${finding.impact}`,
+    `Explanation: ${finding.explanation || 'Review the changed logic carefully and confirm the current behavior is still correct.'}`,
+    `Verify: ${finding.verification || 'Add or run targeted checks around this path.'}`,
+    `Fix: ${finding.fixDirection}`,
+    ''
+  ].join('\n'));
+
+  return header.concat(issues).join('\n');
+}
+
+function buildRecheckState(previousState, findings, reviewedCommit) {
+  if (!previousState || !previousState.findings || !previousState.findings.length) {
+    return null;
+  }
+
+  const previousMap = new Map(previousState.findings.map((finding) => [finding.fingerprint, finding]));
+  const currentMap = new Map(findings.map((finding) => [finding.fingerprint, finding]));
+  const cleared = previousState.findings.filter((finding) => !currentMap.has(finding.fingerprint));
+  const remaining = findings.filter((finding) => previousMap.has(finding.fingerprint));
+  const introduced = findings.filter((finding) => !previousMap.has(finding.fingerprint));
+  const commitChanged = Boolean(previousState.reviewedCommit && reviewedCommit && previousState.reviewedCommit !== reviewedCommit);
+
+  if (!commitChanged && !cleared.length && !remaining.length && !introduced.length) {
+    return null;
+  }
+
+  return {
+    previousCommit: previousState.reviewedCommit || null,
+    previousVerdict: previousState.verdict || null,
+    commitChanged,
+    cleared,
+    remaining,
+    introduced
+  };
+}
+
+function buildNarrativeSummary(report) {
+  const counts = buildFindingSummary(report.findings);
+
+  if (report.recheck) {
+    const parts = [];
+
+    if (report.recheck.cleared.length) {
+      parts.push(`${report.recheck.cleared.length} previous finding(s) cleared`);
+    }
+
+    if (report.recheck.introduced.length) {
+      parts.push(`${report.recheck.introduced.length} new finding(s) introduced`);
+    }
+
+    if (report.findings.length) {
+      const remainingLabel = report.verdict === 'REQUEST_CHANGES' ? 'blocking finding(s) remain' : 'finding(s) remain';
+      parts.push(`${report.findings.length} ${remainingLabel}`);
+    } else {
+      parts.push('blocking findings cleared');
+    }
+
+    const commitLabel = report.reviewedCommit ? `Rechecked \`${report.reviewedCommit}\`` : 'Rechecked current branch state';
+    return `${commitLabel}. ${parts.join('. ')}.`;
+  }
+
+  if (!report.findings.length) {
+    return 'No meaningful issues were found in the reviewed changes.';
+  }
+
+  const leading = [];
+
+  if (counts.critical || counts.important) {
+    leading.push(`Found ${counts.critical + counts.important} blocker-level issue(s)`);
+  } else {
+    leading.push(`Found ${report.findings.length} issue(s) worth addressing before PR`);
+  }
+
+  if (report.findings[0]) {
+    leading.push(`highest-signal finding: ${report.findings[0].title}`);
+  }
+
+  return `${leading.join('; ')}.`;
+}
+
 function renderText(report) {
   const lines = [];
   const counts = buildFindingSummary(report.findings);
 
   lines.push('Summary', '');
+  lines.push(buildNarrativeSummary(report));
+  lines.push('');
   lines.push(report.summary);
   lines.push('');
   lines.push(`Merge stance: ${report.verdict}`);
@@ -1014,6 +1186,24 @@ function renderText(report) {
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
+  if (report.recheck) {
+    lines.push('', 'Recheck Status:');
+    if (report.recheck.previousCommit) {
+      lines.push(`- Previous reviewed commit: ${report.recheck.previousCommit}`);
+    }
+    if (report.recheck.cleared.length) {
+      lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
+      report.recheck.cleared.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.file}:${finding.line})`));
+    }
+    if (report.recheck.remaining.length) {
+      lines.push(`- Still present: ${report.recheck.remaining.length}`);
+    }
+    if (report.recheck.introduced.length) {
+      lines.push(`- New since last review: ${report.recheck.introduced.length}`);
+      report.recheck.introduced.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.file}:${finding.line})`));
+    }
+  }
+
   if (report.findings.length) {
     lines.push('', 'Findings', '');
     lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
@@ -1033,6 +1223,9 @@ function renderText(report) {
       lines.push('');
       buildFixPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
     });
+
+    lines.push('', 'Prompt To Fix All With AI:', '');
+    buildFixAllPrompt(report).split('\n').forEach((line) => lines.push(line));
   } else {
     lines.push('', 'Findings', '', 'No findings.');
   }
@@ -1050,6 +1243,8 @@ function renderMarkdown(report) {
     '# Codex Review Report',
     '',
     '## Summary',
+    '',
+    buildNarrativeSummary(report),
     '',
     report.summary,
     '',
@@ -1079,6 +1274,24 @@ function renderMarkdown(report) {
   if (report.notes.length) {
     lines.push('', '## Outside Diff Follow-ups', '');
     report.notes.forEach((note) => lines.push(`- ${note}`));
+  }
+
+  if (report.recheck) {
+    lines.push('', '## Recheck Status', '');
+    if (report.recheck.previousCommit) {
+      lines.push(`- Previous reviewed commit: \`${report.recheck.previousCommit}\``);
+    }
+    if (report.recheck.cleared.length) {
+      lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
+      report.recheck.cleared.slice(0, 5).forEach((finding) => lines.push(`- Cleared: \`${finding.title}\` at \`${finding.file}:${finding.line}\``));
+    }
+    if (report.recheck.remaining.length) {
+      lines.push(`- Still present: ${report.recheck.remaining.length}`);
+    }
+    if (report.recheck.introduced.length) {
+      lines.push(`- New since last review: ${report.recheck.introduced.length}`);
+      report.recheck.introduced.slice(0, 5).forEach((finding) => lines.push(`- New: \`${finding.title}\` at \`${finding.file}:${finding.line}\``));
+    }
   }
 
   if (!report.findings.length) {
@@ -1113,6 +1326,15 @@ function renderMarkdown(report) {
     lines.push('</details>');
     lines.push('');
   });
+
+  lines.push('<details>');
+  lines.push('<summary>Prompt To Fix All With AI</summary>');
+  lines.push('');
+  lines.push('```text');
+  lines.push(buildFixAllPrompt(report));
+  lines.push('```');
+  lines.push('</details>');
+  lines.push('');
 
   if (report.reviewedCommit) {
     lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
@@ -1376,9 +1598,11 @@ function createReviewContext(options, cwd) {
   const fileEntries = listChangedFiles(cwd, options, baseRef);
   const instructions = getRepoInstructions(cwd, options.repoConfigPath);
   const diffText = getUnifiedDiff(cwd, baseRef, options, fileEntries.map((entry) => entry.path));
+  const repoRoot = getRepoRoot(cwd);
 
   return {
     cwd,
+    repoRoot,
     baseRef,
     fileEntries,
     instructions,
@@ -1389,7 +1613,7 @@ function createReviewContext(options, cwd) {
 }
 
 function buildFinalReport(options, reviewContext, reviewResult) {
-  const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel } = reviewContext;
+  const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel, repoRoot } = reviewContext;
   const rankedFindings = rankFindings((reviewResult.findings || []).map((finding) => ({
     severity: finding.severity,
     confidence: finding.confidence,
@@ -1400,9 +1624,11 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     impact: finding.impact,
     explanation: finding.explanation,
     verification: finding.verification,
-    fixDirection: finding.fixDirection
+    fixDirection: finding.fixDirection,
+    fingerprint: buildFindingFingerprint(finding)
   }))).slice(0, options.maxFindings);
   const scope = summarizeScope(fileEntries, instructions);
+  const previousState = loadPreviousReviewState(repoRoot);
   const report = {
     verdict: reviewResult.verdict || buildVerdict(rankedFindings),
     confidenceScore: reviewResult.confidenceScore || buildConfidence(rankedFindings),
@@ -1417,6 +1643,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     }),
     reviewedCommit,
     repoLabel,
+    repoRoot,
     scope,
     findings: rankedFindings,
     diffStats: {
@@ -1429,6 +1656,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     report.scope.codexReviewedFiles = reviewResult.codexReviewedFiles;
   }
 
+  report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit);
+
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
   } else if (options.format === 'markdown') {
@@ -1438,6 +1667,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   }
 
   report.exitCode = shouldFail(report, options.failOn) ? 2 : 0;
+  saveReviewState(repoRoot, report);
   return report;
 }
 
