@@ -1368,7 +1368,7 @@ function buildVerdict(findings) {
   }
 
   if (findings.some((item) => item.severity === 'important' && item.confidence !== 'low')) {
-    return 'COMMENT';
+    return 'REQUEST_CHANGES';
   }
 
   if (findings.length) {
@@ -1376,6 +1376,10 @@ function buildVerdict(findings) {
   }
 
   return 'APPROVE';
+}
+
+function countBlockerFindings(findings) {
+  return findings.filter((item) => item.severity === 'critical' || (item.severity === 'important' && item.confidence !== 'low')).length;
 }
 
 function buildConfidence(findings) {
@@ -1717,6 +1721,7 @@ function buildNarrativeSummary(report) {
 function renderText(report) {
   const lines = [];
   const counts = buildFindingSummary(report.findings);
+  const blockerCount = countBlockerFindings(report.findings);
 
   lines.push('Summary', '');
   lines.push(buildNarrativeSummary(report));
@@ -1770,6 +1775,13 @@ function renderText(report) {
 
   if (report.findings.length) {
     lines.push('', 'Findings', '');
+    if (blockerCount) {
+      lines.push('Must fix before merge.');
+      lines.push('');
+    } else {
+      lines.push('No confirmed blocker-level findings, but the following issues are still worth resolving before PR.');
+      lines.push('');
+    }
     lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
 
     report.findings.forEach((finding, index) => {
@@ -1819,6 +1831,7 @@ function renderText(report) {
 
 function renderMarkdown(report) {
   const counts = buildFindingSummary(report.findings);
+  const blockerCount = countBlockerFindings(report.findings);
   const lines = [
     '# Codex Review Report',
     '',
@@ -1888,6 +1901,8 @@ function renderMarkdown(report) {
   }
 
   lines.push('', '## Findings', '');
+  lines.push(blockerCount ? 'Must fix before merge.' : 'No confirmed blocker-level findings, but the following issues are still worth resolving before PR.');
+  lines.push('');
   lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
   lines.push('');
   report.findings.forEach((finding, index) => {
