@@ -946,6 +946,59 @@ function buildConfidence(findings) {
   return 3;
 }
 
+function clampConfidenceScore(score) {
+  return Math.max(1, Math.min(5, parseInt(score, 10) || 3));
+}
+
+function normalizeConfidenceScore(rawScore, findings, context) {
+  const reviewedFiles = context.reviewedFilesCount || 0;
+  const deepReviewedFiles = context.codexReviewedFilesCount || 0;
+  const hasHighConfidenceFinding = findings.some((item) => item.confidence === 'high');
+  const hasCriticalFinding = findings.some((item) => item.severity === 'critical');
+  const hasImportantFinding = findings.some((item) => item.severity === 'important' && item.confidence !== 'low');
+  const isCodexReview = context.engine === 'codex' && !context.fallbackUsed;
+  const isHeuristicOnly = context.engine === 'heuristic' || context.fallbackUsed;
+  let score = clampConfidenceScore(rawScore || buildConfidence(findings));
+
+  if (!reviewedFiles) {
+    return 4;
+  }
+
+  if (isHeuristicOnly) {
+    if (!findings.length) {
+      return 3;
+    }
+
+    if (hasHighConfidenceFinding || hasImportantFinding || hasCriticalFinding) {
+      return 3;
+    }
+
+    return 2;
+  }
+
+  if (isCodexReview) {
+    if (!findings.length) {
+      score = Math.max(score, context.reviewDepth === 'thorough' ? 4 : 3);
+    } else if (hasCriticalFinding) {
+      score = Math.max(score, 5);
+    } else if (hasImportantFinding || hasHighConfidenceFinding) {
+      score = Math.max(score, 4);
+    } else {
+      score = Math.max(score, 3);
+    }
+
+    if (context.reviewDepth === 'thorough' && deepReviewedFiles) {
+      score += 1;
+    }
+
+    if (deepReviewedFiles && deepReviewedFiles < reviewedFiles) {
+      score -= deepReviewedFiles < Math.min(3, reviewedFiles) ? 1 : 0;
+    }
+  }
+
+  return clampConfidenceScore(score);
+}
+
 function buildSummary(findings, scope, options) {
   if (!scope.reviewedFiles.length) {
     return 'No local changes were found for review.';
@@ -1749,7 +1802,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   const previousState = loadPreviousReviewState(repoRoot);
   const report = {
     verdict: reviewResult.verdict || buildVerdict(rankedFindings),
-    confidenceScore: reviewResult.confidenceScore || buildConfidence(rankedFindings),
+    confidenceScore: 0,
     baseRef: baseRef || '--staged',
     mode: options.mode,
     reviewDepth: options.reviewDepth,
@@ -1775,6 +1828,14 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   if (reviewResult.codexReviewedFiles && reviewResult.codexReviewedFiles.length) {
     report.scope.codexReviewedFiles = reviewResult.codexReviewedFiles;
   }
+
+  report.confidenceScore = normalizeConfidenceScore(reviewResult.confidenceScore, rankedFindings, {
+    engine: report.engine,
+    fallbackUsed: report.fallbackUsed,
+    reviewDepth: report.reviewDepth,
+    reviewedFilesCount: report.scope.reviewedFiles.length,
+    codexReviewedFilesCount: report.scope.codexReviewedFiles ? report.scope.codexReviewedFiles.length : 0
+  });
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit);
 
