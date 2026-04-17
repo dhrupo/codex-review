@@ -982,6 +982,21 @@ function buildProductSpecificFindings(options, reviewContext) {
         fixDirection: 'Mirror any new upload/crop setting keys into the save-time field settings whitelist and sanitization logic.'
       });
     }
+
+    if (
+      changedPathList.some((filePath) => /FormEditor|editor|field|Component/i.test(filePath)) &&
+      !changedPathList.some((filePath) => /app\/Services\/Form\/Updater\.php|app\/Modules\/Form\/Form\.php/i.test(filePath))
+    ) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'app/Services/Form/Updater.php',
+        line: 138,
+        title: 'Field-schema changes may need save-time sanitizer updates',
+        explanation: 'In Fluent Forms, editor-side field and settings changes often need matching save-time sanitizer/whitelist updates. Without that, fields can look correct in the builder but lose data after save or duplicate operations.',
+        verification: 'Check whether the changed field/settings keys are preserved by the Form updater and any duplicate/import/export path that sanitizes form schema.',
+        fixDirection: 'Update the save-time sanitizer/whitelist logic for any new field keys or nested settings introduced by this change.'
+      });
+    }
   }
 
   if (productProfile.repoLabel === 'fluentformpro') {
@@ -1159,6 +1174,21 @@ function buildProductSpecificFindings(options, reviewContext) {
         explanation: 'Fluent Player Pro often extends a shared frontend player contract. A Pro-only change can be locally correct but still diverge from the base config shape expected by the shared bootstrap path.',
         verification: 'Check the same config keys against the shared/base player bootstrap to confirm the Pro extension still composes cleanly with the core player config.',
         fixDirection: 'Validate the changed Pro config against the shared player bootstrap and align any diverging config keys or defaults.'
+      });
+    }
+
+    if (
+      changedPathList.some((filePath) => /shortcode|block|resources\/blocks|app\/Blocks/i.test(filePath)) &&
+      !changedPathList.some((filePath) => /resources\/js|resources\/share|bootstrap|player/i.test(filePath))
+    ) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'frontend player bootstrap',
+        line: 1,
+        title: 'Block or shortcode config change may need matching frontend bootstrap update',
+        explanation: 'Fluent Player behavior depends on the saved block/shortcode config reaching the frontend player initialization payload unchanged. A change only on the block or shortcode side can leave the rendered player using stale or incomplete runtime config.',
+        verification: 'Check the same changed settings on a rendered player and confirm the frontend bootstrap payload includes the updated values.',
+        fixDirection: 'Align shortcode/block config changes with the frontend bootstrap or serialized player payload path.'
       });
     }
   }
@@ -1557,6 +1587,11 @@ function saveReviewState(repoRoot, report) {
     reviewedCommit: report.reviewedCommit,
     verdict: report.verdict,
     confidenceScore: report.confidenceScore,
+    diffStats: report.diffStats,
+    scope: {
+      reviewedFiles: report.scope.reviewedFiles,
+      codexReviewedFiles: report.scope.codexReviewedFiles || []
+    },
     savedAt: new Date().toISOString(),
     findings: report.findings.map((finding) => ({
       fingerprint: finding.fingerprint || buildFindingFingerprint(finding),
@@ -1652,7 +1687,7 @@ function buildOutsideDiffPrompt(report, finding) {
   ].join('\n');
 }
 
-function buildRecheckState(previousState, findings, reviewedCommit) {
+function buildRecheckState(previousState, findings, reviewedCommit, report) {
   if (!previousState || !previousState.findings || !previousState.findings.length) {
     return null;
   }
@@ -1671,10 +1706,20 @@ function buildRecheckState(previousState, findings, reviewedCommit) {
   return {
     previousCommit: previousState.reviewedCommit || null,
     previousVerdict: previousState.verdict || null,
+    previousConfidenceScore: previousState.confidenceScore || null,
+    previousDiffStats: previousState.diffStats || null,
+    previousScope: previousState.scope || null,
     commitChanged,
     cleared,
     remaining,
-    introduced
+    introduced,
+    verdictChanged: Boolean(previousState.verdict && previousState.verdict !== report.verdict),
+    confidenceDelta: typeof previousState.confidenceScore === 'number'
+      ? report.confidenceScore - previousState.confidenceScore
+      : null,
+    reviewedFilesDelta: previousState.diffStats && typeof previousState.diffStats.files === 'number'
+      ? report.diffStats.files - previousState.diffStats.files
+      : null
   };
 }
 
@@ -1763,6 +1808,15 @@ function renderText(report) {
     lines.push('', 'Recheck Status:');
     if (report.recheck.previousCommit) {
       lines.push(`- Previous reviewed commit: ${report.recheck.previousCommit}`);
+    }
+    if (report.recheck.verdictChanged) {
+      lines.push(`- Verdict changed: ${report.recheck.previousVerdict} -> ${report.verdict}`);
+    }
+    if (typeof report.recheck.confidenceDelta === 'number' && report.recheck.confidenceDelta !== 0) {
+      lines.push(`- Confidence change: ${report.recheck.previousConfidenceScore}/5 -> ${report.confidenceScore}/5`);
+    }
+    if (typeof report.recheck.reviewedFilesDelta === 'number' && report.recheck.reviewedFilesDelta !== 0) {
+      lines.push(`- Changed-file scope delta: ${report.recheck.previousDiffStats.files} -> ${report.diffStats.files}`);
     }
     if (report.recheck.cleared.length) {
       lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
@@ -1884,6 +1938,15 @@ function renderMarkdown(report) {
     lines.push('', '## Recheck Status', '');
     if (report.recheck.previousCommit) {
       lines.push(`- Previous reviewed commit: \`${report.recheck.previousCommit}\``);
+    }
+    if (report.recheck.verdictChanged) {
+      lines.push(`- Verdict changed: \`${report.recheck.previousVerdict}\` -> \`${report.verdict}\``);
+    }
+    if (typeof report.recheck.confidenceDelta === 'number' && report.recheck.confidenceDelta !== 0) {
+      lines.push(`- Confidence change: \`${report.recheck.previousConfidenceScore}/5\` -> \`${report.confidenceScore}/5\``);
+    }
+    if (typeof report.recheck.reviewedFilesDelta === 'number' && report.recheck.reviewedFilesDelta !== 0) {
+      lines.push(`- Changed-file scope delta: \`${report.recheck.previousDiffStats.files}\` -> \`${report.diffStats.files}\``);
     }
     if (report.recheck.cleared.length) {
       lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
@@ -2224,43 +2287,71 @@ function isGeneratedOrBinaryPath(filePath) {
   );
 }
 
+function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
+  const filePath = entry.path;
+  const changedLines = extractChangedLines(reviewContext.diffText, filePath).length;
+  const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
+  const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
+  const isHighRisk = isHighRiskPath(filePath, options.highRiskPaths);
+  const isExplicit = options.files.includes(filePath);
+  const isWorktreeChange = entry.status.trim() && entry.status !== '??';
+  const isTest = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.(test|spec)\./i.test(filePath);
+  const productWeight = reviewContext.productProfile && reviewContext.productProfile.repoLabel === 'fluentformpro' && /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)
+    ? 40
+    : 0;
+
+  let score = 0;
+
+  if (isExplicit) {
+    score += 1000;
+  }
+
+  if (hasHotspot) {
+    score += 400;
+  }
+
+  if (hasOutsideDiffFollowup) {
+    score += 120;
+  }
+
+  if (isHighRisk) {
+    score += 150;
+  }
+
+  if (isWorktreeChange) {
+    score += 80;
+  }
+
+  if (isTest) {
+    score += 20;
+  }
+
+  score += Math.min(changedLines, 120);
+  score += productWeight;
+
+  return score;
+}
+
 function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
-  const selected = [];
-  const seen = new Set();
-  const fileMap = new Map(reviewContext.fileEntries.map((entry) => [entry.path, entry]));
-
-  function tryAdd(filePath) {
-    if (!filePath || seen.has(filePath)) {
-      return;
-    }
-
-    const entry = fileMap.get(filePath);
-    if (!entry || isGeneratedOrBinaryPath(filePath)) {
-      return;
-    }
-
-    selected.push(entry);
-    seen.add(filePath);
-  }
-
-  heuristicSeed.findings.forEach((finding) => tryAdd(finding.file));
-
-  if (options.files.length) {
-    options.files.forEach((filePath) => tryAdd(filePath));
-  }
-
-  reviewContext.fileEntries
-    .filter((entry) => entry.status.trim() && entry.status !== '??')
-    .forEach((entry) => tryAdd(entry.path));
-
-  reviewContext.fileEntries
-    .filter((entry) => isHighRiskPath(entry.path, options.highRiskPaths))
-    .forEach((entry) => tryAdd(entry.path));
-
-  reviewContext.fileEntries.forEach((entry) => tryAdd(entry.path));
-
   const limit = options.reviewDepth === 'thorough' ? CODEX_FILE_LIMITS.thorough : CODEX_FILE_LIMITS.balanced;
-  return selected.slice(0, limit);
+  return reviewContext.fileEntries
+    .filter((entry) => !isGeneratedOrBinaryPath(entry.path))
+    .map((entry) => ({
+      entry,
+      score: scoreCodexEntry(entry, reviewContext, heuristicSeed, options),
+      changedLines: extractChangedLines(reviewContext.diffText, entry.path).length
+    }))
+    .sort((left, right) => {
+      if (right.score !== left.score) {
+        return right.score - left.score;
+      }
+      if (right.changedLines !== left.changedLines) {
+        return right.changedLines - left.changedLines;
+      }
+      return left.entry.path.localeCompare(right.entry.path);
+    })
+    .slice(0, limit)
+    .map((item) => item.entry);
 }
 
 function runCodexReview(payload, options, cwd) {
@@ -2460,7 +2551,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     highRiskTouched: fileEntries.some((entry) => isHighRiskPath(entry.path, options.highRiskPaths))
   });
 
-  report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit);
+  report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit, report);
 
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
