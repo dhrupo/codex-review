@@ -68,6 +68,12 @@ const REVIEW_SCHEMA = {
     summary: {
       type: 'string'
     },
+    key_changes: {
+      type: 'array',
+      items: {
+        type: 'string'
+      }
+    },
     findings: {
       type: 'array',
       items: {
@@ -110,9 +116,42 @@ const REVIEW_SCHEMA = {
         required: ['severity', 'confidence', 'file', 'line', 'title', 'evidence', 'impact', 'explanation', 'verification', 'fix_direction'],
         additionalProperties: false
       }
+    },
+    outside_diff_findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          severity: {
+            type: 'string',
+            enum: ['critical', 'important', 'medium', 'low']
+          },
+          file: {
+            type: 'string'
+          },
+          line: {
+            type: 'integer',
+            minimum: 1
+          },
+          title: {
+            type: 'string'
+          },
+          explanation: {
+            type: 'string'
+          },
+          verification: {
+            type: 'string'
+          },
+          fix_direction: {
+            type: 'string'
+          }
+        },
+        required: ['severity', 'file', 'line', 'title', 'explanation', 'verification', 'fix_direction'],
+        additionalProperties: false
+      }
     }
   },
-  required: ['verdict', 'confidence_score', 'summary', 'findings'],
+  required: ['verdict', 'confidence_score', 'summary', 'key_changes', 'findings', 'outside_diff_findings'],
   additionalProperties: false
 };
 
@@ -1085,6 +1124,19 @@ function buildFixAllPrompt(report) {
   return header.concat(issues).join('\n');
 }
 
+function buildOutsideDiffPrompt(report, finding) {
+  return [
+    `This is a follow-up review item for ${report.repoLabel}${report.reviewedCommit ? ` at commit ${report.reviewedCommit}` : ''}.`,
+    `Location: ${finding.file}:${finding.line}`,
+    `Issue: ${finding.title}`,
+    `Why it matters: ${finding.explanation}`,
+    `What to verify: ${finding.verification}`,
+    `Fix direction: ${finding.fixDirection}`,
+    '',
+    'Treat this as outside-diff follow-up work unless the same code path already needs changes in this branch.'
+  ].join('\n');
+}
+
 function buildRecheckState(previousState, findings, reviewedCommit) {
   if (!previousState || !previousState.findings || !previousState.findings.length) {
     return null;
@@ -1181,8 +1233,13 @@ function renderText(report) {
     report.scope.codexReviewedFiles.forEach((filePath) => lines.push(`- ${filePath}`));
   }
 
+  if (report.keyChanges.length) {
+    lines.push('', 'Key Changes:');
+    report.keyChanges.forEach((item) => lines.push(`- ${item}`));
+  }
+
   if (report.notes.length) {
-    lines.push('', 'Outside Diff Follow-ups:');
+    lines.push('', 'Notes:');
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
@@ -1230,6 +1287,22 @@ function renderText(report) {
     lines.push('', 'Findings', '', 'No findings.');
   }
 
+  if (report.outsideDiffFindings.length) {
+    lines.push('', 'Outside Diff Follow-ups', '');
+    report.outsideDiffFindings.forEach((finding, index) => {
+      lines.push(`${index + 1}. ${finding.title}`);
+      lines.push(`   Severity: ${finding.severity}`);
+      lines.push(`   Location: ${finding.file}:${finding.line}`);
+      lines.push(`   Why it matters: ${finding.explanation}`);
+      lines.push(`   What to verify: ${finding.verification}`);
+      lines.push(`   Fix: ${finding.fixDirection}`);
+      lines.push('   Prompt To Fix With AI:');
+      lines.push('');
+      buildOutsideDiffPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
+      lines.push('');
+    });
+  }
+
   if (report.reviewedCommit) {
     lines.push('', `Last reviewed commit: ${report.reviewedCommit}`);
   }
@@ -1266,13 +1339,18 @@ function renderMarkdown(report) {
     report.scope.codexReviewedFiles.forEach((filePath) => lines.push(`- \`${filePath}\``));
   }
 
+  if (report.keyChanges.length) {
+    lines.push('', '## Key Changes', '');
+    report.keyChanges.forEach((item) => lines.push(`- ${item}`));
+  }
+
   if (report.scope.instructions.length) {
     lines.push('', '## Repo Context', '');
     report.scope.instructions.forEach((filePath) => lines.push(`- \`${filePath}\``));
   }
 
   if (report.notes.length) {
-    lines.push('', '## Outside Diff Follow-ups', '');
+    lines.push('', '## Notes', '');
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
@@ -1336,6 +1414,28 @@ function renderMarkdown(report) {
   lines.push('</details>');
   lines.push('');
 
+  if (report.outsideDiffFindings.length) {
+    lines.push('## Outside Diff Follow-ups', '');
+    report.outsideDiffFindings.forEach((finding, index) => {
+      lines.push(`### ${index + 1}. ${finding.title}`);
+      lines.push('');
+      lines.push(`- Severity: \`${finding.severity}\``);
+      lines.push(`- Location: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Why it matters: ${finding.explanation}`);
+      lines.push(`- What to verify: ${finding.verification}`);
+      lines.push(`- Fix direction: ${finding.fixDirection}`);
+      lines.push('');
+      lines.push('<details>');
+      lines.push('<summary>Prompt To Fix With AI</summary>');
+      lines.push('');
+      lines.push('```text');
+      lines.push(buildOutsideDiffPrompt(report, finding));
+      lines.push('```');
+      lines.push('</details>');
+      lines.push('');
+    });
+  }
+
   if (report.reviewedCommit) {
     lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
   }
@@ -1378,6 +1478,18 @@ function normalizeCodexFinding(finding) {
   };
 }
 
+function normalizeOutsideDiffFinding(finding) {
+  return {
+    severity: finding.severity,
+    file: finding.file,
+    line: Math.max(1, parseInt(finding.line, 10) || 1),
+    title: finding.title,
+    explanation: finding.explanation,
+    verification: finding.verification,
+    fixDirection: finding.fix_direction
+  };
+}
+
 function commandExists(command) {
   try {
     runCommand(command, ['--version']);
@@ -1410,6 +1522,8 @@ function buildPrompt(payload) {
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
+    'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
+    'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
     '',
     'Severity rules:',
     '- critical: confirmed security issue, destructive data corruption, or severe payment flaw',
@@ -1535,7 +1649,9 @@ function runCodexReview(payload, options, cwd) {
       verdict: parsed.verdict,
       confidenceScore: parsed.confidence_score,
       summary: parsed.summary,
-      findings: (parsed.findings || []).map(normalizeCodexFinding)
+      keyChanges: parsed.key_changes || [],
+      findings: (parsed.findings || []).map(normalizeCodexFinding),
+      outsideDiffFindings: (parsed.outside_diff_findings || []).map(normalizeOutsideDiffFinding)
     };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -1589,7 +1705,9 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
     summary: buildSummary(rankedFindings, summarizeScope(fileEntries, instructions), {
       base: baseRef || '--staged'
     }),
-    findings: rankedFindings
+    keyChanges: [],
+    findings: rankedFindings,
+    outsideDiffFindings: []
   };
 }
 
@@ -1641,11 +1759,13 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     summary: reviewResult.summary || buildSummary(rankedFindings, scope, {
       base: baseRef || '--staged'
     }),
+    keyChanges: reviewResult.keyChanges || [],
     reviewedCommit,
     repoLabel,
     repoRoot,
     scope,
     findings: rankedFindings,
+    outsideDiffFindings: reviewResult.outsideDiffFindings || [],
     diffStats: {
       files: fileEntries.length,
       testsChanged: getChangedTestFiles(fileEntries).length
