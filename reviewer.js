@@ -7,7 +7,15 @@ const { execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
-const DEFAULT_IGNORES = ['.git/', 'node_modules/', '.playwright-mcp/'];
+const DEFAULT_IGNORES = [
+  '.git/',
+  'node_modules/',
+  '.playwright-mcp/',
+  'builds/',
+  'dist/',
+  'vendor/',
+  'public/mix-manifest.json'
+];
 const HIGH_RISK_PATHS = [
   'app/http/',
   'app/services/',
