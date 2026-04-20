@@ -137,12 +137,15 @@ const PRODUCT_PROFILES = {
     focus: [
       'player initialization, shortcode/block attribute mapping, and frontend playback behavior',
       'video source, subtitle, and chapter/metadata configuration round-trips',
-      'public asset bootstrap and browser-side player controls/state changes'
+      'public asset bootstrap and browser-side player controls/state changes',
+      'public/private player payload boundaries and per-media submission identity contracts'
     ],
     regressionChecks: [
       'new player settings must survive save/load and reach frontend initialization payloads',
       'source/subtitle/chapter changes must keep player config and rendered UI in sync',
-      'asset/bootstrap changes must still initialize the player for shortcode and block paths'
+      'asset/bootstrap changes must still initialize the player for shortcode and block paths',
+      'language-switch payloads must preserve the same permission and scrubbing boundary as the primary media payload',
+      'layer/preset submission dedupe keys must match the persisted identity and any DB uniqueness guard'
     ]
   },
   'fluent-player-pro': {
@@ -150,12 +153,14 @@ const PRODUCT_PROFILES = {
     focus: [
       'Pro player feature wiring such as analytics, DRM/protected media, and premium UI overlays',
       'free/pro shared player bootstrapping and config compatibility',
-      'paid or restricted playback flows where config mismatches break real users silently'
+      'paid or restricted playback flows where config mismatches break real users silently',
+      'public/private player payload boundaries and per-media submission identity contracts'
     ],
     regressionChecks: [
       'Pro-only settings must extend, not break, the shared frontend player config contract',
       'analytics/protection changes must preserve playback start, resume, and event reporting behavior',
-      'shared player changes should be checked against both free and pro feature entry points'
+      'shared player changes should be checked against both free and pro feature entry points',
+      'language-switch payloads must not expose signed URLs, DRM fields, or filtered player settings through alternate media descriptors'
     ]
   }
 };
@@ -1191,6 +1196,40 @@ function buildProductSpecificFindings(options, reviewContext) {
         fixDirection: 'Align shortcode/block config changes with the frontend bootstrap or serialized player payload path.'
       });
     }
+
+    if (changedPathList.some((filePath) => /EmailCollectionHandler\.php|EmailCollectionsMigrator\.php/i.test(filePath))) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'important',
+        file: 'app/Hooks/Handlers/EmailCollectionHandler.php',
+        line: 1,
+        title: 'Submission identity changes need lookup and DB uniqueness parity',
+        explanation: 'Email capture dedupe bugs in Fluent Player usually come from scoping a lookup by only part of the real submission identity. If rows persist media_id alongside preset_slug or layer_id, the query path and schema need to enforce the same identity or submissions from different media can merge or duplicate under concurrency.',
+        verification: 'Trace preset and layer submissions from frontend request data through the existing-row lookup, create/update path, and flp_email_collections schema. Confirm the query key matches the persisted identity and that migrations add a matching unique index.',
+        fixDirection: 'Align the lookup/update key and the database unique key around the same persisted submission target, including media_id where that target is media-scoped.'
+      });
+    }
+
+    if (changedPathList.some((filePath) => /MediaService\.php|MediaRenderer\.php|media-page\.php|FluentCommunityMediaBlock\.php/i.test(filePath))) {
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'important',
+        file: 'app/Services/MediaService.php',
+        line: 1,
+        title: 'Language-switch payload changes need the same public trust boundary as the primary media payload',
+        explanation: 'Fluent Player often prepares one primary media payload and then localizes alternate-language descriptors separately. A change can keep the main media settings scrubbed while the languageMediaSources branch still exposes signed URLs, DRM fields, or other player_settings mutations to public page JS or guest AJAX responses.',
+        verification: 'Compare the public render/AJAX boundary for media.settings and languageMediaSources. Confirm alternate-language descriptors either stay free of privileged player_settings mutations or are filtered through the same public scrubbing path before localization.',
+        fixDirection: 'Apply one consistent permission and filtering boundary to both the primary media payload and every localized language variant.'
+      });
+
+      pushOutsideDiffFinding(outsideDiffFindings, {
+        severity: 'medium',
+        file: 'app/Services/MediaService.php',
+        line: 1,
+        title: 'Language payload changes should avoid full per-language settings blobs in initial bootstrap',
+        explanation: 'Fluent Player localizes bootstrap data into page JS. If each language entry starts carrying full settings and defaults, payload size and browser parse cost grow with the number of mapped media and can become a measurable frontend regression even when switching still works.',
+        verification: 'Inspect languageMediaSources and confirm it only carries the fields required for the initial render and first switch. Heavy settings, overlays, or provider config should be fetched lazily or cached only after the user actually switches.',
+        fixDirection: 'Keep alternate-language descriptors minimal at bootstrap time and fetch or materialize heavy runtime settings only when they are first needed.'
+      });
+    }
   }
 
   if (productProfile.repoLabel && !findings.length && !outsideDiffFindings.length) {
@@ -1272,6 +1311,64 @@ function analyzeFile(context) {
       verification: 'Inspect the exact query construction and confirm every dynamic value is either hard-cast or routed through $wpdb->prepare().',
       fixDirection: 'Route dynamic SQL values through $wpdb->prepare() before execution.'
     });
+  }
+
+  if (
+    /EmailCollectionHandler\.php$/i.test(filePath) &&
+    /when\s*\(\s*'layer'\s*==\s*\$type[\s\S]*?where\s*\(\s*'layer_id'/.test(currentContent) &&
+    !/when\s*\(\s*'layer'\s*==\s*\$type[\s\S]*?where\s*\(\s*'layer_id'[\s\S]*?where\s*\(\s*'media_id'/.test(currentContent)
+  ) {
+    pushFinding(findings, {
+      severity: 'important',
+      confidence: 'high',
+      file: filePath,
+      line: findLineNumber(currentContent, /where\s*\(\s*'layer_id'/),
+      title: 'Layer submission identity is not scoped by media_id',
+      evidence: 'The layer submission lookup keys existing rows by email and layer_id, but the same file also persists media_id for each row.',
+      impact: 'Different media items that happen to reuse the same frontend layer ID can overwrite each other, and concurrent submissions still have no full persisted identity to enforce.',
+      explanation: 'Fluent Player layer IDs are simple runtime strings, not globally unique database identifiers. When the update path omits media_id from the row identity, submissions on one media can match rows from another media that uses the same layer ID.',
+      verification: 'Trace the layer email submission from request data into the existing-row query and confirm media_id participates in the lookup anywhere layer_id does.',
+      fixDirection: 'Include media_id in the layer submission lookup/update identity and back it with a matching unique DB key.'
+    });
+  }
+
+  if (/MediaService\.php$/i.test(filePath)) {
+    if (/function\s+prepareLanguageSourcePayload[\s\S]*apply_filters\s*\(\s*'fluent_player\/player_settings'/.test(currentContent)) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /apply_filters\s*\(\s*'fluent_player\/player_settings'/),
+        title: 'Alternate-language payload applies privileged player_settings mutations',
+        evidence: 'prepareLanguageSourcePayload() runs fluent_player/player_settings while alternate language descriptors are later localized separately from the primary media payload.',
+        impact: 'Public pages or guest AJAX responses can expose signed URLs, DRM fields, or other privileged player settings through languageMediaSources even when media.settings itself is filtered correctly.',
+        explanation: 'This creates a split trust boundary: the main media payload can stay permission-gated while the alternate-language branch bypasses that same gate and leaks the post-filter settings into public JS.',
+        verification: 'Compare the public filtering boundary for media.settings and languageMediaSources and confirm alternate-language descriptors do not carry privileged player_settings output.',
+        fixDirection: 'Keep prepareLanguageSourcePayload() free of privileged player_settings mutations for public contexts, or scrub every languageMediaSources entry through the same public filter before localization.'
+      });
+    }
+
+    if (
+      /function\s+prepareLanguageSourcePayload/.test(currentContent) &&
+      (
+        /'settings'\s*=>\s*self::filterSensitiveSettings\s*\(\s*\$settings\s*\)/.test(currentContent) ||
+        /'settings'\s*=>\s*\$settings/.test(currentContent) ||
+        /'defaultSettings'\s*=>\s*SettingsService::getMediaDefaultSettings\s*\(\s*\$settings\s*\)/.test(currentContent)
+      )
+    ) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /function\s+prepareLanguageSourcePayload/),
+        title: 'Language-switch bootstrap is carrying full per-language settings',
+        evidence: 'prepareLanguageSourcePayload() appears to return full settings/defaultSettings blobs instead of a reduced runtime descriptor.',
+        impact: 'Localized player bootstrap payload size grows with the number of mapped languages and the size of each settings tree, which increases transfer, parse, and heap cost on every page render.',
+        explanation: 'This usually goes unnoticed in review because switching still works, but it turns a lightweight language descriptor into a repeated copy of overlays, layers, provider settings, and other heavy runtime config.',
+        verification: 'Inspect the localized languageMediaSources payload on a representative player and confirm it only includes the fields required for initial render and first switch.',
+        fixDirection: 'Reduce languageMediaSources to a minimal descriptor and fetch or materialize heavy settings lazily on switch.'
+      });
+    }
   }
 
   if (isPhpFile && /str_contains\s*\(/.test(currentContent)) {
@@ -2237,6 +2334,10 @@ function buildPrompt(payload) {
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
+    'Trace identity and trust boundaries across layers, not just inside the changed function.',
+    'If a diff changes dedupe, upsert, or update-by-query logic, compare the lookup key against the full persisted identity and check whether the migration/schema adds a matching unique constraint.',
+    'If a diff adds alternate payload branches such as language variants, fallback descriptors, or AJAX-only responses, compare them against the primary public payload and flag any permission, filtering, or sanitization mismatch.',
+    'Treat frontend bootstrap payload size as a real review concern when the diff starts embedding full settings/config blobs per variant or per item instead of minimal descriptors.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
     '',
