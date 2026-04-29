@@ -4,7 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
@@ -77,6 +77,7 @@ const CODEX_FILE_LIMITS = {
   balanced: 12,
   thorough: 24
 };
+const COMMAND_EXISTS_CACHE = new Map();
 const PRODUCT_PROFILES = {
   fluentform: {
     name: 'Fluent Forms',
@@ -309,6 +310,104 @@ function runCommand(command, args, options = {}) {
     stdio: ['pipe', 'pipe', 'pipe'],
     maxBuffer: options.maxBuffer || 16 * 1024 * 1024,
     timeout: options.timeout || undefined
+  });
+}
+
+async function runCommandAsync(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd || process.cwd(),
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const maxBuffer = options.maxBuffer || 16 * 1024 * 1024;
+    let stdoutSize = 0;
+    let stderrSize = 0;
+    let finished = false;
+    let timeoutId = null;
+
+    function finish(error, stdout = '') {
+      if (finished) {
+        return;
+      }
+
+      finished = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(stdout);
+    }
+
+    function buildBufferError(streamLabel) {
+      const error = new Error(`${streamLabel} maxBuffer length exceeded`);
+      error.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+      return error;
+    }
+
+    child.stdout.on('data', (chunk) => {
+      stdoutSize += chunk.length;
+      if (stdoutSize > maxBuffer) {
+        child.kill('SIGTERM');
+        finish(buildBufferError('stdout'));
+        return;
+      }
+      stdoutChunks.push(chunk);
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderrSize += chunk.length;
+      if (stderrSize > maxBuffer) {
+        child.kill('SIGTERM');
+        finish(buildBufferError('stderr'));
+        return;
+      }
+      stderrChunks.push(chunk);
+    });
+
+    child.on('error', (error) => finish(error));
+
+    child.on('close', (code, signal) => {
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+
+      if (code === 0) {
+        finish(null, stdout);
+        return;
+      }
+
+      const error = new Error(stderr || `Command failed: ${command} ${args.join(' ')}`);
+      if (signal === 'SIGTERM' && options.timeout) {
+        error.code = 'ETIMEDOUT';
+      } else {
+        error.code = code;
+      }
+      error.stderr = stderr;
+      finish(error);
+    });
+
+    if (options.timeout) {
+      timeoutId = setTimeout(() => {
+        child.kill('SIGTERM');
+      }, options.timeout);
+    }
+
+    if (options.input) {
+      child.stdin.write(options.input);
+    }
+    child.stdin.end();
+  }).catch((error) => {
+    const stderr = error.stderr ? String(error.stderr).trim() : '';
+    const normalizedError = new Error(stderr || error.message);
+    normalizedError.code = error.code;
+    normalizedError.stderr = stderr;
+    throw normalizedError;
   });
 }
 
@@ -943,6 +1042,57 @@ function getUnifiedDiff(cwd, baseRef, options, filePaths) {
   return buildDiffSegments(cwd, baseRef, options, filePaths).join('\n');
 }
 
+function indexUnifiedDiff(diffText) {
+  const segmentsByPath = new Map();
+
+  if (!diffText) {
+    return segmentsByPath;
+  }
+
+  const lines = diffText.split('\n');
+  let currentFile = null;
+  let currentSegment = [];
+
+  function flushSegment() {
+    if (!currentFile || !currentSegment.length) {
+      return;
+    }
+
+    const existing = segmentsByPath.get(currentFile) || [];
+    existing.push(currentSegment.join('\n'));
+    segmentsByPath.set(currentFile, existing);
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('diff --git ')) {
+      flushSegment();
+      currentSegment = [line];
+      const match = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+      currentFile = match ? match[2] : null;
+      continue;
+    }
+
+    if (!currentSegment.length) {
+      continue;
+    }
+
+    currentSegment.push(line);
+
+    if (line.startsWith('+++ b/')) {
+      currentFile = line.slice(6);
+    }
+  }
+
+  flushSegment();
+  return segmentsByPath;
+}
+
+function getScopedDiffFromIndex(diffIndex, filePaths) {
+  return filePaths
+    .flatMap((filePath) => diffIndex.get(filePath) || [])
+    .join('\n');
+}
+
 function getBaseContent(cwd, baseRef, filePath) {
   if (!baseRef) {
     return '';
@@ -959,28 +1109,17 @@ function getCurrentContent(cwd, filePath) {
   return safeReadFile(path.join(cwd, filePath));
 }
 
-function extractChangedLines(diffText, filePath) {
+function extractChangedLinesFromSegment(diffText) {
   const lines = diffText.split('\n');
   const changedLines = [];
-  let currentFile = null;
   let currentLine = 0;
 
   for (const line of lines) {
-    if (line.startsWith('+++ b/')) {
-      currentFile = line.slice(6);
-      currentLine = 0;
-      continue;
-    }
-
     if (line.startsWith('@@')) {
       const match = line.match(/\+(\d+)(?:,(\d+))?/);
       if (match) {
         currentLine = parseInt(match[1], 10);
       }
-      continue;
-    }
-
-    if (currentFile !== filePath) {
       continue;
     }
 
@@ -999,6 +1138,31 @@ function extractChangedLines(diffText, filePath) {
   }
 
   return changedLines;
+}
+
+function getCurrentContentForContext(reviewContext, filePath) {
+  if (!reviewContext.currentContentByPath.has(filePath)) {
+    reviewContext.currentContentByPath.set(filePath, getCurrentContent(reviewContext.cwd, filePath));
+  }
+
+  return reviewContext.currentContentByPath.get(filePath);
+}
+
+function getBaseContentForContext(reviewContext, filePath) {
+  if (!reviewContext.baseContentByPath.has(filePath)) {
+    reviewContext.baseContentByPath.set(filePath, getBaseContent(reviewContext.cwd, reviewContext.baseRef, filePath));
+  }
+
+  return reviewContext.baseContentByPath.get(filePath);
+}
+
+function getChangedLinesForContext(reviewContext, filePath) {
+  if (!reviewContext.changedLinesByPath.has(filePath)) {
+    const scopedDiff = getScopedDiffFromIndex(reviewContext.diffIndex, [filePath]);
+    reviewContext.changedLinesByPath.set(filePath, scopedDiff ? extractChangedLinesFromSegment(scopedDiff) : []);
+  }
+
+  return reviewContext.changedLinesByPath.get(filePath);
 }
 
 function findLineNumber(content, pattern) {
@@ -1227,7 +1391,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
     const inventoryRendererEntry = findChangedEntry(fileEntries, (filePath) => /InventoryFieldsRenderer\.php$/i.test(filePath));
     if (inventoryRendererEntry) {
-      const content = getCurrentContent(cwd, inventoryRendererEntry.path);
+      const content = getCurrentContentForContext(reviewContext, inventoryRendererEntry.path);
       if (/\$field\[['"]settings\.[^'"]+['"]\s*(?:\.\s*\$[A-Za-z_][A-Za-z0-9_]*)?\]\s*=/.test(content) && /(Arr|ArrayHelper)::get\s*\([^)]*['"]settings\./.test(content)) {
         pushFinding(findings, {
           severity: 'important',
@@ -1246,7 +1410,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
     const entryViewEntry = findChangedEntry(fileEntries, (filePath) => /StepFormEntries\/Components\/Entry\.vue$/i.test(filePath));
     if (entryViewEntry) {
-      const content = getCurrentContent(cwd, entryViewEntry.path);
+      const content = getCurrentContentForContext(reviewContext, entryViewEntry.path);
       const loopsAdvancedOptions = /each\s*\(\s*advancedOptions/.test(content);
       const directOptionMapping = /options\[[^\]]*optionItem\.value[^\]]*\]\s*=/.test(content) || /optionItem\.label/.test(content);
       const hasGroupedPayloadGuard = /flattenAdvancedOptions|isMappableOption|optionItem\s*&&\s*typeof\s+optionItem\s*===\s*['"]object['"]|Object\.prototype\.hasOwnProperty\.call\(optionItem,\s*['"]value['"]\)/.test(content);
@@ -1271,7 +1435,7 @@ function buildProductSpecificFindings(options, reviewContext) {
   if (productProfile.repoLabel === 'fluent-conversational-js') {
     const fileTypeEntry = findChangedEntry(fileEntries, (filePath) => /FileType\.vue$/i.test(filePath));
     if (fileTypeEntry) {
-      const content = getCurrentContent(cwd, fileTypeEntry.path);
+      const content = getCurrentContentForContext(reviewContext, fileTypeEntry.path);
       const hasImageOnload = /image\.onload\s*=/.test(content);
       const hasCropperCreate = /new\s+Cropper\s*\(/.test(content);
       const hasCleanupFlag = /isClosed|cleanedUp|destroyed|isDestroyed/.test(content);
@@ -1295,7 +1459,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
     const toggleTypeEntry = findChangedEntry(fileEntries, (filePath) => /ToggleType\.vue$/i.test(filePath));
     if (toggleTypeEntry) {
-      const content = getCurrentContent(cwd, toggleTypeEntry.path);
+      const content = getCurrentContentForContext(reviewContext, toggleTypeEntry.path);
       const hasChoiceButtons = /ff_conv_toggle__choice/.test(content) || /<button\b/.test(content);
       const hasAriaLabels = /:aria-label=|aria-label=/.test(content);
       const hasDisabledBinding = /<button\b[^>]*:disabled=|<button\b[^>]*\bdisabled\b|<el-switch\b[^>]*:disabled=/.test(content);
@@ -1334,7 +1498,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
     const toggleStyleEntry = findChangedEntry(fileEntries, (filePath) => /app\.scss$/i.test(filePath));
     if (toggleStyleEntry) {
-      const content = getCurrentContent(cwd, toggleStyleEntry.path);
+      const content = getCurrentContentForContext(reviewContext, toggleStyleEntry.path);
       if (/ff_conv_toggle__choice:focus\s*\{[\s\S]*outline\s*:\s*none/i.test(content) && !/ff_conv_toggle__choice:focus-visible\s*\{[\s\S]*(outline|box-shadow|border)/i.test(content)) {
         pushFinding(findings, {
           severity: 'important',
@@ -1444,7 +1608,7 @@ function buildProductSpecificFindings(options, reviewContext) {
     if (isProRepo) {
       const subtitleControllerEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleController\.php$/i.test(filePath));
       if (subtitleControllerEntry) {
-        const content = getCurrentContent(cwd, subtitleControllerEntry.path);
+        const content = getCurrentContentForContext(reviewContext, subtitleControllerEntry.path);
 
         if (/makeSubtitleDedupKey\s*\(/.test(content) && /array_map\s*\(\s*\[\$this,\s*['"]makeSubtitleDedupKey['"]\s*\],\s*\$subtitles\s*\)/.test(content)) {
           const incomingDedupArrayMissingTrackId = /makeSubtitleDedupKey\s*\(\s*\[\s*[\s\S]*['"]url['"]\s*=>[\s\S]*['"]language['"]\s*=>[\s\S]*['"]label['"]\s*=>[\s\S]*\]\s*\)/.test(content)
@@ -1488,7 +1652,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
       const subtitleServiceEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleService\.php$/i.test(filePath));
       if (subtitleServiceEntry) {
-        const content = getCurrentContent(cwd, subtitleServiceEntry.path);
+        const content = getCurrentContentForContext(reviewContext, subtitleServiceEntry.path);
         const remoteDecodeWithoutLimit = /wp_remote_(get|post)\s*\([\s\S]*json_decode\s*\(\s*\$body\s*,\s*true\s*\)/.test(content)
           && !/limit_response_size|strlen\s*\(\s*\$body\s*\)|MAX_[A-Z0-9_]*BYTES/.test(content);
 
@@ -1510,7 +1674,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 
       const actionsEntry = findChangedEntry(fileEntries, (filePath) => /app\/Hooks\/actions\.php$/i.test(filePath));
       if (actionsEntry) {
-        const content = getCurrentContent(cwd, actionsEntry.path);
+        const content = getCurrentContentForContext(reviewContext, actionsEntry.path);
         const saveHookRemoteWork = /after_save_media/.test(content) && /(wp_remote_|Storyboard|storyboard|downloadRemoteTracks|generate)/.test(content) && !/wp_schedule_single_event|queue[A-Z]|dispatch|as_enqueue_async_action|schedule/i.test(content);
 
         if (saveHookRemoteWork) {
@@ -3517,10 +3681,16 @@ function normalizeOutsideDiffFinding(finding) {
 }
 
 function commandExists(command) {
+  if (COMMAND_EXISTS_CACHE.has(command)) {
+    return COMMAND_EXISTS_CACHE.get(command);
+  }
+
   try {
     runCommand(command, ['--version']);
+    COMMAND_EXISTS_CACHE.set(command, true);
     return true;
   } catch (error) {
+    COMMAND_EXISTS_CACHE.set(command, false);
     return false;
   }
 }
@@ -3593,15 +3763,50 @@ function runRenderedAccessibilityScan(options, cwd) {
   }
 }
 
-function collectFileContexts(cwd, fileEntries, baseRef, diffText, highRiskPaths) {
+async function runRenderedAccessibilityScanAsync(options, cwd) {
+  if (!options.a11yUrls || !options.a11yUrls.length) {
+    return null;
+  }
+
+  if (!moduleExists('playwright') || !moduleExists('axe-core')) {
+    throw new Error('Rendered accessibility scan requires the playwright and axe-core packages to be installed.');
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-a11y-'));
+  const inputPath = path.join(tempDir, 'input.json');
+  const outputPath = path.join(tempDir, 'output.json');
+  const scriptPath = path.join(__dirname, 'lib', 'runtime-accessibility-scan.js');
+  const payload = {
+    urls: options.a11yUrls,
+    waitForSelector: options.a11yWaitFor || null,
+    timeoutMs: options.a11yTimeout || DEFAULT_CONFIG.a11yTimeout,
+    storageStatePath: options.a11yStorageState ? path.resolve(cwd, options.a11yStorageState) : null,
+    headless: true
+  };
+
+  writeJsonFile(inputPath, payload);
+
+  try {
+    await runCommandAsync(process.execPath, [scriptPath, inputPath, outputPath], {
+      cwd,
+      maxBuffer: 32 * 1024 * 1024
+    });
+
+    return JSON.parse(safeReadFile(outputPath));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function collectFileContexts(reviewContext, fileEntries, highRiskPaths) {
   return fileEntries.map((entry) => {
     const filePath = entry.path;
     return {
       path: filePath,
       highRisk: isHighRiskPath(filePath, highRiskPaths),
-      base: truncateText(getBaseContent(cwd, baseRef, filePath), 8000),
-      current: truncateText(getCurrentContent(cwd, filePath), 12000),
-      changedLines: extractChangedLines(diffText, filePath).slice(0, 80)
+      base: truncateText(getBaseContentForContext(reviewContext, filePath), 8000),
+      current: truncateText(getCurrentContentForContext(reviewContext, filePath), 12000),
+      changedLines: getChangedLinesForContext(reviewContext, filePath).slice(0, 80)
     };
   });
 }
@@ -3688,7 +3893,7 @@ function isGeneratedOrBinaryPath(filePath) {
 
 function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
   const filePath = entry.path;
-  const changedLines = extractChangedLines(reviewContext.diffText, filePath).length;
+  const changedLines = getChangedLinesForContext(reviewContext, filePath).length;
   const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
   const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
   const isHighRisk = isHighRiskPath(filePath, options.highRiskPaths);
@@ -3738,7 +3943,7 @@ function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
     .map((entry) => ({
       entry,
       score: scoreCodexEntry(entry, reviewContext, heuristicSeed, options),
-      changedLines: extractChangedLines(reviewContext.diffText, entry.path).length
+      changedLines: getChangedLinesForContext(reviewContext, entry.path).length
     }))
     .sort((left, right) => {
       if (right.score !== left.score) {
@@ -3809,12 +4014,83 @@ function runCodexReview(payload, options, cwd) {
   }
 }
 
+async function runCodexReviewAsync(payload, options, cwd) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-'));
+  const schemaPath = path.join(tempDir, 'schema.json');
+  const outputPath = path.join(tempDir, 'output.json');
+  const prompt = buildPrompt(payload);
+
+  writeJsonFile(schemaPath, REVIEW_SCHEMA);
+
+  const args = [
+    'exec',
+    '-',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--ephemeral',
+    '--sandbox',
+    'read-only',
+    '--skip-git-repo-check',
+    '--color',
+    'never',
+    '--output-schema',
+    schemaPath,
+    '-o',
+    outputPath,
+    '-C',
+    cwd
+  ];
+
+  if (options.model) {
+    args.push('--model', options.model);
+  }
+
+  try {
+    await runCommandAsync('codex', args, {
+      cwd,
+      input: prompt,
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS
+    });
+
+    const parsed = JSON.parse(safeReadFile(outputPath));
+    return {
+      engine: 'codex',
+      fallbackUsed: false,
+      notes: [],
+      verdict: parsed.verdict,
+      confidenceScore: parsed.confidence_score,
+      summary: parsed.summary,
+      keyChanges: parsed.key_changes || [],
+      findings: (parsed.findings || []).map(normalizeCodexFinding),
+      outsideDiffFindings: (parsed.outside_diff_findings || []).map(normalizeOutsideDiffFinding)
+    };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function isCodexTimeoutError(error) {
   if (!error) {
     return false;
   }
 
   return error.code === 'ETIMEDOUT' || /timed out/i.test(error.message || '');
+}
+
+function toSettledPromise(promise) {
+  return Promise.resolve(promise).then(
+    (value) => ({ status: 'fulfilled', value }),
+    (reason) => ({ status: 'rejected', reason })
+  );
+}
+
+function unwrapSettledResult(outcome, label) {
+  if (!outcome || outcome.status !== 'rejected') {
+    return outcome ? outcome.value : null;
+  }
+
+  throw new Error(`${label}: ${outcome.reason.message}`);
 }
 
 function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuristic', fallbackUsed = false) {
@@ -3825,9 +4101,9 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
 
   for (const entry of fileEntries) {
     const filePath = entry.path;
-    const currentContent = getCurrentContent(reviewContext.cwd, filePath);
-    const baseContent = getBaseContent(reviewContext.cwd, baseRef, filePath);
-    const changedLines = extractChangedLines(diffText, filePath);
+    const currentContent = getCurrentContentForContext(reviewContext, filePath);
+    const baseContent = getBaseContentForContext(reviewContext, filePath);
+    const changedLines = getChangedLinesForContext(reviewContext, filePath);
     const fileFindings = analyzeFile({
       filePath,
       currentContent,
@@ -3893,6 +4169,7 @@ function createReviewContext(options, cwd) {
   const fileEntries = listChangedFiles(cwd, options, baseRef);
   const instructions = getRepoInstructions(cwd, options.repoConfigPath);
   const diffText = getUnifiedDiff(cwd, baseRef, options, fileEntries.map((entry) => entry.path));
+  const diffIndex = indexUnifiedDiff(diffText);
   const repoRoot = getRepoRoot(cwd);
   const repoLabel = getRepoLabel(cwd);
   const productProfile = buildCustomProductProfile(repoLabel, options.productProfile) || getProductProfile(repoLabel);
@@ -3905,6 +4182,10 @@ function createReviewContext(options, cwd) {
     fileEntries,
     instructions,
     diffText,
+    diffIndex,
+    currentContentByPath: new Map(),
+    baseContentByPath: new Map(),
+    changedLinesByPath: new Map(),
     currentBranch: getCurrentBranch(cwd),
     reviewedCommit: getCurrentCommit(cwd),
     repoLabel
@@ -4006,7 +4287,7 @@ function appendRuntimeAccessibility(reviewResult, runtimeScan) {
   };
 }
 
-function createReviewReport(options, cwd = process.cwd()) {
+async function createReviewReport(options, cwd = process.cwd()) {
   const loadedConfig = loadRepoConfig(cwd);
   const resolvedOptions = resolveOptions(options, loadedConfig.config);
   resolvedOptions.repoConfigPath = loadedConfig.configPath;
@@ -4042,11 +4323,14 @@ function createReviewReport(options, cwd = process.cwd()) {
       confidenceScore: 3,
       summary: 'No local diff was selected, but rendered accessibility pages were scanned.',
       findings: []
-    }, runRenderedAccessibilityScan(resolvedOptions, cwd)));
+    }, await runRenderedAccessibilityScanAsync(resolvedOptions, cwd)));
 
     return buildFinalReport(resolvedOptions, reviewContext, runtimeOnlyResult);
   }
 
+  const runtimeScanPromise = shouldRunRuntimeA11y
+    ? toSettledPromise(runRenderedAccessibilityScanAsync(resolvedOptions, cwd))
+    : Promise.resolve({ status: 'fulfilled', value: null });
   const heuristicSeed = runHeuristicReview(resolvedOptions, reviewContext, baseNotes.slice(), 'heuristic', false);
   const shouldUseCodex = resolvedOptions.engine === 'codex' || resolvedOptions.engine === 'auto';
 
@@ -4066,13 +4350,13 @@ function createReviewReport(options, cwd = process.cwd()) {
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(heuristicResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+          appendRuntimeAccessibility(heuristicResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
         )
       );
     }
 
     const selectedEntries = selectCodexFileEntries(reviewContext, heuristicSeed, resolvedOptions);
-    const selectedDiff = getUnifiedDiff(cwd, reviewContext.baseRef, resolvedOptions, selectedEntries.map((entry) => entry.path));
+    const selectedDiff = getScopedDiffFromIndex(reviewContext.diffIndex, selectedEntries.map((entry) => entry.path));
 
     if (selectedEntries.length < reviewContext.fileEntries.length) {
       notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for ${resolvedOptions.reviewDepth} review depth.`);
@@ -4099,11 +4383,20 @@ function createReviewReport(options, cwd = process.cwd()) {
       },
       workflow: resolvedOptions.workflow,
       diffText: truncateText(selectedDiff, 30000),
-      fileContexts: collectFileContexts(cwd, selectedEntries, reviewContext.baseRef, selectedDiff, resolvedOptions.highRiskPaths)
+      fileContexts: collectFileContexts(reviewContext, selectedEntries, resolvedOptions.highRiskPaths)
     };
 
     try {
-      const codexResult = runCodexReview(payload, resolvedOptions, cwd);
+      const [codexOutcome, runtimeOutcome] = await Promise.all([
+        toSettledPromise(runCodexReviewAsync(payload, resolvedOptions, cwd)),
+        runtimeScanPromise
+      ]);
+      if (codexOutcome.status === 'rejected') {
+        throw codexOutcome.reason;
+      }
+
+      const codexResult = codexOutcome.value;
+      const runtimeScan = unwrapSettledResult(runtimeOutcome, 'Rendered accessibility scan failed');
       codexResult.notes = notes.slice();
       codexResult.codexReviewedFiles = selectedEntries.map((entry) => entry.path);
       return buildFinalReport(
@@ -4112,7 +4405,7 @@ function createReviewReport(options, cwd = process.cwd()) {
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(codexResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+          appendRuntimeAccessibility(codexResult, runtimeScan)
         )
       );
     } catch (error) {
@@ -4127,7 +4420,7 @@ function createReviewReport(options, cwd = process.cwd()) {
           applyWorkflowPostProcessing(
             resolvedOptions,
             reviewContext,
-            appendRuntimeAccessibility(fallbackResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+            appendRuntimeAccessibility(fallbackResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
           )
         );
       }
@@ -4144,7 +4437,7 @@ function createReviewReport(options, cwd = process.cwd()) {
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(fallbackResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+          appendRuntimeAccessibility(fallbackResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
         )
       );
     }
@@ -4156,7 +4449,7 @@ function createReviewReport(options, cwd = process.cwd()) {
     applyWorkflowPostProcessing(
       resolvedOptions,
       reviewContext,
-      appendRuntimeAccessibility(heuristicSeed, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+      appendRuntimeAccessibility(heuristicSeed, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
     )
   );
 }

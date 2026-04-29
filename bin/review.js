@@ -66,7 +66,7 @@ function archiveExistingReportIfNeeded(reportPath, workflow) {
   fs.copyFileSync(reportPath, archivePath);
 }
 
-function main() {
+async function main() {
   const options = parseArgs(process.argv.slice(2));
 
   if (options.help) {
@@ -81,7 +81,7 @@ function main() {
   }
 
   try {
-    const report = createReviewReport(options, process.cwd());
+    const report = await createReviewReport(options, process.cwd());
 
     if (report.reportPath) {
       const resolvedReportPath = path.resolve(process.cwd(), report.reportPath);
