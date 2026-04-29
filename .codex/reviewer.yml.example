@@ -32,3 +32,8 @@ notes:
   - Payment path changes should include verification for strict and non-strict flows.
   - Webhook changes should be reviewed with verification and replay risks in mind.
   - Settings or meta shape changes should be checked for backward compatibility.
+accessibility:
+  urls: []
+  wait_for:
+  timeout_ms: 30000
+  storage_state:

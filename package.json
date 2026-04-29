@@ -12,6 +12,7 @@
   "files": [
     ".codex/",
     "bin/",
+    "lib/",
     "reviewer.js",
     "README.md",
     "SETUP.md",
@@ -29,7 +30,9 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "js-yaml": "^4.1.0"
+    "axe-core": "^4.11.3",
+    "js-yaml": "^4.1.0",
+    "playwright": "^1.59.1"
   },
   "engines": {
     "node": ">=18.0.0"

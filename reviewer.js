@@ -8,6 +8,24 @@ const { execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
+const WORKFLOW_PRESETS = {
+  debugger: {
+    format: 'markdown',
+    report: 'debugger-report.md',
+    reviewDepth: 'thorough',
+    maxFindings: 20,
+    mode: 'full',
+    engine: 'auto'
+  },
+  'plugin-audit': {
+    format: 'markdown',
+    report: 'plugin-audit.md',
+    reviewDepth: 'thorough',
+    maxFindings: 30,
+    mode: 'full',
+    engine: 'auto'
+  }
+};
 const DEFAULT_IGNORES = [
   '.git/',
   'node_modules/',
@@ -47,7 +65,11 @@ const DEFAULT_CONFIG = {
   focusAreas: [],
   ignorePaths: [],
   highRiskPaths: [],
-  notes: []
+  notes: [],
+  a11yUrls: [],
+  a11yWaitFor: null,
+  a11yTimeout: 30000,
+  a11yStorageState: null
 };
 const CODEX_FILE_LIMITS = {
   balanced: 12,
@@ -150,12 +172,13 @@ const PRODUCT_PROFILES = {
     focus: [
       'Pro player feature wiring such as analytics, DRM/protected media, and premium UI overlays',
       'free/pro shared player bootstrapping and config compatibility',
-      'paid or restricted playback flows where config mismatches break real users silently'
+      'subtitle-service, attachment, and storyboard workflows where remote or destructive behavior can break real users silently'
     ],
     regressionChecks: [
       'Pro-only settings must extend, not break, the shared frontend player config contract',
       'analytics/protection changes must preserve playback start, resume, and event reporting behavior',
-      'shared player changes should be checked against both free and pro feature entry points'
+      'shared player changes should be checked against both free and pro feature entry points',
+      'subtitle import and storyboard changes must enforce attachment ownership, sanitize remote metadata, and avoid synchronous remote work on save paths'
     ]
   }
 };
@@ -340,6 +363,7 @@ function parseArgs(argv) {
     head: 'HEAD',
     staged: false,
     files: [],
+    workflow: null,
     mode: 'full',
     format: 'text',
     report: null,
@@ -348,6 +372,10 @@ function parseArgs(argv) {
     engine: 'auto',
     model: null,
     reviewDepth: 'balanced',
+    a11yUrls: [],
+    a11yWaitFor: null,
+    a11yTimeout: DEFAULT_CONFIG.a11yTimeout,
+    a11yStorageState: null,
     help: false,
     version: false,
     _explicit: {}
@@ -414,6 +442,19 @@ function parseArgs(argv) {
     if (arg.startsWith('--files=')) {
       options.files = arg.slice('--files='.length).split(',').map((item) => item.trim()).filter(Boolean);
       options._explicit.files = true;
+      continue;
+    }
+
+    if (arg === '--workflow' && argv[i + 1]) {
+      options.workflow = argv[i + 1];
+      options._explicit.workflow = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--workflow=')) {
+      options.workflow = arg.slice('--workflow='.length);
+      options._explicit.workflow = true;
       continue;
     }
 
@@ -518,10 +559,96 @@ function parseArgs(argv) {
     if (arg.startsWith('--review-depth=')) {
       options.reviewDepth = arg.slice('--review-depth='.length);
       options._explicit.reviewDepth = true;
+      continue;
+    }
+
+    if (arg === '--a11y-url' && argv[i + 1]) {
+      options.a11yUrls.push(argv[i + 1]);
+      options._explicit.a11yUrls = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--a11y-url=')) {
+      options.a11yUrls.push(arg.slice('--a11y-url='.length));
+      options._explicit.a11yUrls = true;
+      continue;
+    }
+
+    if (arg === '--a11y-urls' && argv[i + 1]) {
+      options.a11yUrls.push(...argv[i + 1].split(',').map((item) => item.trim()).filter(Boolean));
+      options._explicit.a11yUrls = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--a11y-urls=')) {
+      options.a11yUrls.push(...arg.slice('--a11y-urls='.length).split(',').map((item) => item.trim()).filter(Boolean));
+      options._explicit.a11yUrls = true;
+      continue;
+    }
+
+    if (arg === '--a11y-wait-for' && argv[i + 1]) {
+      options.a11yWaitFor = argv[i + 1];
+      options._explicit.a11yWaitFor = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--a11y-wait-for=')) {
+      options.a11yWaitFor = arg.slice('--a11y-wait-for='.length);
+      options._explicit.a11yWaitFor = true;
+      continue;
+    }
+
+    if (arg === '--a11y-timeout' && argv[i + 1]) {
+      options.a11yTimeout = normalizeInteger(argv[i + 1], DEFAULT_CONFIG.a11yTimeout);
+      options._explicit.a11yTimeout = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--a11y-timeout=')) {
+      options.a11yTimeout = normalizeInteger(arg.slice('--a11y-timeout='.length), DEFAULT_CONFIG.a11yTimeout);
+      options._explicit.a11yTimeout = true;
+      continue;
+    }
+
+    if (arg === '--a11y-storage-state' && argv[i + 1]) {
+      options.a11yStorageState = argv[i + 1];
+      options._explicit.a11yStorageState = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--a11y-storage-state=')) {
+      options.a11yStorageState = arg.slice('--a11y-storage-state='.length);
+      options._explicit.a11yStorageState = true;
     }
   }
 
+  options.a11yUrls = Array.from(new Set(options.a11yUrls.map((item) => item.trim()).filter(Boolean)));
   return options;
+}
+
+function applyWorkflowPreset(options) {
+  if (!options.workflow) {
+    return options;
+  }
+
+  const preset = WORKFLOW_PRESETS[options.workflow];
+  if (!preset) {
+    throw new Error(`Unknown workflow "${options.workflow}". Supported workflows: ${Object.keys(WORKFLOW_PRESETS).join(', ')}`);
+  }
+
+  const next = { ...options };
+  ['mode', 'format', 'report', 'reviewDepth', 'maxFindings', 'engine'].forEach((key) => {
+    if (!options._explicit[key]) {
+      next[key] = preset[key];
+    }
+  });
+
+  return next;
 }
 
 function resolveDefaultBase(cwd) {
@@ -549,6 +676,11 @@ function normalizeStringArray(value) {
   }
 
   return value.map((item) => String(item).trim()).filter(Boolean);
+}
+
+function normalizeInteger(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function loadRepoConfig(cwd) {
@@ -585,13 +717,24 @@ function loadRepoConfig(cwd) {
       focusAreas: normalizeStringArray(parsed.focus_areas || parsed.focusAreas),
       ignorePaths: normalizeStringArray((parsed.paths && parsed.paths.ignore) || parsed.ignore_paths || parsed.ignorePaths),
       highRiskPaths: normalizeStringArray((parsed.paths && parsed.paths.high_risk) || parsed.high_risk_paths || parsed.highRiskPaths),
-      notes: normalizeStringArray(parsed.notes)
+      notes: normalizeStringArray(parsed.notes),
+      a11yUrls: normalizeStringArray((parsed.accessibility && parsed.accessibility.urls) || parsed.a11y_urls || parsed.a11yUrls),
+      a11yWaitFor: typeof ((parsed.accessibility && parsed.accessibility.wait_for) || (parsed.accessibility && parsed.accessibility.waitFor) || parsed.a11y_wait_for || parsed.a11yWaitFor) === 'string'
+        ? ((parsed.accessibility && parsed.accessibility.wait_for) || (parsed.accessibility && parsed.accessibility.waitFor) || parsed.a11y_wait_for || parsed.a11yWaitFor)
+        : DEFAULT_CONFIG.a11yWaitFor,
+      a11yTimeout: normalizeInteger(
+        (parsed.accessibility && (parsed.accessibility.timeout_ms || parsed.accessibility.timeoutMs)) || parsed.a11y_timeout || parsed.a11yTimeout,
+        DEFAULT_CONFIG.a11yTimeout
+      ),
+      a11yStorageState: typeof ((parsed.accessibility && parsed.accessibility.storage_state) || (parsed.accessibility && parsed.accessibility.storageState) || parsed.a11y_storage_state || parsed.a11yStorageState) === 'string'
+        ? ((parsed.accessibility && parsed.accessibility.storage_state) || (parsed.accessibility && parsed.accessibility.storageState) || parsed.a11y_storage_state || parsed.a11yStorageState)
+        : DEFAULT_CONFIG.a11yStorageState
     }
   };
 }
 
 function resolveOptions(rawOptions, repoConfig) {
-  const options = {
+  const options = applyWorkflowPreset({
     ...rawOptions,
     base: rawOptions._explicit.base ? rawOptions.base : (repoConfig.base || rawOptions.base),
     mode: rawOptions._explicit.mode ? rawOptions.mode : repoConfig.mode,
@@ -599,13 +742,17 @@ function resolveOptions(rawOptions, repoConfig) {
     model: rawOptions._explicit.model ? rawOptions.model : repoConfig.model,
     reviewDepth: rawOptions._explicit.reviewDepth ? rawOptions.reviewDepth : repoConfig.reviewDepth,
     maxFindings: rawOptions._explicit.maxFindings ? rawOptions.maxFindings : repoConfig.maxFindings
-  };
+  });
 
   options.productProfile = repoConfig.productProfile;
   options.focusAreas = repoConfig.focusAreas;
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
   options.configNotes = repoConfig.notes;
+  options.a11yUrls = rawOptions._explicit.a11yUrls ? rawOptions.a11yUrls : repoConfig.a11yUrls;
+  options.a11yWaitFor = rawOptions._explicit.a11yWaitFor ? rawOptions.a11yWaitFor : repoConfig.a11yWaitFor;
+  options.a11yTimeout = rawOptions._explicit.a11yTimeout ? rawOptions.a11yTimeout : repoConfig.a11yTimeout;
+  options.a11yStorageState = rawOptions._explicit.a11yStorageState ? rawOptions.a11yStorageState : repoConfig.a11yStorageState;
 
   return options;
 }
@@ -867,6 +1014,27 @@ function getChangedTestFiles(fileEntries) {
   return fileEntries.filter((entry) => /(^|\/)(test|tests|__tests__)\//i.test(entry.path) || /\.(test|spec)\./i.test(entry.path));
 }
 
+function isFrontendTemplateFile(filePath) {
+  return /\.(php|html|vue|jsx|tsx)$/i.test(filePath);
+}
+
+function isStyleFile(filePath) {
+  return /\.(css|scss|sass|less)$/i.test(filePath);
+}
+
+function getLineWindow(content, lineNumber, radius = 2) {
+  const lines = content.split('\n');
+  const index = Math.max(0, (lineNumber || 1) - 1);
+  const start = Math.max(0, index - radius);
+  const end = Math.min(lines.length, index + radius + 1);
+  return lines.slice(start, end).join('\n');
+}
+
+function hasNearbyAccessibleLabel(content, lineNumber) {
+  const window = getLineWindow(content, lineNumber, 3);
+  return /<label\b|aria-label\s*=|aria-labelledby\s*=|for\s*=/.test(window);
+}
+
 function pushFinding(findings, finding) {
   const key = [finding.file, finding.line, finding.title].join(':');
   if (findings.some((item) => [item.file, item.line, item.title].join(':') === key)) {
@@ -1048,6 +1216,48 @@ function buildProductSpecificFindings(options, reviewContext) {
         });
       }
     }
+
+    const inventoryRendererEntry = findChangedEntry(fileEntries, (filePath) => /InventoryFieldsRenderer\.php$/i.test(filePath));
+    if (inventoryRendererEntry) {
+      const content = getCurrentContent(cwd, inventoryRendererEntry.path);
+      if (/\$field\[['"]settings\.[^'"]+['"]\s*(?:\.\s*\$[A-Za-z_][A-Za-z0-9_]*)?\]\s*=/.test(content) && /(Arr|ArrayHelper)::get\s*\([^)]*['"]settings\./.test(content)) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'high',
+          file: inventoryRendererEntry.path,
+          line: findLineNumber(content, /\$field\[['"]settings\.[^'"]+['"]\s*(?:\.\s*\$[A-Za-z_][A-Za-z0-9_]*)?\]\s*=/),
+          title: 'Adjusted option payload is written back to the wrong settings path',
+          evidence: 'The inventory renderer writes the transformed option collection under a literal settings.* key while neighboring reads still use helper path lookup semantics.',
+          impact: 'Grouped or transformed option data can be lost after adjustment, which breaks downstream inventory rendering and validation even when the transformation logic itself is correct.',
+          explanation: 'This is a Fluent Forms Pro contract issue: the option collection is read through nested settings paths across inventory consumers, so the write-back path must preserve that same structure.',
+          verification: 'Confirm the adjusted option collection is stored inside the nested settings array path read by inventory validation, list formatting, and render consumers.',
+          fixDirection: 'Write the adjusted options into the real nested settings array instead of a literal dotted-key path.'
+        });
+      }
+    }
+
+    const entryViewEntry = findChangedEntry(fileEntries, (filePath) => /StepFormEntries\/Components\/Entry\.vue$/i.test(filePath));
+    if (entryViewEntry) {
+      const content = getCurrentContent(cwd, entryViewEntry.path);
+      const loopsAdvancedOptions = /each\s*\(\s*advancedOptions/.test(content);
+      const directOptionMapping = /options\[[^\]]*optionItem\.value[^\]]*\]\s*=/.test(content) || /optionItem\.label/.test(content);
+      const hasGroupedPayloadGuard = /flattenAdvancedOptions|isMappableOption|optionItem\s*&&\s*typeof\s+optionItem\s*===\s*['"]object['"]|Object\.prototype\.hasOwnProperty\.call\(optionItem,\s*['"]value['"]\)/.test(content);
+
+      if (loopsAdvancedOptions && directOptionMapping && !hasGroupedPayloadGuard) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          file: entryViewEntry.path,
+          line: findLineNumber(content, /each\s*\(\s*advancedOptions/),
+          title: 'Advanced option mapping does not guard grouped payload variants',
+          evidence: 'The changed entry renderer maps advanced_options directly into a value->label lookup without flattening or validating grouped option payload members first.',
+          impact: 'Entry rendering can break when grouped options introduce container nodes or payload variants that do not match the simple value/label shape expected by the old mapping logic.',
+          explanation: 'This is the same regression class that appears when grouped options are supported in one consumer but another consumer still assumes a flat collection of directly mappable options.',
+          verification: 'Test entry rendering with grouped advanced_options payloads and confirm option collection flattening or shape guards run before value/label mapping.',
+          fixDirection: 'Flatten grouped advanced_options or guard payload members before building the rendered option map.'
+        });
+      }
+    }
   }
 
   if (productProfile.repoLabel === 'fluent-conversational-js') {
@@ -1071,6 +1281,64 @@ function buildProductSpecificFindings(options, reviewContext) {
           explanation: 'This is a product-specific race in the conversational uploader because there is no PHP fallback or second render pass to hide it. If the modal closes first and the image finishes later, the late callback still executes unless it checks the cleanup flag before creating Cropper.',
           verification: 'Close the crop dialog quickly on a large image or slow device and confirm no cropper instance is created after teardown.',
           fixDirection: 'Guard the image.onload callback with the cleanup flag before creating Cropper and return early after teardown.'
+        });
+      }
+    }
+
+    const toggleTypeEntry = findChangedEntry(fileEntries, (filePath) => /ToggleType\.vue$/i.test(filePath));
+    if (toggleTypeEntry) {
+      const content = getCurrentContent(cwd, toggleTypeEntry.path);
+      const hasChoiceButtons = /ff_conv_toggle__choice/.test(content) || /<button\b/.test(content);
+      const hasAriaLabels = /:aria-label=|aria-label=/.test(content);
+      const hasDisabledBinding = /<button\b[^>]*:disabled=|<button\b[^>]*\bdisabled\b|<el-switch\b[^>]*:disabled=/.test(content);
+      const hasDisabledGuard = /this\.disabled|if\s*\(\s*!option\s*\|\|\s*this\.disabled|if\s*\(\s*this\.disabled\s*\)/.test(content);
+
+      if (hasChoiceButtons && !hasAriaLabels) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'high',
+          file: toggleTypeEntry.path,
+          line: findLineNumber(content, /<button\b/),
+          title: 'Toggle choice buttons do not expose an accessible name',
+          evidence: 'The toggle component renders custom choice buttons but does not show aria labeling for assistive technology.',
+          impact: 'Image-based or visually minimal toggle choices can become unlabeled buttons for screen-reader users, making the question impossible to answer reliably.',
+          explanation: 'Conversational custom controls often bypass native form semantics. When choice buttons rely on images or optional labels, they need a stable accessible name independent of visual layout.',
+          verification: 'Inspect the rendered toggle choices with assistive technology and confirm each button exposes a meaningful accessible name even when visual labels or images vary.',
+          fixDirection: 'Add reliable aria-label or aria-labelledby wiring for each toggle choice button.'
+        });
+      }
+
+      if (hasChoiceButtons && !hasDisabledBinding && !hasDisabledGuard) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          file: toggleTypeEntry.path,
+          line: findLineNumber(content, /<button\b/),
+          title: 'Disabled toggle state is not propagated to all interactive controls',
+          evidence: 'The toggle component adds custom interactive controls but does not clearly bind disabled state in markup or guard interaction in the handler path.',
+          impact: 'A disabled-looking toggle can remain reachable or actionable for assistive technology and keyboard users, causing inconsistent behavior between pointer and non-pointer interaction.',
+          explanation: 'This regression is specific to custom composite controls: disabled state has to be enforced across each child button and switch-like control, not only in visual state.',
+          verification: 'Disable the field and confirm none of the toggle controls remain focusable or actionable through keyboard or assistive-technology interaction.',
+          fixDirection: 'Bind disabled state to every interactive child control and return early from selection handlers when disabled.'
+        });
+      }
+    }
+
+    const toggleStyleEntry = findChangedEntry(fileEntries, (filePath) => /app\.scss$/i.test(filePath));
+    if (toggleStyleEntry) {
+      const content = getCurrentContent(cwd, toggleStyleEntry.path);
+      if (/ff_conv_toggle__choice:focus\s*\{[\s\S]*outline\s*:\s*none/i.test(content) && !/ff_conv_toggle__choice:focus-visible\s*\{[\s\S]*(outline|box-shadow|border)/i.test(content)) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          file: toggleStyleEntry.path,
+          line: findLineNumber(content, /ff_conv_toggle__choice:focus/),
+          title: 'Toggle choice buttons remove focus styling without a visible replacement',
+          evidence: 'The toggle styles remove default focus indication from the custom choice buttons but do not show a replacement focus-visible treatment.',
+          impact: 'Keyboard users can reach the toggle choices without any clear focus indicator, which is a real accessibility regression for conversational navigation.',
+          explanation: 'This is a predictable risk whenever button defaults are stripped in a custom control. The component remains interactive, but the focus location becomes invisible during keyboard navigation.',
+          verification: 'Tab through the toggle question and confirm the focused button remains visibly highlighted against the surrounding UI.',
+          fixDirection: 'Add a clear focus-visible style for the custom toggle choice buttons whenever outline removal is used.'
         });
       }
     }
@@ -1165,6 +1433,95 @@ function buildProductSpecificFindings(options, reviewContext) {
       });
     }
 
+    if (isProRepo) {
+      const subtitleControllerEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleController\.php$/i.test(filePath));
+      if (subtitleControllerEntry) {
+        const content = getCurrentContent(cwd, subtitleControllerEntry.path);
+
+        if (/makeSubtitleDedupKey\s*\(/.test(content) && /array_map\s*\(\s*\[\$this,\s*['"]makeSubtitleDedupKey['"]\s*\],\s*\$subtitles\s*\)/.test(content)) {
+          const incomingDedupArrayMissingTrackId = /makeSubtitleDedupKey\s*\(\s*\[\s*[\s\S]*['"]url['"]\s*=>[\s\S]*['"]language['"]\s*=>[\s\S]*['"]label['"]\s*=>[\s\S]*\]\s*\)/.test(content)
+            && !/makeSubtitleDedupKey\s*\(\s*\[[\s\S]*['"]trackId['"]\s*=>|makeSubtitleDedupKey\s*\(\s*\[[\s\S]*['"]track_id['"]\s*=>/.test(content);
+
+          if (incomingDedupArrayMissingTrackId) {
+            pushFinding(findings, {
+              severity: 'important',
+              confidence: 'medium',
+              file: subtitleControllerEntry.path,
+              line: findLineNumber(content, /makeSubtitleDedupKey\s*\(\s*\[/),
+              title: 'Dedup key construction does not preserve remote track identity',
+              evidence: 'The controller computes existing subtitle keys through makeSubtitleDedupKey(), but the incoming import dedup array does not pass track_id/trackId even though the helper prioritizes that identity.',
+              impact: 'The same remote caption track can be re-imported because existing and incoming subtitle keys are computed from different identity fields.',
+              explanation: 'This is a data-contract mismatch rather than a syntax error. The dedup helper has one canonical identity order, but the import path only provides a fallback subset of fields, so already-imported remote tracks may not collide with their existing saved entry.',
+              verification: 'Confirm the import dedup path passes the same canonical identifier fields that existing saved subtitles use, especially track_id for remote caption imports.',
+              fixDirection: 'Build incoming dedup keys from the same canonical identity fields as existing subtitles, including track_id/trackId when available.'
+            });
+          }
+        }
+
+        const persistsExternalMetadata = /Arr::get\(\$track,\s*['"]language['"]|Arr::get\(\$track,\s*['"]label['"]|Arr::get\(\$track,\s*['"]track_id['"]/.test(content)
+          && /update_post_meta\s*\([^)]*settings/.test(content);
+        const hasRemoteMetadataSanitizer = /sanitize_text_field\s*\(|sanitize_file_name\s*\(/.test(content);
+
+        if (persistsExternalMetadata && !hasRemoteMetadataSanitizer) {
+          pushFinding(findings, {
+            severity: 'important',
+            confidence: 'medium',
+            file: subtitleControllerEntry.path,
+            line: findLineNumber(content, /Arr::get\(\$track,\s*['"](track_id|language|label)['"]/),
+            title: 'External subtitle metadata is persisted without visible sanitization',
+            evidence: 'The import flow reads remote track label/language/track identifiers and persists subtitle settings, but no sanitize_text_field()/sanitize_file_name() calls were detected in the controller path.',
+            impact: 'Untrusted external service metadata can become stored or reflected UI content if it reaches post meta and later API responses without normalization.',
+            explanation: 'Remote service data is still untrusted input. In subtitle import flows, label, language, track IDs, and filenames should be normalized in the service or controller layer before persistence so downstream renderers are not forced to assume they are safe.',
+            verification: 'Confirm remote track metadata is sanitized at normalization time before subtitle settings are saved or returned in responses.',
+            fixDirection: 'Sanitize remote subtitle metadata before persistence, keeping binary/text track content validation separate from label and identifier normalization.'
+          });
+        }
+      }
+
+      const subtitleServiceEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleService\.php$/i.test(filePath));
+      if (subtitleServiceEntry) {
+        const content = getCurrentContent(cwd, subtitleServiceEntry.path);
+        const remoteDecodeWithoutLimit = /wp_remote_(get|post)\s*\([\s\S]*json_decode\s*\(\s*\$body\s*,\s*true\s*\)/.test(content)
+          && !/limit_response_size|strlen\s*\(\s*\$body\s*\)|MAX_[A-Z0-9_]*BYTES/.test(content);
+
+        if (remoteDecodeWithoutLimit) {
+          pushFinding(findings, {
+            severity: 'important',
+            confidence: 'high',
+            file: subtitleServiceEntry.path,
+            line: findLineNumber(content, /json_decode\s*\(\s*\$body\s*,\s*true\s*\)/),
+            title: 'Subtitle-service response is decoded before a visible payload-size guard',
+            evidence: 'The subtitle service call reads the full response body and json_decodes it without showing an HTTP-layer response-size cap.',
+            impact: 'Large multi-track subtitle responses can trigger memory spikes or timeouts before any per-track MAX_SUBTITLE_BYTES validation runs.',
+            explanation: 'Per-track validation is not enough when the entire remote JSON body has already been materialized and decoded. The request can fail on memory long before the later subtitle-content guard rejects oversize tracks.',
+            verification: 'Confirm subtitle-service HTTP calls use limit_response_size or another hard byte cap before the response body is decoded.',
+            fixDirection: 'Add a response-size guard before json_decode and keep large subtitle imports on a bounded processing path.'
+          });
+        }
+      }
+
+      const actionsEntry = findChangedEntry(fileEntries, (filePath) => /app\/Hooks\/actions\.php$/i.test(filePath));
+      if (actionsEntry) {
+        const content = getCurrentContent(cwd, actionsEntry.path);
+        const saveHookRemoteWork = /after_save_media/.test(content) && /(wp_remote_|Storyboard|storyboard|downloadRemoteTracks|generate)/.test(content) && !/wp_schedule_single_event|queue[A-Z]|dispatch|as_enqueue_async_action|schedule/i.test(content);
+
+        if (saveHookRemoteWork) {
+          pushFinding(findings, {
+            severity: 'important',
+            confidence: 'medium',
+            file: actionsEntry.path,
+            line: findLineNumber(content, /after_save_media/),
+            title: 'Remote generation work is running synchronously on the media-save path',
+            evidence: 'The changed save hook wires storyboard, subtitle, or other remote generation work directly into after_save_media without an obvious async queue or scheduler handoff.',
+            impact: 'Media save requests can become slow or stall under remote latency because network and attachment work are running on the synchronous save path.',
+            explanation: 'This is a classic player/admin hot-path regression. Even correct remote generation logic becomes risky when it is attached directly to a save hook, because user-facing admin requests inherit the timeout and memory profile of the remote work.',
+            verification: 'Confirm remote storyboard or subtitle generation is deferred to a queue/scheduled event, or otherwise bounded so media saves do not block on the external call.',
+            fixDirection: 'Move remote generation off the synchronous save hook or gate it behind a background job / queued follow-up flow.'
+          });
+        }
+      }
+    }
+
     if (isProRepo && changedPlayerFiles.length && !changedPathList.some((filePath) => /shared|common|base|bootstrap/i.test(filePath))) {
       pushOutsideDiffFinding(outsideDiffFindings, {
         severity: 'medium',
@@ -1202,8 +1559,12 @@ function buildProductSpecificFindings(options, reviewContext) {
 
 function analyzeFile(context) {
   const findings = [];
-  const { filePath, currentContent, baseContent, changedLines, mode, highRiskPaths } = context;
+  const { filePath, currentContent, baseContent, changedLines, mode, highRiskPaths, productProfile } = context;
+  const repoLabel = productProfile ? productProfile.repoLabel : '';
   const isPhpFile = filePath.endsWith('.php');
+  const isFrontendFile = isFrontendTemplateFile(filePath);
+  const isStyleLikeFile = isStyleFile(filePath);
+  const runAccessibilityChecks = mode === 'full' || mode === 'compatibility' || mode === 'accessibility';
 
   if (!currentContent) {
     return findings;
@@ -1259,6 +1620,39 @@ function analyzeFile(context) {
     }
   }
 
+  if (isPhpFile && /wp_ajax_nopriv_/.test(currentContent) && /\$_(POST|GET|REQUEST|FILES)\s*\[/.test(currentContent) && !/check_ajax_referer\s*\(|wp_verify_nonce\s*\(/.test(currentContent)) {
+    pushFinding(findings, {
+      severity: 'important',
+      confidence: 'medium',
+      file: filePath,
+      line: findLineNumber(currentContent, /wp_ajax_nopriv_/),
+      title: 'Public AJAX endpoint does not show nonce or resource-binding protection',
+      evidence: 'The file registers a wp_ajax_nopriv_ endpoint and reads request input, but no nonce check was detected nearby.',
+      impact: 'Public AJAX handlers are frequently reachable from attacker-controlled browsers. If the action also trusts user-chosen IDs, paths, or targets, this can expose unauthorized reads, writes, or abuse of plugin-owned resources.',
+      explanation: 'In WordPress plugins, a frontend nonce is not full authorization. Public handlers usually need both anti-CSRF protection and a resource-binding check that proves the caller can act on the exact form, attachment, post, or file being referenced.',
+      verification: 'Trace the wp_ajax_nopriv_ entry point and confirm it verifies a nonce or token and binds the request to the exact resource it is allowed to touch.',
+      fixDirection: 'Add request-bound nonce or token verification and validate ownership or resource binding before processing the public AJAX action.'
+    });
+  }
+
+  if (isPhpFile && /wp_delete_attachment\s*\(/.test(currentContent)) {
+    const hasDeletePostCheck = /current_user_can\s*\(\s*['"]delete_post['"]|user_can\s*\([^)]*['"]delete_post['"]|canDeleteManaged[A-Za-z]+Attachment\s*\(/.test(currentContent);
+    if (!hasDeletePostCheck) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'medium',
+        file: filePath,
+        line: findLineNumber(currentContent, /wp_delete_attachment\s*\(/),
+        title: 'Attachment deletion path does not show per-attachment authorization',
+        evidence: 'The changed code deletes a WordPress attachment but does not show a delete_post capability or managed-attachment ownership check nearby.',
+        impact: 'Destructive attachment operations can cross media or ownership boundaries if the route-level permission is broader than the exact attachment context being deleted.',
+        explanation: 'A route or media-level permission gate is not always enough when a request can reference a specific attachment ID. Attachment deletion usually needs both per-attachment capability enforcement and a check that the attachment belongs to the expected media or managed context.',
+        verification: 'Confirm the delete flow enforces current_user_can(\'delete_post\', $attachmentId) or an equivalent ownership helper before wp_delete_attachment() runs.',
+        fixDirection: 'Add per-attachment authorization and managed-context ownership checks before deleting the attachment.'
+      });
+    }
+  }
+
   if (isPhpFile && /\$wpdb->(query|get_results|get_row|get_var)\s*\(/.test(currentContent) && !/\$wpdb->prepare\s*\(/.test(currentContent)) {
     pushFinding(findings, {
       severity: 'important',
@@ -1274,6 +1668,24 @@ function analyzeFile(context) {
     });
   }
 
+  if (isPhpFile && /wp_remote_(get|post)\s*\(/.test(currentContent) && /json_decode\s*\(/.test(currentContent)) {
+    const hasResponseSizeGuard = /limit_response_size|strlen\s*\(\s*\$body\s*\)|mb_strlen\s*\(\s*\$body\s*\)|MAX_[A-Z0-9_]*BYTES|response-size|response size/i.test(currentContent);
+    if (!hasResponseSizeGuard) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'medium',
+        file: filePath,
+        line: findLineNumber(currentContent, /json_decode\s*\(/),
+        title: 'Remote JSON response is decoded without a visible size guard',
+        evidence: 'The changed code fetches a remote response and json_decodes it, but no response-size cap was detected nearby.',
+        impact: 'Large remote payloads can exhaust PHP memory or trigger very slow requests before downstream field-level validation ever runs.',
+        explanation: 'This pattern matters in WordPress because wp_remote_get()/wp_remote_post() materialize the response body in memory first. If the code then json_decodes the entire body without a limit_response_size guard or an explicit byte cap, a remote service can turn one request into a memory spike.',
+        verification: 'Check whether the HTTP call uses limit_response_size or an equivalent byte-limit before json_decode, especially on multi-item download endpoints.',
+        fixDirection: 'Add a hard response-size cap before json_decode or switch the flow to a bounded incremental processing approach.'
+      });
+    }
+  }
+
   if (isPhpFile && /str_contains\s*\(/.test(currentContent)) {
     pushFinding(findings, {
       severity: 'medium',
@@ -1287,6 +1699,40 @@ function analyzeFile(context) {
       verification: 'Check the repo minimum PHP version and release policy. If older versions are still supported, replace this with a compatibility-safe substring check.',
       fixDirection: 'Confirm the minimum PHP version or use a compatibility-safe substring check.'
     });
+  }
+
+  const dottedSettingsWrite = changedLines.find((entry) => /\[['"][^'"]*\.[^'"]*['"]\s*(?:\.\s*[$A-Za-z_][A-Za-z0-9_]*)?\]\s*=/.test(entry.text));
+  if (isPhpFile && dottedSettingsWrite && /(Arr|ArrayHelper)::get\s*\([^)]*['"]settings\./.test(currentContent)) {
+    pushFinding(findings, {
+      severity: 'important',
+      confidence: 'high',
+      file: filePath,
+      line: dottedSettingsWrite.line,
+      title: 'Dotted settings key is being written as a literal array path',
+      evidence: 'The changed code writes to an array key like settings.* as a literal string while the same file also reads settings.* through Arr::get()/ArrayHelper::get() path semantics.',
+      impact: 'This can break downstream consumers that expect nested settings arrays and silently lose transformed field configuration before render or validation.',
+      explanation: 'In WPManageNinja codebases, dotted paths are often read through helper path semantics, not stored as literal array keys. Writing the transformed payload back under a literal dotted key makes the write path structurally inconsistent with the read path.',
+      verification: 'Confirm the updated data is written into the nested settings array structure expected by downstream Arr::get()/ArrayHelper::get() readers.',
+      fixDirection: 'Write the updated payload into the real nested array path instead of a literal dotted-key string.'
+    });
+  }
+
+  if (repoLabel === 'fluentformpro') {
+    const wrongTextDomain = changedLines.find((entry) => /(__|_e|_x|esc_html__|esc_attr__)\s*\([^)]*['"]fluentform['"]/.test(entry.text));
+    if (isPhpFile && wrongTextDomain) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: wrongTextDomain.line,
+        title: 'Pro code is using the free-plugin text domain',
+        evidence: 'The changed translation call uses the fluentform text domain inside Fluent Forms Pro code.',
+        impact: 'This breaks translation isolation between free and Pro packages and can cause strings to miss the intended Pro translation catalog.',
+        explanation: 'Fluent Forms Pro has its own text domain contract. Reusing the free-plugin domain in Pro code is easy to miss in review because the string still renders correctly in development, but it violates the i18n boundary the product relies on.',
+        verification: 'Check that every new translation call in Pro code uses the fluentformpro text domain consistently.',
+        fixDirection: 'Change the translation call to use the fluentformpro text domain.'
+      });
+    }
   }
 
   const unescapedEcho = changedLines.find((entry) => /echo\s+\$_(GET|POST|REQUEST)/.test(entry.text));
@@ -1335,6 +1781,117 @@ function analyzeFile(context) {
         explanation: 'This pattern is easy to miss in review because the loop itself looks harmless, but once it wraps remote requests or database reads it can scale poorly with entry count or field count.',
         verification: 'Estimate the worst-case loop size and confirm expensive work is cached, batched, or moved outside the iteration.',
         fixDirection: 'Check whether expensive work can be cached, batched, or moved outside the loop.'
+      });
+    }
+  }
+
+  if (runAccessibilityChecks && isFrontendFile) {
+    const unlabeledControl = changedLines.find((entry) => {
+      if (!/<(input|select|textarea)\b/i.test(entry.text) || /type\s*=\s*["']hidden["']/i.test(entry.text)) {
+        return false;
+      }
+
+      if (/aria-label\s*=|aria-labelledby\s*=/.test(entry.text)) {
+        return false;
+      }
+
+      return !hasNearbyAccessibleLabel(currentContent, entry.line);
+    });
+
+    if (unlabeledControl) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'medium',
+        file: filePath,
+        line: unlabeledControl.line,
+        title: 'Form control does not show an accessible label',
+        evidence: 'A changed input, select, or textarea does not show a nearby label or aria labeling hook.',
+        impact: 'Screen reader users can encounter unnamed form controls, making settings pages, blocks, or frontend forms difficult or impossible to complete reliably.',
+        explanation: 'WordPress plugin UIs often render inside wp-admin, Gutenberg, or public forms where labels are part of both accessibility and supportability. A control that looks obvious visually can still be effectively anonymous to assistive technology.',
+        verification: 'Check the rendered control and confirm it has a visible <label>, or an equivalent aria-label/aria-labelledby relationship that survives the final markup.',
+        fixDirection: 'Add a semantic <label> association or an explicit aria-label/aria-labelledby for the changed control.'
+      });
+    }
+
+    const unlabeledImage = changedLines.find((entry) => /<img\b/i.test(entry.text) && !/\balt\s*=/.test(entry.text));
+    if (unlabeledImage) {
+      pushFinding(findings, {
+        severity: 'low',
+        confidence: 'high',
+        file: filePath,
+        line: unlabeledImage.line,
+        title: 'Image markup is missing alt text',
+        evidence: 'A changed <img> tag does not include an alt attribute.',
+        impact: 'Assistive technology cannot determine whether the image is decorative or meaningful, and missing alt text also weakens fallback behavior when assets fail to load.',
+        explanation: 'Plugin UIs commonly include icons, previews, and instructional imagery. Even decorative images should set alt="" explicitly so screen readers can skip them predictably.',
+        verification: 'Check whether the image is decorative or conveys content, then confirm the rendered markup includes the appropriate alt attribute.',
+        fixDirection: 'Add alt text for informative images or alt="" for decorative-only images.'
+      });
+    }
+
+    const clickableNonInteractive = changedLines.find((entry) => /<(div|span|li|p)\b[^>]*(@click=|v-on:click=|onClick=|onclick=)/.test(entry.text) && !/\b(role=|tabindex=|@keydown=|v-on:keydown=|onKeyDown=|@keyup=|onKeyUp=)/.test(entry.text));
+    if (clickableNonInteractive) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'high',
+        file: filePath,
+        line: clickableNonInteractive.line,
+        title: 'Non-interactive element is handling click behavior directly',
+        evidence: 'A changed div/span/li/p element handles click interaction without visible keyboard semantics.',
+        impact: 'Keyboard users may not be able to reach or activate the control, and assistive technology will not consistently announce it as interactive.',
+        explanation: 'This is a common accessibility regression in plugin admin UIs and Vue/React components. If an element behaves like a button or disclosure, it should usually be a real <button> or it needs explicit keyboard and role semantics.',
+        verification: 'Test the interaction with keyboard-only navigation and confirm the element is reachable, announced correctly, and activatable with Enter/Space.',
+        fixDirection: 'Use a semantic button element or add the required role, tabindex, and keyboard handlers for equivalent accessibility.'
+      });
+    }
+
+    const unnamedButton = changedLines.find((entry) => /<button\b[^>]*>\s*(<[^/][^>]*>\s*)*<\/button>/i.test(entry.text) && !/aria-label\s*=|aria-labelledby\s*=|title\s*=/.test(entry.text));
+    if (unnamedButton) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'medium',
+        file: filePath,
+        line: unnamedButton.line,
+        title: 'Button does not show an accessible name',
+        evidence: 'A changed button appears to render without visible text or aria labeling.',
+        impact: 'Icon-only or visually minimal controls can become silent to screen readers, which makes toolbars, modal controls, and media actions hard to discover and use.',
+        explanation: 'WordPress plugin screens often rely on compact action buttons. If the control name is only implied by an icon, assistive technology may announce it as a generic button with no purpose.',
+        verification: 'Inspect the rendered button and confirm it exposes a clear accessible name through visible text or aria-label/aria-labelledby.',
+        fixDirection: 'Add visible button text or an explicit accessible name for icon-only controls.'
+      });
+    }
+
+    const clickableButtonWithoutDisabledState = changedLines.find((entry) => /<button\b[^>]*@click|<button\b[^>]*onClick=/.test(entry.text) && !/:disabled=| disabled\b|aria-disabled=/.test(entry.text));
+    if (clickableButtonWithoutDisabledState && /\bdisabled\b/.test(currentContent) && !/this\.disabled|if\s*\(\s*!option\s*\|\|\s*this\.disabled|if\s*\(\s*this\.disabled\s*\)/.test(currentContent)) {
+      pushFinding(findings, {
+        severity: 'medium',
+        confidence: 'medium',
+        file: filePath,
+        line: clickableButtonWithoutDisabledState.line,
+        title: 'Custom interactive control does not show disabled-state enforcement',
+        evidence: 'A changed clickable button does not show disabled binding, and the component logic does not visibly guard interaction when disabled.',
+        impact: 'Disabled-looking controls can remain reachable or actionable for keyboard users and assistive technology, causing inconsistent UI state and accessibility regressions.',
+        explanation: 'Custom controls often need disabled handling in both markup and behavior. If the element is still clickable or focusable while the form considers it disabled, assistive-technology users can trigger states that mouse users cannot.',
+        verification: 'Confirm every interactive child control receives disabled semantics and that click/change handlers return early when the component is disabled.',
+        fixDirection: 'Propagate disabled semantics to all interactive controls and guard event handlers against disabled interaction.'
+      });
+    }
+  }
+
+  if (runAccessibilityChecks && isStyleLikeFile) {
+    const outlineRemoved = changedLines.find((entry) => /outline\s*:\s*none/.test(entry.text));
+    if (outlineRemoved && /cursor\s*:\s*pointer|appearance\s*:\s*none|<button\b/.test(currentContent) && !/:focus-visible[\s\S]{0,400}(outline|box-shadow|border)/.test(currentContent)) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'medium',
+        file: filePath,
+        line: outlineRemoved.line,
+        title: 'Custom interactive styling removes focus indication without a visible replacement',
+        evidence: 'The changed styles remove outline from an interactive element, but the file does not show a nearby :focus-visible replacement.',
+        impact: 'Keyboard users can tab to the control without any clear visual indication of focus, which is a real usability and accessibility regression.',
+        explanation: 'Custom UI components often remove browser default button styling. If the replacement styles do not restore a visible focus state, non-mouse navigation becomes much harder even though the control still works functionally.',
+        verification: 'Tab through the changed control and confirm the focused state remains clearly visible against the surrounding UI.',
+        fixDirection: 'Add a visible :focus-visible or equivalent focus treatment whenever default outlines are removed.'
       });
     }
   }
@@ -1445,7 +2002,14 @@ function normalizeConfidenceScore(rawScore, findings, context) {
 
   if (isHeuristicOnly) {
     if (!findings.length) {
-      return 3;
+      if (
+        !touchedHighRiskPaths &&
+        reviewedFiles <= 2
+      ) {
+        return 5;
+      }
+
+      return 4;
     }
 
     if (hasCriticalFinding || importantFindings.length >= 2) {
@@ -1464,10 +2028,6 @@ function normalizeConfidenceScore(rawScore, findings, context) {
   }
 
   if (findings.length) {
-    if (importantFindings.length || mediumFindings.length) {
-      return 3;
-    }
-
     return 3;
   }
 
@@ -1510,6 +2070,14 @@ function getCurrentCommit(cwd) {
     return runGit(['rev-parse', '--short', 'HEAD'], { cwd }).trim();
   } catch (error) {
     return null;
+  }
+}
+
+function getCurrentBranch(cwd) {
+  try {
+    return runGit(['branch', '--show-current'], { cwd }).trim() || 'HEAD';
+  } catch (error) {
+    return 'HEAD';
   }
 }
 
@@ -1631,6 +2199,76 @@ function buildFindingSummary(findings) {
   });
 
   return counts;
+}
+
+function getSeverityDisplayLabel(severity) {
+  const labels = {
+    critical: 'Critical',
+    important: 'Important',
+    medium: 'Medium',
+    low: 'Low'
+  };
+
+  return labels[severity] || severity;
+}
+
+function getSeverityKeyLabel(severity) {
+  return String(severity || '').toUpperCase();
+}
+
+function getSeverityOrder() {
+  return ['critical', 'important', 'medium', 'low'];
+}
+
+function groupFindingsBySeverity(findings) {
+  const groups = new Map(getSeverityOrder().map((severity) => [severity, []]));
+
+  findings.forEach((finding) => {
+    if (!groups.has(finding.severity)) {
+      groups.set(finding.severity, []);
+    }
+    groups.get(finding.severity).push(finding);
+  });
+
+  return groups;
+}
+
+function getFindingDisplayEntries(findings) {
+  const groups = groupFindingsBySeverity(findings);
+  const entries = [];
+
+  getSeverityOrder().forEach((severity) => {
+    const severityFindings = groups.get(severity) || [];
+    severityFindings.forEach((finding, index) => {
+      entries.push({
+        ...finding,
+        severityIndex: index + 1,
+        severityKey: `${getSeverityKeyLabel(severity)}-${String(index + 1).padStart(2, '0')}`
+      });
+    });
+  });
+
+  return entries;
+}
+
+function buildPrioritizedBacklog(findings) {
+  return getFindingDisplayEntries(findings).map((finding) => ({
+    key: finding.severityKey,
+    title: finding.title,
+    task: finding.fixDirection,
+    file: finding.file,
+    line: finding.line
+  }));
+}
+
+function slugifyHeading(text) {
+  return String(text || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[`*_]/g, '')
+    .replace(/[^a-z0-9\s-]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-');
 }
 
 function buildFixPrompt(report, finding) {
@@ -1767,17 +2405,374 @@ function buildNarrativeSummary(report) {
   return `${leading.join('; ')}.`;
 }
 
+function getReportTitle(report) {
+  if (report.workflow === 'debugger') {
+    return `Debugger Report — ${report.repoLabel}`;
+  }
+
+  if (report.workflow === 'plugin-audit') {
+    return `Plugin Audit Report — ${report.repoLabel}`;
+  }
+
+  return `Codex Review Report — ${report.repoLabel}`;
+}
+
+function getWorkflowSeverityLabel(workflow, severity) {
+  if (workflow === 'plugin-audit') {
+    return {
+      critical: 'CRITICAL',
+      important: 'HIGH',
+      medium: 'MEDIUM',
+      low: 'SUGGESTION'
+    }[severity] || String(severity || '').toUpperCase();
+  }
+
+  return {
+    critical: 'CRITICAL',
+    important: 'HIGH',
+    medium: 'MEDIUM',
+    low: 'LOW'
+  }[severity] || String(severity || '').toUpperCase();
+}
+
+function getWorkflowSeverityHeading(workflow, severity) {
+  if (workflow === 'plugin-audit') {
+    return {
+      critical: 'Critical',
+      important: 'High',
+      medium: 'Medium',
+      low: 'Suggestion'
+    }[severity] || getSeverityDisplayLabel(severity);
+  }
+
+  return {
+    critical: 'Critical',
+    important: 'High',
+    medium: 'Medium',
+    low: 'Low'
+  }[severity] || getSeverityDisplayLabel(severity);
+}
+
+function getWorkflowDisplayEntries(workflow, findings) {
+  const groups = groupFindingsBySeverity(findings);
+  const entries = [];
+
+  getSeverityOrder().forEach((severity) => {
+    const severityFindings = groups.get(severity) || [];
+    severityFindings.forEach((finding, index) => {
+      entries.push({
+        ...finding,
+        severityIndex: index + 1,
+        severityKey: `${getWorkflowSeverityLabel(workflow, severity)}-${String(index + 1).padStart(2, '0')}`
+      });
+    });
+  });
+
+  return entries;
+}
+
+function inferFindingArea(finding) {
+  const haystack = `${finding.title}\n${finding.evidence}\n${finding.explanation}\n${finding.verification}`.toLowerCase();
+
+  if (/(nonce|capability|auth|permission|xss|sql|ssrf|sanitize|csrf|secret|token|file upload|attachment deletion|current_user_can|wp_ajax_nopriv)/.test(haystack)) {
+    return 'Security';
+  }
+
+  if (/(memory|timeout|response-size|unbounded|slow|performance|scheduler|async save path|sync save path|queue|duplicate scheduling)/.test(haystack)) {
+    return 'Optimization';
+  }
+
+  return 'Traceability';
+}
+
+function inferRiskClassification(finding) {
+  const haystack = `${finding.title}\n${finding.explanation}\n${finding.verification}`.toLowerCase();
+  if (finding.severity === 'low' || /verification|follow-up|manual check|test changes/.test(haystack)) {
+    return 'Hardening';
+  }
+
+  return 'Bug';
+}
+
+function buildSeverityRationale(finding, workflow) {
+  const label = getWorkflowSeverityHeading(workflow, finding.severity);
+  if (finding.severity === 'critical') {
+    return `${label}: the code evidence points to a directly actionable security or data-integrity failure with merge-blocking impact.`;
+  }
+
+  if (finding.severity === 'important') {
+    return `${label}: the path looks merge-blocking because the failure mode is concrete and can break authorization, persistence, or core user flows.`;
+  }
+
+  if (finding.severity === 'medium') {
+    return `${label}: the issue is meaningful and evidence-backed, but the impact appears more bounded than a blocker.`;
+  }
+
+  if (workflow === 'plugin-audit') {
+    return `${label}: the signal is useful as an implementation improvement or caution, but it does not currently justify blocker status.`;
+  }
+
+  return `${label}: the issue is real enough to keep on the backlog, but the current impact looks limited or primarily hardening-oriented.`;
+}
+
+function buildWorkflowVerifierNote(finding) {
+  if (finding.confidence === 'high') {
+    return 'Verifier re-traced the changed path and the failure mode stays intact without finding a stronger mitigating guard in the supplied code.';
+  }
+
+  return 'Verifier kept this issue because the code path still shows a concrete gap, but the final impact should be re-checked during fix validation.';
+}
+
+function buildExpectedActualBehavior(finding) {
+  return `Expected: ${finding.verification || 'the changed path should preserve the intended guarded behavior.'} Actual: ${finding.evidence}`;
+}
+
+function buildFeedbackForNextRun(finding) {
+  const haystack = `${finding.title}\n${finding.evidence}`.toLowerCase();
+
+  if (/nonce|capability|auth|permission/.test(haystack)) {
+    return 'Re-check authz findings end to end: route/policy/helper/resource binding, not only nonce presence.';
+  }
+
+  if (/subtitle|storyboard|remote|response-size|attachment/.test(haystack)) {
+    return 'Prioritize remote-work and attachment flows again when player media features change, especially around ownership and bounded payload handling.';
+  }
+
+  if (/focus|label|button|keyboard|accessibility/.test(haystack)) {
+    return 'Repeat the UI audit with keyboard-only interaction and rendered accessibility checks before merge.';
+  }
+
+  return 'Keep this regression class in the next run and require end-to-end verification before treating similar paths as safe.';
+}
+
+function buildTaskStatement(finding) {
+  return finding.fixDirection || finding.verification || 'Implement the narrowest fix that removes the confirmed failure mode and re-verify the affected workflow.';
+}
+
+function buildEntryPoint(reviewContext, finding) {
+  if (/app\/http\/routes\//i.test(finding.file)) {
+    return `Route definition in ${finding.file}`;
+  }
+
+  if (/controller|handler|hook|actions\.php|filters\.php/i.test(finding.file)) {
+    return `Runtime entry in ${finding.file}`;
+  }
+
+  return `Changed path in ${finding.file}`;
+}
+
+function createWorkflowRejectedCandidate(finding, reviewContext, reason) {
+  return {
+    title: finding.title,
+    file: finding.file,
+    line: finding.line,
+    confidence: finding.confidence,
+    area: inferFindingArea(finding),
+    entryPoint: buildEntryPoint(reviewContext, finding),
+    evidence: finding.evidence,
+    rejectionReason: reason,
+    verifierNote: 'Verifier did not keep this as a confirmed issue because the current signal is too generic or not tied to a concrete broken effect.'
+  };
+}
+
+function createWorkflowManualCandidate(finding, reviewContext, reason) {
+  return {
+    ...finding,
+    area: inferFindingArea(finding),
+    entryPoint: buildEntryPoint(reviewContext, finding),
+    taskStatement: buildTaskStatement(finding),
+    verifierNote: reason
+  };
+}
+
+function enrichWorkflowFinding(finding, workflow, reviewContext) {
+  return {
+    ...finding,
+    area: inferFindingArea(finding),
+    riskClassification: inferRiskClassification(finding),
+    entryPoint: buildEntryPoint(reviewContext, finding),
+    reproductionPath: finding.verification,
+    expectedActualBehavior: buildExpectedActualBehavior(finding),
+    severityRationale: buildSeverityRationale(finding, workflow),
+    recommendedFix: finding.fixDirection,
+    verifierNote: buildWorkflowVerifierNote(finding),
+    feedbackForNextRun: buildFeedbackForNextRun(finding),
+    taskStatement: buildTaskStatement(finding)
+  };
+}
+
+function isVerifierOnlySignal(finding) {
+  return /verification|without matching test changes|coverage|manual scenario|needs product-specific verification/i.test(`${finding.title}\n${finding.explanation}\n${finding.verification}`);
+}
+
+function buildWorkflowFeedbackUpdates(confirmedFindings, rejectedCandidates, manualCandidates) {
+  const updates = [];
+
+  if (rejectedCandidates.length) {
+    updates.push('Reject broad verification-only warnings unless they point to a concrete broken effect in the changed code path.');
+  }
+
+  if (manualCandidates.some((finding) => /nonce|capability|auth/i.test(`${finding.title}\n${finding.evidence}`))) {
+    updates.push('Keep public-endpoint and delegated-permission checks skeptical: require resource binding and exact permission matching, not only a visible nonce.');
+  }
+
+  if (confirmedFindings.some((finding) => /focus|label|keyboard|button|accessibility/i.test(`${finding.title}\n${finding.evidence}`))) {
+    updates.push('When UI controls change, pair static checks with rendered accessibility verification instead of treating markup-only review as sufficient.');
+  }
+
+  if (confirmedFindings.some((finding) => /remote|response-size|subtitle|attachment|storyboard/i.test(`${finding.title}\n${finding.evidence}`))) {
+    updates.push('Repeat remote payload and ownership checks on media-related changes, because these regressions reappear when new service integrations are added.');
+  }
+
+  return Array.from(new Set(updates));
+}
+
+function classifyPluginAuditWorkstream(finding) {
+  const haystack = `${finding.title}\n${finding.evidence}\n${finding.explanation}`.toLowerCase();
+
+  if (inferFindingArea(finding) === 'Security') {
+    return 'Security';
+  }
+
+  if (/dead code|unused|duplicate|duplication|unreachable/.test(haystack)) {
+    return 'Dead code and duplication';
+  }
+
+  if (/memory|timeout|response-size|slow|performance|queue|scheduler/.test(haystack)) {
+    return 'Performance and optimization';
+  }
+
+  if (/block|shortcode|frontend|ui|modal|button|label|focus|settings path|render|bootstrap/.test(haystack)) {
+    return 'Traceability from UI entry points to handlers';
+  }
+
+  return 'Traceability from handlers to services/database and back to response';
+}
+
+function applyDebuggerWorkflow(reviewResult, reviewContext) {
+  const confirmed = [];
+  const rejectedCandidates = [];
+  const manualCandidates = [];
+
+  (reviewResult.findings || []).forEach((finding) => {
+    if (finding.confidence === 'low' && finding.severity !== 'critical') {
+      if (isVerifierOnlySignal(finding)) {
+        manualCandidates.push(createWorkflowManualCandidate(finding, reviewContext, 'Verifier kept this as a follow-up item rather than a confirmed bug because the signal is real but still too verification-oriented.'));
+      } else {
+        rejectedCandidates.push(createWorkflowRejectedCandidate(finding, reviewContext, 'The signal was too weak to survive verification as a confirmed bug.'));
+      }
+      return;
+    }
+
+    confirmed.push(enrichWorkflowFinding(finding, 'debugger', reviewContext));
+  });
+
+  (reviewResult.outsideDiffFindings || []).forEach((finding) => {
+    manualCandidates.push(createWorkflowManualCandidate(finding, reviewContext, 'Verifier could not confirm this inside the changed lines and kept it for manual follow-up.'));
+  });
+
+  const feedbackUpdates = buildWorkflowFeedbackUpdates(confirmed, rejectedCandidates, manualCandidates);
+  const verdictCounts = {
+    confirmed: confirmed.length,
+    rejected: rejectedCandidates.length,
+    manual: manualCandidates.length
+  };
+
+  return {
+    ...reviewResult,
+    verdict: buildVerdict(confirmed),
+    confidenceScore: buildConfidence(confirmed),
+    summary: confirmed.length
+      ? `Finder generated ${confirmed.length + rejectedCandidates.length + manualCandidates.length} candidate(s); verifier confirmed ${confirmed.length}, rejected ${rejectedCandidates.length}, and left ${manualCandidates.length} for manual verification.`
+      : `Finder generated ${rejectedCandidates.length + manualCandidates.length} candidate(s), but verifier did not confirm a blocker-level bug in the current diff.`,
+    findings: confirmed,
+    outsideDiffFindings: manualCandidates,
+    workflowData: {
+      rejectedCandidates,
+      needsManualVerification: manualCandidates,
+      feedbackUpdates,
+      verdictCounts
+    }
+  };
+}
+
+function applyPluginAuditWorkflow(reviewResult, reviewContext) {
+  const confirmed = [];
+  const manualCandidates = [];
+
+  (reviewResult.findings || []).forEach((finding) => {
+    if ((finding.severity === 'critical' || finding.severity === 'important') && finding.confidence === 'low') {
+      manualCandidates.push(createWorkflowManualCandidate(finding, reviewContext, 'Pass 6 verification downgraded this to manual follow-up because the impact path is plausible but not proven strongly enough in the current static evidence.'));
+      return;
+    }
+
+    confirmed.push(enrichWorkflowFinding(finding, 'plugin-audit', reviewContext));
+  });
+
+  (reviewResult.outsideDiffFindings || []).forEach((finding) => {
+    manualCandidates.push(createWorkflowManualCandidate(finding, reviewContext, 'Pass 6 verification kept this outside the confirmed set because it depends on adjacent code or runtime behavior not fully shown in the diff.'));
+  });
+
+  const workstreamNames = [
+    'Security',
+    'Performance and optimization',
+    'Dead code and duplication',
+    'Traceability from UI entry points to handlers',
+    'Traceability from handlers to services/database and back to response'
+  ];
+
+  const workstreamSummaries = workstreamNames.map((name) => ({
+    name,
+    confirmedCount: confirmed.filter((finding) => classifyPluginAuditWorkstream(finding) === name).length,
+    manualCount: manualCandidates.filter((finding) => classifyPluginAuditWorkstream(finding) === name).length
+  }));
+
+  return {
+    ...reviewResult,
+    verdict: buildVerdict(confirmed),
+    confidenceScore: buildConfidence(confirmed),
+    summary: confirmed.length
+      ? `Sequentially emulated five audit workstreams plus Pass 6 verification and confirmed ${confirmed.length} implementation-ready issue(s).`
+      : 'Sequentially emulated five audit workstreams plus Pass 6 verification and found no confirmed issues in the reviewed diff.',
+    findings: confirmed,
+    outsideDiffFindings: manualCandidates,
+    workflowData: {
+      needsManualVerification: manualCandidates,
+      workstreamSummaries
+    }
+  };
+}
+
+function applyWorkflowPostProcessing(options, reviewContext, reviewResult) {
+  if (options.workflow === 'debugger') {
+    return applyDebuggerWorkflow(reviewResult, reviewContext);
+  }
+
+  if (options.workflow === 'plugin-audit') {
+    return applyPluginAuditWorkflow(reviewResult, reviewContext);
+  }
+
+  return reviewResult;
+}
+
 function renderText(report) {
   const lines = [];
   const counts = buildFindingSummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
+  const displayFindings = getFindingDisplayEntries(report.findings);
+  const groupedFindings = groupFindingsBySeverity(displayFindings);
+  const backlogItems = buildPrioritizedBacklog(report.findings);
 
+  lines.push(getReportTitle(report), '');
   lines.push('Summary', '');
   lines.push(buildNarrativeSummary(report));
   lines.push('');
   lines.push(report.summary);
   lines.push('');
   lines.push(`Merge stance: ${report.verdict}`);
+  if (report.workflow) {
+    lines.push(`Workflow: ${report.workflow}`);
+  }
   lines.push(`Confidence score: ${report.confidenceScore}/5 (${buildConfidenceLabel(report.confidenceScore)})`);
   lines.push(`Base: ${report.baseRef}`);
   lines.push(`Mode: ${report.mode}`);
@@ -1802,6 +2797,14 @@ function renderText(report) {
   if (report.notes.length) {
     lines.push('', 'Notes:');
     report.notes.forEach((note) => lines.push(`- ${note}`));
+  }
+
+  if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
+    lines.push('', 'Rendered Accessibility Scan:');
+    lines.push(`- Pages scanned: ${report.runtimeAccessibility.pages.length}`);
+    report.runtimeAccessibility.pages.forEach((page) => {
+      lines.push(`- ${page.url} (${page.violations} violation(s))`);
+    });
   }
 
   if (report.recheck) {
@@ -1831,8 +2834,13 @@ function renderText(report) {
     }
   }
 
-  if (report.findings.length) {
-    lines.push('', 'Findings', '');
+  if (displayFindings.length) {
+    lines.push('', 'Table of Contents:');
+    displayFindings.forEach((finding) => lines.push(`- ${finding.severityKey}: ${finding.title}`));
+  }
+
+  if (displayFindings.length) {
+    lines.push('', 'Confirmed Findings By Severity', '');
     if (blockerCount) {
       lines.push('Must fix before merge.');
       lines.push('');
@@ -1842,39 +2850,51 @@ function renderText(report) {
     }
     lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
 
-    report.findings.forEach((finding, index) => {
+    getSeverityOrder().forEach((severity) => {
+      const severityFindings = groupedFindings.get(severity) || [];
+      if (!severityFindings.length) {
+        return;
+      }
+
       lines.push('');
-      lines.push(`${index + 1}. ${finding.title}`);
-      lines.push(`   Severity: ${finding.severity}`);
-      lines.push(`   Confidence: ${finding.confidence}`);
-      lines.push(`   Fingerprint: ${finding.fingerprint}`);
-      lines.push(`   File: ${finding.file}:${finding.line}`);
-      lines.push(`   What is wrong: ${finding.evidence}`);
-      lines.push(`   Why it matters: ${finding.impact}`);
-      lines.push(`   Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
-      lines.push(`   What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
-      lines.push(`   Fix: ${finding.fixDirection}`);
-      lines.push('   Prompt To Fix With AI:');
+      lines.push(`${getSeverityDisplayLabel(severity)} Findings`);
       lines.push('');
-      buildFixPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
+
+      severityFindings.forEach((finding) => {
+        lines.push(`${finding.severityKey}: ${finding.title}`);
+        lines.push(`   Confidence: ${finding.confidence}`);
+        lines.push(`   Fingerprint: ${finding.fingerprint}`);
+        lines.push(`   File: ${finding.file}:${finding.line}`);
+        lines.push(`   Evidence: ${finding.evidence}`);
+        lines.push(`   Impact: ${finding.impact}`);
+        lines.push(`   Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
+        lines.push(`   What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
+        lines.push(`   Recommended fix: ${finding.fixDirection}`);
+        lines.push('   Prompt To Fix With AI:');
+        lines.push('');
+        buildFixPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
+        lines.push('');
+      });
     });
 
+    lines.push('Prioritized Fix Backlog', '');
+    backlogItems.forEach((item) => lines.push(`- ${item.key}: ${item.task} (${item.file}:${item.line})`));
     lines.push('', 'Prompt To Fix All With AI:', '');
     buildFixAllPrompt(report).split('\n').forEach((line) => lines.push(line));
   } else {
-    lines.push('', 'Findings', '', 'No findings.');
+    lines.push('', 'Confirmed Findings By Severity', '', 'No findings.');
   }
 
   if (report.outsideDiffFindings.length) {
-    lines.push('', 'Outside Diff Follow-ups', '');
+    lines.push('', 'Needs Manual Verification', '');
     report.outsideDiffFindings.forEach((finding, index) => {
       lines.push(`${index + 1}. ${finding.title}`);
       lines.push(`   Severity: ${finding.severity}`);
       lines.push(`   Fingerprint: ${finding.fingerprint}`);
       lines.push(`   Location: ${finding.file}:${finding.line}`);
-      lines.push(`   Why it matters: ${finding.explanation}`);
+      lines.push(`   Why this needs follow-up: ${finding.explanation}`);
       lines.push(`   What to verify: ${finding.verification}`);
-      lines.push(`   Fix: ${finding.fixDirection}`);
+      lines.push(`   Suggested fix direction: ${finding.fixDirection}`);
       lines.push('   Prompt To Fix With AI:');
       lines.push('');
       buildOutsideDiffPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
@@ -1889,11 +2909,243 @@ function renderText(report) {
   return lines.join('\n');
 }
 
+function renderDebuggerMarkdown(report) {
+  const confirmedFindings = getWorkflowDisplayEntries('debugger', report.findings);
+  const severityCounts = buildFindingSummary(report.findings);
+  const rejectedCandidates = (report.workflowData && report.workflowData.rejectedCandidates) || [];
+  const manualCandidates = (report.workflowData && report.workflowData.needsManualVerification) || [];
+  const feedbackUpdates = (report.workflowData && report.workflowData.feedbackUpdates) || [];
+  const backlogItems = confirmedFindings.map((finding) => ({
+    key: finding.severityKey,
+    task: finding.taskStatement,
+    file: finding.file,
+    line: finding.line
+  }));
+  const lines = [
+    `# ${getReportTitle(report)}`,
+    '',
+    '## Executive Summary',
+    '',
+    report.summary,
+    '',
+    `- Merge stance: \`${report.verdict}\``,
+    `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
+    `- Safe to merge: ${report.confidenceScore >= 4 && !report.findings.length ? 'yes' : 'no'}`,
+    '',
+    '| Severity | Count |',
+    '| --- | ---: |',
+    `| CRITICAL | ${severityCounts.critical} |`,
+    `| HIGH | ${severityCounts.important} |`,
+    `| MEDIUM | ${severityCounts.medium} |`,
+    `| LOW | ${severityCounts.low} |`,
+    '',
+    '| Verdict bucket | Count |',
+    '| --- | ---: |',
+    `| Confirmed | ${confirmedFindings.length} |`,
+    `| Rejected | ${rejectedCandidates.length} |`,
+    `| Needs manual verification | ${manualCandidates.length} |`
+  ];
+
+  if (confirmedFindings.length) {
+    lines.push('', '## Table of Contents', '');
+    confirmedFindings.forEach((finding) => {
+      const heading = `${finding.severityKey}: ${finding.title}`;
+      lines.push(`- [${heading}](#${slugifyHeading(heading)})`);
+    });
+  }
+
+  lines.push('', '## Confirmed Bugs by Severity', '');
+  getSeverityOrder().forEach((severity) => {
+    const grouped = confirmedFindings.filter((finding) => finding.severity === severity);
+    if (!grouped.length) {
+      return;
+    }
+
+    lines.push(`### ${getWorkflowSeverityHeading('debugger', severity)}`, '');
+    grouped.forEach((finding) => {
+      const heading = `${finding.severityKey}: ${finding.title}`;
+      lines.push(`#### ${heading}`, '');
+      lines.push(`- Area: \`${finding.area}\``);
+      lines.push(`- Risk classification: \`${finding.riskClassification}\``);
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- File:line: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Entry point: ${finding.entryPoint}`);
+      lines.push(`- Reproduction path: ${finding.reproductionPath}`);
+      lines.push(`- Evidence: ${finding.evidence}`);
+      lines.push(`- Expected vs actual behavior: ${finding.expectedActualBehavior}`);
+      lines.push(`- Impact: ${finding.impact}`);
+      lines.push(`- Severity rationale: ${finding.severityRationale}`);
+      lines.push(`- Recommended fix: ${finding.recommendedFix}`);
+      lines.push(`- Verifier note: ${finding.verifierNote}`);
+      lines.push(`- Feedback for next run: ${finding.feedbackForNextRun}`);
+      lines.push(`- Task statement: ${finding.taskStatement}`);
+      lines.push('');
+    });
+  });
+
+  lines.push('## Rejected Candidates', '');
+  if (rejectedCandidates.length) {
+    rejectedCandidates.forEach((finding, index) => {
+      lines.push(`### ${index + 1}. ${finding.title}`, '');
+      lines.push(`- Area: \`${finding.area}\``);
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- File:line: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Entry point: ${finding.entryPoint}`);
+      lines.push(`- Evidence: ${finding.evidence}`);
+      lines.push(`- Rejection reason: ${finding.rejectionReason}`);
+      lines.push(`- Verifier note: ${finding.verifierNote}`);
+      lines.push('');
+    });
+  } else {
+    lines.push('No rejected candidates.');
+  }
+
+  lines.push('', '## Needs Manual Verification', '');
+  if (manualCandidates.length) {
+    manualCandidates.forEach((finding, index) => {
+      lines.push(`### ${index + 1}. ${finding.title}`, '');
+      lines.push(`- Area: \`${finding.area}\``);
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- File:line: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Entry point: ${finding.entryPoint}`);
+      lines.push(`- Evidence: ${finding.evidence || finding.explanation}`);
+      lines.push(`- What to verify: ${finding.verification}`);
+      lines.push(`- Recommended fix: ${finding.fixDirection || finding.taskStatement}`);
+      lines.push(`- Verifier note: ${finding.verifierNote}`);
+      lines.push('');
+    });
+  } else {
+    lines.push('No manual verification items.');
+  }
+
+  lines.push('', '## Prioritized Fix Backlog', '');
+  backlogItems.forEach((item) => lines.push(`- ${item.key}: ${item.task} (\`${item.file}:${item.line}\`)`));
+
+  lines.push('', '## Feedback Loop Updates', '');
+  if (feedbackUpdates.length) {
+    feedbackUpdates.forEach((item) => lines.push(`- ${item}`));
+  } else {
+    lines.push('- No new calibration updates from this run.');
+  }
+
+  return lines.join('\n');
+}
+
+function renderPluginAuditMarkdown(report) {
+  const findings = getWorkflowDisplayEntries('plugin-audit', report.findings);
+  const severityCounts = buildFindingSummary(report.findings);
+  const manualCandidates = (report.workflowData && report.workflowData.needsManualVerification) || [];
+  const workstreamSummaries = (report.workflowData && report.workflowData.workstreamSummaries) || [];
+  const backlogItems = findings.map((finding) => ({
+    key: finding.severityKey,
+    task: finding.taskStatement,
+    file: finding.file,
+    line: finding.line
+  }));
+  const date = report.generatedAt || new Date().toISOString().slice(0, 10);
+  const branch = report.currentBranch || 'unknown';
+  const auditor = `${report.auditorLabel || report.engine} (5-workstream + Pass 6 verification)`;
+  const lines = [
+    `# Plugin Audit Report — ${report.repoLabel}`,
+    `**Branch:** ${branch} | **Date:** ${date} | **Auditor:** ${auditor}`,
+    '---',
+    '',
+    '## Executive Summary',
+    '',
+    report.summary,
+    '',
+    `- Merge stance: \`${report.verdict}\``,
+    `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
+    `- Safe to merge: ${report.confidenceScore >= 4 && !report.findings.length ? 'yes' : 'no'}`,
+    '',
+    '| Severity | Count |',
+    '| --- | ---: |',
+    `| CRITICAL | ${severityCounts.critical} |`,
+    `| HIGH | ${severityCounts.important} |`,
+    `| MEDIUM | ${severityCounts.medium} |`,
+    `| SUGGESTION | ${severityCounts.low} |`
+  ];
+
+  if (workstreamSummaries.length) {
+    lines.push('', '### Workstream Summary', '');
+    workstreamSummaries.forEach((item) => {
+      lines.push(`- ${item.name}: ${item.confirmedCount} confirmed, ${item.manualCount} manual follow-up`);
+    });
+  }
+
+  if (findings.length) {
+    lines.push('', '## Table of Contents', '');
+    findings.forEach((finding) => {
+      const heading = `${finding.severityKey}: ${finding.title}`;
+      lines.push(`- [${heading}](#${slugifyHeading(heading)})`);
+    });
+  }
+
+  lines.push('', '## Findings by Severity', '');
+  getSeverityOrder().forEach((severity) => {
+    const grouped = findings.filter((finding) => finding.severity === severity);
+    if (!grouped.length) {
+      return;
+    }
+
+    lines.push(`### ${getWorkflowSeverityHeading('plugin-audit', severity)}`, '');
+    grouped.forEach((finding) => {
+      const heading = `${finding.severityKey}: ${finding.title}`;
+      lines.push(`#### ${heading}`, '');
+      lines.push(`- Area: \`${finding.area}\``);
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- File:line: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Evidence: ${finding.evidence}`);
+      lines.push(`- Impact: ${finding.impact}`);
+      lines.push(`- Recommended fix: ${finding.recommendedFix}`);
+      lines.push(`- Task statement: ${finding.taskStatement}`);
+      if (finding.severity === 'critical' || finding.severity === 'important') {
+        lines.push(`- Verifier note: ${finding.verifierNote}`);
+      }
+      lines.push('');
+    });
+  });
+
+  lines.push('## Prioritized Implementation Backlog', '');
+  backlogItems.forEach((item) => lines.push(`- ${item.key}: ${item.task} (\`${item.file}:${item.line}\`)`));
+
+  lines.push('', '## Needs Manual Verification', '');
+  if (manualCandidates.length) {
+    manualCandidates.forEach((finding, index) => {
+      lines.push(`### ${index + 1}. ${finding.title}`, '');
+      lines.push(`- Area: \`${finding.area}\``);
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- File:line: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Evidence: ${finding.evidence || finding.explanation}`);
+      lines.push(`- Impact: ${finding.impact || finding.explanation}`);
+      lines.push(`- Recommended fix: ${finding.fixDirection || finding.taskStatement}`);
+      lines.push(`- Task statement: ${finding.taskStatement}`);
+      lines.push(`- Verifier note: ${finding.verifierNote}`);
+      lines.push('');
+    });
+  } else {
+    lines.push('No manual verification items.');
+  }
+
+  return lines.join('\n');
+}
+
 function renderMarkdown(report) {
+  if (report.workflow === 'debugger') {
+    return renderDebuggerMarkdown(report);
+  }
+
+  if (report.workflow === 'plugin-audit') {
+    return renderPluginAuditMarkdown(report);
+  }
+
   const counts = buildFindingSummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
+  const displayFindings = getFindingDisplayEntries(report.findings);
+  const groupedFindings = groupFindingsBySeverity(displayFindings);
+  const backlogItems = buildPrioritizedBacklog(report.findings);
   const lines = [
-    '# Codex Review Report',
+    `# ${getReportTitle(report)}`,
     '',
     '## Summary',
     '',
@@ -1902,6 +3154,7 @@ function renderMarkdown(report) {
     report.summary,
     '',
     `- Merge stance: \`${report.verdict}\``,
+    ...(report.workflow ? [`- Workflow: \`${report.workflow}\``] : []),
     `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
     `- Base: \`${report.baseRef}\``,
     `- Mode: \`${report.mode}\``,
@@ -1934,6 +3187,12 @@ function renderMarkdown(report) {
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
+  if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
+    lines.push('', '## Rendered Accessibility Scan', '');
+    lines.push(`- Pages scanned: ${report.runtimeAccessibility.pages.length}`);
+    report.runtimeAccessibility.pages.forEach((page) => lines.push(`- ${page.url} (${page.violations} violation(s))`));
+  }
+
   if (report.recheck) {
     lines.push('', '## Recheck Status', '');
     if (report.recheck.previousCommit) {
@@ -1961,42 +3220,62 @@ function renderMarkdown(report) {
     }
   }
 
-  if (!report.findings.length) {
-    lines.push('', '## Findings', '', 'No findings.');
+  if (displayFindings.length) {
+    lines.push('', '## Table of Contents', '');
+    displayFindings.forEach((finding) => {
+      const heading = `${finding.severityKey}: ${finding.title}`;
+      lines.push(`- [${heading}](#${slugifyHeading(heading)})`);
+    });
+  }
+
+  if (!displayFindings.length) {
+    lines.push('', '## Confirmed Findings By Severity', '', 'No findings.');
     if (report.reviewedCommit) {
       lines.push('', `Last reviewed commit: \`${report.reviewedCommit}\``);
     }
     return lines.join('\n');
   }
 
-  lines.push('', '## Findings', '');
+  lines.push('', '## Confirmed Findings By Severity', '');
   lines.push(blockerCount ? 'Must fix before merge.' : 'No confirmed blocker-level findings, but the following issues are still worth resolving before PR.');
   lines.push('');
   lines.push(`Verification confirmed ${counts.critical} critical, ${counts.important} important, ${counts.medium} medium, and ${counts.low} low finding(s) in the reviewed changes.`);
   lines.push('');
-  report.findings.forEach((finding, index) => {
-    lines.push(`### ${index + 1}. ${finding.title}`);
-    lines.push('');
-    lines.push(`- Severity: \`${finding.severity}\``);
-    lines.push(`- Confidence: \`${finding.confidence}\``);
-    lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
-    lines.push(`- File: \`${finding.file}:${finding.line}\``);
-    lines.push(`- What is wrong: ${finding.evidence}`);
-    lines.push(`- Why it matters: ${finding.impact}`);
-    lines.push(`- Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
-    lines.push(`- What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
-    lines.push(`- Fix direction: ${finding.fixDirection}`);
-    lines.push('');
-    lines.push('<details>');
-    lines.push('<summary>Prompt To Fix With AI</summary>');
-    lines.push('');
-    lines.push('```text');
-    lines.push(buildFixPrompt(report, finding));
-    lines.push('```');
-    lines.push('</details>');
-    lines.push('');
+
+  getSeverityOrder().forEach((severity) => {
+    const severityFindings = groupedFindings.get(severity) || [];
+    if (!severityFindings.length) {
+      return;
+    }
+
+    lines.push(`### ${getSeverityDisplayLabel(severity)}`, '');
+
+    severityFindings.forEach((finding) => {
+      lines.push(`#### ${finding.severityKey}: ${finding.title}`);
+      lines.push('');
+      lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
+      lines.push(`- File: \`${finding.file}:${finding.line}\``);
+      lines.push(`- Evidence: ${finding.evidence}`);
+      lines.push(`- Impact: ${finding.impact}`);
+      lines.push(`- Explanation: ${finding.explanation || 'No additional explanation provided.'}`);
+      lines.push(`- What to verify: ${finding.verification || 'Add or run targeted checks around this path.'}`);
+      lines.push(`- Recommended fix: ${finding.fixDirection}`);
+      lines.push('');
+      lines.push('<details>');
+      lines.push('<summary>Prompt To Fix With AI</summary>');
+      lines.push('');
+      lines.push('```text');
+      lines.push(buildFixPrompt(report, finding));
+      lines.push('```');
+      lines.push('</details>');
+      lines.push('');
+    });
   });
 
+  lines.push('## Prioritized Fix Backlog', '');
+  backlogItems.forEach((item) => lines.push(`- ${item.key}: ${item.task} (\`${item.file}:${item.line}\`)`));
+  lines.push('');
   lines.push('<details>');
   lines.push('<summary>Prompt To Fix All With AI</summary>');
   lines.push('');
@@ -2007,16 +3286,16 @@ function renderMarkdown(report) {
   lines.push('');
 
   if (report.outsideDiffFindings.length) {
-    lines.push('## Outside Diff Follow-ups', '');
+    lines.push('## Needs Manual Verification', '');
     report.outsideDiffFindings.forEach((finding, index) => {
       lines.push(`### ${index + 1}. ${finding.title}`);
       lines.push('');
       lines.push(`- Severity: \`${finding.severity}\``);
       lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
       lines.push(`- Location: \`${finding.file}:${finding.line}\``);
-      lines.push(`- Why it matters: ${finding.explanation}`);
+      lines.push(`- Why this needs follow-up: ${finding.explanation}`);
       lines.push(`- What to verify: ${finding.verification}`);
-      lines.push(`- Fix direction: ${finding.fixDirection}`);
+      lines.push(`- Suggested fix direction: ${finding.fixDirection}`);
       lines.push('');
       lines.push('<details>');
       lines.push('<summary>Prompt To Fix With AI</summary>');
@@ -2039,9 +3318,12 @@ function renderMarkdown(report) {
 function renderGitHub(report) {
   const counts = buildFindingSummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
+  const displayFindings = getFindingDisplayEntries(report.findings);
+  const groupedFindings = groupFindingsBySeverity(displayFindings);
   const metadata = {
     version: 2,
     repo: report.repoLabel,
+    workflow: report.workflow || null,
     commitId: report.reviewedCommit,
     state: report.verdict,
     blockers: report.findings
@@ -2061,9 +3343,15 @@ function renderGitHub(report) {
   };
 
   const lines = [
+    `<h2>${getReportTitle(report)}</h2>`,
+    '',
     '<h3>Summary</h3>',
     `<p>${buildNarrativeSummary(report)}</p>`
   ];
+
+  if (report.workflow) {
+    lines.push(`<p><strong>Workflow:</strong> <code>${report.workflow}</code></p>`);
+  }
 
   if (report.keyChanges.length) {
     lines.push('<p><strong>Key changes:</strong></p>');
@@ -2072,15 +3360,30 @@ function renderGitHub(report) {
     lines.push('</ul>');
   }
 
-  lines.push('<h3>Findings</h3>');
+  if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
+    lines.push('<p><strong>Rendered accessibility scan:</strong></p>');
+    lines.push('<ul>');
+    report.runtimeAccessibility.pages.forEach((page) => lines.push(`<li><code>${page.url}</code> (${page.violations} violation(s))</li>`));
+    lines.push('</ul>');
+  }
+
+  lines.push('<h3>Confirmed Findings By Severity</h3>');
   lines.push(`<p>${blockerCount ? 'Must fix before merge.' : 'No confirmed blocker-level findings, but there are still issues worth resolving before PR.'}</p>`);
 
-  if (report.findings.length) {
-    lines.push('<ul>');
-    report.findings.forEach((finding) => {
-      lines.push(`<li>${finding.title} (<code>${finding.file}:${finding.line}</code>, fingerprint <code>${finding.fingerprint}</code>)</li>`);
+  if (displayFindings.length) {
+    getSeverityOrder().forEach((severity) => {
+      const severityFindings = groupedFindings.get(severity) || [];
+      if (!severityFindings.length) {
+        return;
+      }
+
+      lines.push(`<h4>${getSeverityDisplayLabel(severity)}</h4>`);
+      lines.push('<ul>');
+      severityFindings.forEach((finding) => {
+        lines.push(`<li><strong>${finding.severityKey}:</strong> ${finding.title} (<code>${finding.file}:${finding.line}</code>, fingerprint <code>${finding.fingerprint}</code>)</li>`);
+      });
+      lines.push('</ul>');
     });
-    lines.push('</ul>');
   } else {
     lines.push('<p>No findings.</p>');
   }
@@ -2093,9 +3396,9 @@ function renderGitHub(report) {
 
   if (report.outsideDiffFindings.length) {
     lines.push('<details>');
-    lines.push(`<summary>Comments Outside Diff (${report.outsideDiffFindings.length})</summary>`);
+    lines.push(`<summary>Needs Manual Verification (${report.outsideDiffFindings.length})</summary>`);
     lines.push('');
-    lines.push('<p>Not part of this diff. Follow up separately.</p>');
+    lines.push('<p>Not fully confirmed in the current diff. Follow up separately.</p>');
     lines.push('<ol>');
     report.outsideDiffFindings.forEach((finding) => {
       lines.push('<li>');
@@ -2126,10 +3429,10 @@ function renderGitHub(report) {
   }
 
   lines.push('');
-  lines.push('## Inline Comment Candidates');
+  lines.push('## Prioritized Inline Comment Candidates');
   lines.push('');
-  report.findings.forEach((finding, index) => {
-    lines.push(`### ${index + 1}. ${finding.title}`);
+  displayFindings.forEach((finding) => {
+    lines.push(`### ${finding.severityKey}: ${finding.title}`);
     lines.push('');
     lines.push(`- Path: \`${finding.file}\``);
     lines.push(`- Line: \`${finding.line}\``);
@@ -2214,6 +3517,50 @@ function commandExists(command) {
   }
 }
 
+function moduleExists(moduleName) {
+  try {
+    require.resolve(moduleName);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function runRenderedAccessibilityScan(options, cwd) {
+  if (!options.a11yUrls || !options.a11yUrls.length) {
+    return null;
+  }
+
+  if (!moduleExists('playwright') || !moduleExists('axe-core')) {
+    throw new Error('Rendered accessibility scan requires the playwright and axe-core packages to be installed.');
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-a11y-'));
+  const inputPath = path.join(tempDir, 'input.json');
+  const outputPath = path.join(tempDir, 'output.json');
+  const scriptPath = path.join(__dirname, 'lib', 'runtime-accessibility-scan.js');
+  const payload = {
+    urls: options.a11yUrls,
+    waitForSelector: options.a11yWaitFor || null,
+    timeoutMs: options.a11yTimeout || DEFAULT_CONFIG.a11yTimeout,
+    storageStatePath: options.a11yStorageState ? path.resolve(cwd, options.a11yStorageState) : null,
+    headless: true
+  };
+
+  writeJsonFile(inputPath, payload);
+
+  try {
+    runCommand(process.execPath, [scriptPath, inputPath, outputPath], {
+      cwd,
+      maxBuffer: 32 * 1024 * 1024
+    });
+
+    return JSON.parse(safeReadFile(outputPath));
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function collectFileContexts(cwd, fileEntries, baseRef, diffText, highRiskPaths) {
   return fileEntries.map((entry) => {
     const filePath = entry.path;
@@ -2228,10 +3575,28 @@ function collectFileContexts(cwd, fileEntries, baseRef, diffText, highRiskPaths)
 }
 
 function buildPrompt(payload) {
+  const workflowInstructions = [];
+  if (payload.workflow === 'debugger') {
+    workflowInstructions.push(
+      'Workflow: debugger.',
+      'Emulate Finder -> Verifier -> Feedback in one response.',
+      'Generate broad bug candidates first, but keep only verifier-confirmed issues in findings.',
+      'Use outside_diff_findings for items that still need manual verification after skeptical re-tracing.',
+      'Do not keep weak verification-only warnings as confirmed findings.'
+    );
+  } else if (payload.workflow === 'plugin-audit') {
+    workflowInstructions.push(
+      'Workflow: plugin-audit.',
+      'Emulate five workstreams: security, performance/optimization, dead code/duplication, UI-to-handler traceability, and handler-to-service/database traceability.',
+      'Re-verify every critical or important candidate before returning it as a confirmed finding.',
+      'If the exploitability or operational impact is not proven strongly enough, move it to outside_diff_findings instead of overstating severity.'
+    );
+  }
+
   return [
     'You are performing a local pre-PR code review for a WordPress-oriented repository.',
     'Review only the supplied local diff and file context.',
-    'Prioritize real bugs, security issues, compatibility risks, data integrity problems, and missing verification around risky changes.',
+    'Prioritize real bugs, security issues, compatibility risks, accessibility issues in changed user-facing markup or interactions, data integrity problems, and missing verification around risky changes.',
     'Do not emit style-only feedback.',
     'Do not speculate without evidence from the provided diff or file contents.',
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
@@ -2251,6 +3616,8 @@ function buildPrompt(payload) {
     '- medium: likely from nearby code evidence but still somewhat inferential',
     '- low: weak signal; avoid unless still useful',
     '',
+    ...workflowInstructions,
+    ...(workflowInstructions.length ? [''] : []),
     `Review mode: ${payload.mode}`,
     `Base ref: ${payload.baseRef}`,
     '',
@@ -2421,7 +3788,8 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
       baseContent,
       changedLines,
       mode: options.mode,
-      highRiskPaths: options.highRiskPaths
+      highRiskPaths: options.highRiskPaths,
+      productProfile: reviewContext.productProfile
     });
 
     fileFindings.forEach((finding) => pushFinding(findings, finding));
@@ -2491,14 +3859,16 @@ function createReviewContext(options, cwd) {
     fileEntries,
     instructions,
     diffText,
+    currentBranch: getCurrentBranch(cwd),
     reviewedCommit: getCurrentCommit(cwd),
     repoLabel
   };
 }
 
 function buildFinalReport(options, reviewContext, reviewResult) {
-  const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel, repoRoot } = reviewContext;
+  const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel, repoRoot, currentBranch } = reviewContext;
   const rankedFindings = rankFindings((reviewResult.findings || []).map((finding) => ({
+    ...finding,
     severity: finding.severity,
     confidence: finding.confidence,
     file: finding.file,
@@ -2509,13 +3879,19 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     explanation: finding.explanation,
     verification: finding.verification,
     fixDirection: finding.fixDirection,
-    fingerprint: buildFindingFingerprint(finding)
+    fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
   }))).slice(0, options.maxFindings);
   const scope = summarizeScope(fileEntries, instructions);
   const previousState = loadPreviousReviewState(repoRoot);
   const report = {
     verdict: reviewResult.verdict || buildVerdict(rankedFindings),
     confidenceScore: 0,
+    workflow: options.workflow || null,
+    reportPath: options.report || null,
+    workflowData: reviewResult.workflowData || null,
+    currentBranch,
+    generatedAt: new Date().toISOString().slice(0, 10),
+    auditorLabel: options.model || reviewResult.engine || options.engine,
     baseRef: baseRef || '--staged',
     mode: options.mode,
     reviewDepth: options.reviewDepth,
@@ -2532,6 +3908,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     scope,
     findings: rankedFindings,
     outsideDiffFindings: reviewResult.outsideDiffFindings || [],
+    runtimeAccessibility: reviewResult.runtimeAccessibility || null,
     diffStats: {
       files: fileEntries.length,
       testsChanged: getChangedTestFiles(fileEntries).length
@@ -2568,6 +3945,21 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   return report;
 }
 
+function appendRuntimeAccessibility(reviewResult, runtimeScan) {
+  if (!runtimeScan) {
+    return reviewResult;
+  }
+
+  return {
+    ...reviewResult,
+    findings: (reviewResult.findings || []).concat(runtimeScan.findings || []),
+    notes: (reviewResult.notes || []).concat(runtimeScan.notes || []),
+    runtimeAccessibility: {
+      pages: runtimeScan.pages || []
+    }
+  };
+}
+
 function createReviewReport(options, cwd = process.cwd()) {
   const loadedConfig = loadRepoConfig(cwd);
   const resolvedOptions = resolveOptions(options, loadedConfig.config);
@@ -2575,6 +3967,7 @@ function createReviewReport(options, cwd = process.cwd()) {
   const reviewContext = createReviewContext(resolvedOptions, cwd);
   const scope = summarizeScope(reviewContext.fileEntries, reviewContext.instructions);
   const baseNotes = [];
+  const shouldRunRuntimeA11y = Boolean(resolvedOptions.a11yUrls && resolvedOptions.a11yUrls.length);
 
   if (loadedConfig.configPath) {
     baseNotes.push(`Loaded repo config from ${path.relative(cwd, loadedConfig.configPath)}`);
@@ -2582,8 +3975,8 @@ function createReviewReport(options, cwd = process.cwd()) {
 
   baseNotes.push(...resolvedOptions.configNotes);
 
-  if (!scope.reviewedFiles.length) {
-    return buildFinalReport(resolvedOptions, reviewContext, {
+  if (!scope.reviewedFiles.length && !shouldRunRuntimeA11y) {
+    return buildFinalReport(resolvedOptions, reviewContext, applyWorkflowPostProcessing(resolvedOptions, reviewContext, {
       engine: resolvedOptions.engine === 'codex' ? 'codex' : 'heuristic',
       fallbackUsed: false,
       notes: baseNotes,
@@ -2591,7 +3984,21 @@ function createReviewReport(options, cwd = process.cwd()) {
       confidenceScore: 4,
       summary: 'No local changes were found for review.',
       findings: []
-    });
+    }));
+  }
+
+  if (!scope.reviewedFiles.length && shouldRunRuntimeA11y) {
+    const runtimeOnlyResult = applyWorkflowPostProcessing(resolvedOptions, reviewContext, appendRuntimeAccessibility({
+      engine: resolvedOptions.engine === 'codex' ? 'codex' : 'heuristic',
+      fallbackUsed: false,
+      notes: baseNotes,
+      verdict: 'APPROVE',
+      confidenceScore: 3,
+      summary: 'No local diff was selected, but rendered accessibility pages were scanned.',
+      findings: []
+    }, runRenderedAccessibilityScan(resolvedOptions, cwd)));
+
+    return buildFinalReport(resolvedOptions, reviewContext, runtimeOnlyResult);
   }
 
   const heuristicSeed = runHeuristicReview(resolvedOptions, reviewContext, baseNotes.slice(), 'heuristic', false);
@@ -2606,7 +4013,16 @@ function createReviewReport(options, cwd = process.cwd()) {
       }
 
       notes.push('Codex CLI was not available, so the report used heuristic review only.');
-      return buildFinalReport(resolvedOptions, reviewContext, runHeuristicReview(resolvedOptions, reviewContext, notes, 'heuristic', true));
+      const heuristicResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'heuristic', true);
+      return buildFinalReport(
+        resolvedOptions,
+        reviewContext,
+        applyWorkflowPostProcessing(
+          resolvedOptions,
+          reviewContext,
+          appendRuntimeAccessibility(heuristicResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+        )
+      );
     }
 
     const selectedEntries = selectCodexFileEntries(reviewContext, heuristicSeed, resolvedOptions);
@@ -2633,6 +4049,7 @@ function createReviewReport(options, cwd = process.cwd()) {
         codexScopedFiles: selectedEntries.length,
         testsChanged: getChangedTestFiles(reviewContext.fileEntries).length
       },
+      workflow: resolvedOptions.workflow,
       diffText: truncateText(selectedDiff, 30000),
       fileContexts: collectFileContexts(cwd, selectedEntries, reviewContext.baseRef, selectedDiff, resolvedOptions.highRiskPaths)
     };
@@ -2641,18 +4058,43 @@ function createReviewReport(options, cwd = process.cwd()) {
       const codexResult = runCodexReview(payload, resolvedOptions, cwd);
       codexResult.notes = notes.slice();
       codexResult.codexReviewedFiles = selectedEntries.map((entry) => entry.path);
-      return buildFinalReport(resolvedOptions, reviewContext, codexResult);
+      return buildFinalReport(
+        resolvedOptions,
+        reviewContext,
+        applyWorkflowPostProcessing(
+          resolvedOptions,
+          reviewContext,
+          appendRuntimeAccessibility(codexResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+        )
+      );
     } catch (error) {
       if (resolvedOptions.engine === 'codex') {
         throw new Error(`Codex review failed: ${error.message}`);
       }
 
       notes.push(`Codex review failed, so the report used heuristic fallback: ${error.message}`);
-      return buildFinalReport(resolvedOptions, reviewContext, runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true));
+      const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
+      return buildFinalReport(
+        resolvedOptions,
+        reviewContext,
+        applyWorkflowPostProcessing(
+          resolvedOptions,
+          reviewContext,
+          appendRuntimeAccessibility(fallbackResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+        )
+      );
     }
   }
 
-  return buildFinalReport(resolvedOptions, reviewContext, heuristicSeed);
+  return buildFinalReport(
+    resolvedOptions,
+    reviewContext,
+    applyWorkflowPostProcessing(
+      resolvedOptions,
+      reviewContext,
+      appendRuntimeAccessibility(heuristicSeed, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+    )
+  );
 }
 
 module.exports = {

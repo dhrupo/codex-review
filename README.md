@@ -27,6 +27,8 @@ It combines:
 
 - heuristic review for fast local product-aware checks
 - Codex-backed review for deeper reasoning over the most relevant changed files
+- WordPress-plugin-specific checks for permission, persistence, public endpoint, and accessibility regressions
+- optional Playwright + axe scans against rendered plugin/admin URLs for dynamic accessibility issues
 - recheck-aware output so a second run after fixes behaves like a follow-up review, not a fresh scan
 
 The report includes:
@@ -34,9 +36,11 @@ The report includes:
 - summary
 - merge stance
 - confidence score
+- table of contents for confirmed findings
 - key changes
-- findings
-- outside-diff follow-ups
+- confirmed findings grouped by severity
+- needs manual verification follow-ups
+- prioritized fix backlog
 - prompt to fix each finding
 - prompt to fix all findings
 - recheck status against the previous local review
@@ -44,6 +48,7 @@ The report includes:
 ## Supported Product Awareness
 
 The reviewer now applies repo-specific rules for WPManageNinja products.
+Its rendered review output also follows the evidence-first WPManageNinja `agent-skills` review shape rather than a flat lint-style report.
 
 Examples:
 
@@ -62,7 +67,7 @@ Examples:
 - `fluent-player`
   checks player config/bootstrap/playback verification gaps
 - `fluent-player-pro`
-  checks Pro player config plus shared free/pro compatibility risks
+  checks Pro player config, subtitle-service sanitization and payload limits, managed attachment deletion, and shared free/pro compatibility risks
 
 For repos that are not hardcoded yet, such as `fluent-cart` or `fluent-crm`, you can calibrate the reviewer locally with `.codex/reviewer.yml`.
 
@@ -162,7 +167,45 @@ This mirrors the same workflow you already use with PR bots, but locally before 
 
 ## Common Commands
 
-Basic review:
+## Canonical Commands
+
+Use these first. Everything else is override detail.
+
+Standard local pre-PR review:
+
+```bash
+codex-review
+```
+
+Debugger-style bug sweep:
+
+```bash
+codex-review --workflow debugger
+```
+
+Plugin-audit-style deep review:
+
+```bash
+codex-review --workflow plugin-audit
+```
+
+What those workflow presets do:
+
+- `--workflow debugger`
+  runs a local Finder -> Verifier -> Feedback style bug sweep and writes `debugger-report.md` by default
+- `--workflow plugin-audit`
+  runs a broader five-workstream audit plus verification pass and writes `plugin-audit.md` by default
+- both presets switch to markdown output and thorough review depth unless you explicitly override them
+
+Rendered accessibility review using repo-local defaults:
+
+```bash
+codex-review --mode accessibility --engine codex
+```
+
+## More Examples
+
+Base review against a specific branch:
 
 ```bash
 codex-review --base origin/dev
@@ -174,16 +217,25 @@ Codex-backed review:
 codex-review --base origin/dev --engine codex
 ```
 
-Thorough review:
-
-```bash
-codex-review --base origin/dev --engine codex --thorough
-```
-
 Fast heuristic pass:
 
 ```bash
 codex-review --base origin/dev --engine heuristic
+```
+
+Rendered accessibility scan:
+
+```bash
+codex-review --mode accessibility \
+  --a11y-url https://forms.test/wp-admin/admin.php?page=fluent_forms \
+  --a11y-url https://forms.test/wp-admin/admin.php?page=fluent_forms_settings \
+  --a11y-storage-state .playwright/auth.json
+```
+
+Rendered accessibility scan with repo-local defaults:
+
+```bash
+codex-review --mode accessibility --engine codex
 ```
 
 Review only staged changes:
@@ -192,7 +244,7 @@ Review only staged changes:
 codex-review --staged --engine codex
 ```
 
-Write a markdown report:
+Write a custom markdown report:
 
 ```bash
 codex-review --base origin/dev --engine codex --format markdown --report codex-review.md
@@ -223,6 +275,7 @@ Especially important for:
 - multilingual/WPML mapping changes
 - signature capture or render changes
 - player config/bootstrap/playback changes
+- frontend form, modal, block, or settings UI changes that can affect keyboard or screen-reader accessibility
 
 ## Understanding The Report
 
@@ -236,12 +289,18 @@ Important sections:
   `APPROVE`, `COMMENT`, or `REQUEST_CHANGES`
 - `Confidence score`
   calibrated to behave similarly to the current WPManageNinja PR bot pattern
+- `Table of Contents`
+  anchors each confirmed finding for faster navigation
 - `Key Changes`
   what looks correct or intentional in the patch
-- `Findings`
-  actionable issues in the changed code
-- `Outside Diff Follow-ups`
-  closely related issues that may live outside the current diff
+- `Confirmed Findings By Severity`
+  evidence-backed issues grouped as critical, important, medium, and low
+- `Needs Manual Verification`
+  closely related follow-ups that should be checked before merge or in adjacent files
+- `Prioritized Fix Backlog`
+  implementation-ready fix directions ordered by review priority
+- `Rendered Accessibility Scan`
+  URLs scanned with Playwright + axe and their violation counts
 - `Recheck Status`
   what cleared, what remains, what is new
 
@@ -249,14 +308,20 @@ Important sections:
 
 The confidence score is intentionally calibrated to feel similar to the existing review bot behavior in Fluent Forms repos.
 
-- `3/5`
-  the common case; reviewed code with some issues or meaningful caution
-- `4/5`
-  clean review with no meaningful issues, but not an extremely narrow trivial change
 - `5/5`
-  rare; very narrow and clean change with strong confidence
+  very narrow clean change; safe to merge based on the reviewed diff
+- `3/5`
+  there are some issues or meaningful cautions to resolve before merge
+- `4/5`
+  clean review with no meaningful issues; safe to merge
 - `2/5`
-  indicates significantly worse review health
+  major issues or blocker-level review health problems
+
+Workflow reports use the same meaning:
+
+- `4/5` and `5/5` mean the reviewed diff is safe to merge
+- `3/5` means there are issues to address
+- `2/5` means the review found major problems
 
 Do not read `3/5` as “bad.” In this workflow it is often the normal score.
 
@@ -296,6 +361,75 @@ Typical usage:
 mkdir -p .codex
 cp /path/to/codex-review/.codex/reviewer.yml.example .codex/reviewer.yml
 ```
+
+You can also preconfigure rendered accessibility scan targets there:
+
+```yaml
+accessibility:
+  urls:
+    - https://forms.test/wp-admin/admin.php?page=fluent_forms
+    - https://forms.test/wp-admin/admin.php?page=fluent_forms_settings
+  wait_for: .ff_form_wrap
+  timeout_ms: 30000
+  storage_state: .playwright/auth.json
+```
+
+## Plugin Repo Workflow
+
+This tool is meant to be installed once and then run from inside a plugin repo.
+
+Standard review:
+
+```bash
+cd /Volumes/Projects/forms/wp-content/plugins/fluent-player-pro
+codex-review
+```
+
+Debugger workflow:
+
+```bash
+cd /Volumes/Projects/forms/wp-content/plugins/fluent-player-pro
+codex-review --workflow debugger
+```
+
+Plugin audit workflow:
+
+```bash
+cd /Volumes/Projects/forms/wp-content/plugins/fluent-player-pro
+codex-review --workflow plugin-audit
+```
+
+For rendered accessibility checks:
+
+```bash
+cd /Volumes/Projects/forms/wp-content/plugins/fluentform
+codex-review --mode accessibility --engine codex
+```
+
+How it works:
+
+- it detects the current git repo and applies any built-in product profile for that repo
+- it loads repo-local defaults from `.codex/reviewer.yml` if present
+- CLI flags override repo-local config when both are supplied
+- `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
+- `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
+- the debugger workflow emulates `Finder -> Verifier -> Feedback` sequentially in one local run when no literal sub-agents are used
+- the plugin-audit workflow emulates the five audit workstreams plus a final verification pass sequentially in one local run
+- heuristic and Codex review use the repo profile plus local `focus_areas`, `paths.high_risk`, and `notes`
+- rendered accessibility scanning runs only when `accessibility.urls` are configured in `.codex/reviewer.yml` or when `--a11y-url` / `--a11y-urls` are passed explicitly
+
+That means plugin-specific `.codex/reviewer.yml` files are the right place to store:
+
+- high-risk directories for that repo
+- repeated regression reminders for that plugin
+- default admin/frontend URLs for Playwright + axe scans
+- storage-state paths for authenticated wp-admin scans
+
+For workflow reports:
+
+- `debugger-report.md` keeps confirmed bugs, rejected candidates, manual-verification items, and feedback-loop updates
+- `plugin-audit.md` keeps severity-grouped findings, a prioritized implementation backlog, and manual-verification items
+- if `plugin-audit.md` already exists, the CLI archives it to `plugin-audit-YYYY-MM-DD.md` before overwriting
 
 For most WPManageNinja repos, the main useful defaults are:
 
