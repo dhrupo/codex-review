@@ -1177,6 +1177,114 @@ function findLineNumber(content, pattern) {
   return 1;
 }
 
+function findAllLineNumbers(content, pattern) {
+  const lines = content.split('\n');
+  const matches = [];
+
+  for (let i = 0; i < lines.length; i += 1) {
+    pattern.lastIndex = 0;
+    if (pattern.test(lines[i])) {
+      matches.push(i + 1);
+    }
+  }
+
+  return matches;
+}
+
+function mergeLineRanges(ranges, maxGap = 3) {
+  const normalized = ranges
+    .filter((range) => range && Number.isFinite(range.start) && Number.isFinite(range.end))
+    .map((range) => ({
+      start: Math.max(1, range.start),
+      end: Math.max(1, range.end)
+    }))
+    .sort((left, right) => left.start - right.start);
+
+  if (!normalized.length) {
+    return [];
+  }
+
+  const merged = [normalized[0]];
+
+  for (let i = 1; i < normalized.length; i += 1) {
+    const current = normalized[i];
+    const previous = merged[merged.length - 1];
+
+    if (current.start <= previous.end + maxGap) {
+      previous.end = Math.max(previous.end, current.end);
+      continue;
+    }
+
+    merged.push(current);
+  }
+
+  return merged;
+}
+
+function buildExcerptFromRanges(content, ranges, maxChars) {
+  if (!content || content.length <= maxChars) {
+    return content;
+  }
+
+  const lines = content.split('\n');
+  const mergedRanges = mergeLineRanges(ranges).map((range) => ({
+    start: Math.max(1, Math.min(range.start, lines.length)),
+    end: Math.max(1, Math.min(range.end, lines.length))
+  }));
+  const sections = [];
+
+  mergedRanges.forEach((range) => {
+    const excerpt = lines.slice(range.start - 1, range.end).join('\n');
+    sections.push(`// lines ${range.start}-${range.end}\n${excerpt}`);
+  });
+
+  if (!sections.length) {
+    return truncateText(content, maxChars);
+  }
+
+  return truncateText(sections.join('\n\n...\n\n'), maxChars);
+}
+
+function buildRelevantContextRanges(filePath, content, changedLines) {
+  const ranges = changedLines.map((entry) => ({
+    start: Math.max(1, entry.line - 10),
+    end: entry.line + 18
+  }));
+
+  if (!/\.(js|jsx|ts|tsx)$/i.test(filePath)) {
+    return mergeLineRanges(ranges);
+  }
+
+  const changedText = changedLines.map((entry) => entry.text).join('\n');
+  const introducesStateSyncHelper = /toggleClass\s*\(|addClass\s*\(|removeClass\s*\(/.test(changedText)
+    && /(input|change|keyup|blur)\b/.test(changedText);
+
+  if (!introducesStateSyncHelper) {
+    return mergeLineRanges(ranges);
+  }
+
+  findAllLineNumbers(content, /var\s+formResetHandler\s*=\s*function|function\s+formResetHandler\s*\(/).forEach((line) => {
+    ranges.push({
+      start: Math.max(1, line - 6),
+      end: line + 80
+    });
+  });
+
+  findAllLineNumbers(content, /\.on\(\s*['"]reset|\.trigger\(\s*['"]fluentform_reset['"]|\[0\]\.reset\(\)/).forEach((line) => {
+    ranges.push({
+      start: Math.max(1, line - 6),
+      end: line + 20
+    });
+  });
+
+  return mergeLineRanges(ranges);
+}
+
+function buildTargetedContextExcerpt(content, filePath, changedLines, maxChars) {
+  const ranges = buildRelevantContextRanges(filePath, content, changedLines);
+  return buildExcerptFromRanges(content, ranges, maxChars);
+}
+
 function isHighRiskPath(filePath, highRiskPaths) {
   const normalized = filePath.toLowerCase();
   return highRiskPaths.some((segment) => normalized.includes(segment));
@@ -1734,6 +1842,7 @@ function analyzeFile(context) {
   const { filePath, currentContent, baseContent, changedLines, mode, highRiskPaths, productProfile } = context;
   const repoLabel = productProfile ? productProfile.repoLabel : '';
   const isPhpFile = filePath.endsWith('.php');
+  const isScriptFile = /\.(js|jsx|ts|tsx)$/i.test(filePath);
   const isFrontendFile = isFrontendTemplateFile(filePath);
   const isStyleLikeFile = isStyleFile(filePath);
   const runAccessibilityChecks = mode === 'full' || mode === 'compatibility' || mode === 'accessibility';
@@ -1953,6 +2062,39 @@ function analyzeFile(context) {
         explanation: 'This pattern is easy to miss in review because the loop itself looks harmless, but once it wraps remote requests or database reads it can scale poorly with entry count or field count.',
         verification: 'Estimate the worst-case loop size and confirm expensive work is cached, batched, or moved outside the iteration.',
         fixDirection: 'Check whether expensive work can be cached, batched, or moved outside the loop.'
+      });
+    }
+  }
+
+  if (isScriptFile) {
+    const changedText = changedLines.map((entry) => entry.text).join('\n');
+    const helperDeclaration = changedText.match(/var\s+([A-Za-z0-9_]+)\s*=\s*function\s*\(/);
+    const stateClassMatch = changedText.match(/toggleClass\s*\(\s*['"]([^'"]+)['"]|addClass\s*\(\s*['"]([^'"]+)['"]|removeClass\s*\(\s*['"]([^'"]+)['"]/);
+    const stateClass = stateClassMatch ? (stateClassMatch[1] || stateClassMatch[2] || stateClassMatch[3]) : null;
+    const helperName = helperDeclaration ? helperDeclaration[1] : null;
+    const introducedStateSyncLifecycle = /(input|change|keyup|blur)\b/.test(changedText)
+      && /(toggleClass\s*\(|addClass\s*\(|removeClass\s*\()/.test(changedText)
+      && Boolean(helperName && stateClass);
+    const resetHandlerMatch = currentContent.match(/var\s+formResetHandler\s*=\s*function\s*\([^)]*\)\s*\{[\s\S]*?\n\s*\};/);
+    const resetHandlerBlock = resetHandlerMatch ? resetHandlerMatch[0] : '';
+    const hasResetLifecycle = /formResetHandler|\.on\(\s*['"]reset|\[0\]\.reset\(\)/.test(currentContent);
+    const resetTouchesState = resetHandlerBlock && (
+      (helperName && resetHandlerBlock.includes(helperName)) ||
+      (stateClass && resetHandlerBlock.includes(stateClass))
+    );
+
+    if (introducedStateSyncLifecycle && hasResetLifecycle && resetHandlerBlock && !resetTouchesState) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /var\s+formResetHandler\s*=\s*function|function\s+formResetHandler\s*\(/),
+        title: 'State-sync helper does not refresh UI state after form reset',
+        evidence: `The changed code introduces the ${helperName} helper to toggle the ${stateClass} state class on input/change paths, but the form reset handler does not call that helper or clear the same state class.`,
+        impact: 'Forms can keep stale UI state after reset or success flows, leaving labels, placeholders, or other state-driven visuals out of sync with the cleared field values.',
+        explanation: 'This is a lifecycle regression rather than a rendering bug in the changed lines themselves. When a frontend feature introduces state-sync logic that mutates CSS classes in response to input events, the same state usually needs to be recomputed after reset, clear, or success-driven form resets.',
+        verification: 'Reset the rendered form after typing into the affected field types and confirm the state-driven class is recomputed or removed so the cleared UI matches the underlying field values.',
+        fixDirection: 'Re-run the state-sync helper after reset, or explicitly remove and recompute the affected state class at the end of the reset handler.'
       });
     }
   }
@@ -3801,12 +3943,15 @@ async function runRenderedAccessibilityScanAsync(options, cwd) {
 function collectFileContexts(reviewContext, fileEntries, highRiskPaths) {
   return fileEntries.map((entry) => {
     const filePath = entry.path;
+    const changedLines = getChangedLinesForContext(reviewContext, filePath);
+    const baseContent = getBaseContentForContext(reviewContext, filePath);
+    const currentContent = getCurrentContentForContext(reviewContext, filePath);
     return {
       path: filePath,
       highRisk: isHighRiskPath(filePath, highRiskPaths),
-      base: truncateText(getBaseContentForContext(reviewContext, filePath), 8000),
-      current: truncateText(getCurrentContentForContext(reviewContext, filePath), 12000),
-      changedLines: getChangedLinesForContext(reviewContext, filePath).slice(0, 80)
+      base: buildTargetedContextExcerpt(baseContent, filePath, changedLines, 8000),
+      current: buildTargetedContextExcerpt(currentContent, filePath, changedLines, 12000),
+      changedLines: changedLines.slice(0, 80)
     };
   });
 }
@@ -3839,6 +3984,7 @@ function buildPrompt(payload) {
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
+    'When a frontend diff adds state-sync helpers, CSS state classes, or input/change/blur listeners, trace reset, clear, success, and teardown paths in the same file before approving.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
     '',
