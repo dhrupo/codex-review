@@ -420,10 +420,13 @@ How it works:
 - it detects the current git repo and applies any built-in product profile for that repo
 - it loads repo-local defaults from `.codex/reviewer.yml` if present
 - CLI flags override repo-local config when both are supplied
-- it computes the local git diff and runs built-in heuristic checks in this repo
+- it computes the local git diff once, memoizes file/base/diff data for the run, and uses that cached context for both heuristic and Codex stages
+- it runs built-in heuristic checks first to rank risk, build product-aware hotspots, and choose the Codex deep-review scope
 - when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with isolated `codex exec --ignore-user-config --ignore-rules --ephemeral`
 - it then applies its own workflow bucketing, confidence scoring, and markdown/github/text rendering on top of the returned model output
+- when rendered accessibility URLs are configured, the Playwright + axe scan runs in parallel with the Codex subprocess instead of waiting for it to finish first
 - the default Codex subprocess timeout is `180000ms`; if it times out, the tool falls back to heuristic review and records that fallback in the report notes
+- `--thorough` increases the scoped Codex review set, but it does not guarantee a Codex-backed final result if the model step times out
 - interactive terminal runs print a short stderr progress line before the Codex step so long reviews do not look hung
 - `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
 - `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
@@ -444,6 +447,11 @@ For workflow reports:
 - `debugger-report.md` keeps confirmed bugs, rejected candidates, manual-verification items, and feedback-loop updates
 - `plugin-audit.md` keeps severity-grouped findings, a prioritized implementation backlog, and manual-verification items
 - if `plugin-audit.md` already exists, the CLI archives it to `plugin-audit-YYYY-MM-DD.md` before overwriting
+
+Practical expectation:
+
+- local wrapper overhead is now lower because repeated file reads, changed-line extraction, and Codex-scoped diff assembly are reused inside one run
+- total wall time can still be dominated by the Codex model itself on large or complex diffs, especially with `--thorough`
 
 For most WPManageNinja repos, the main useful defaults are:
 
