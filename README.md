@@ -23,13 +23,19 @@ WPManageNinja developers working on:
 
 `codex-review` reviews your local branch or worktree against a base branch and produces a report designed to catch the kinds of regressions that matter in WPManageNinja products.
 
+It is a custom local reviewer maintained in this repo. It is not an official Codex review library.
+
 It combines:
 
 - heuristic review for fast local product-aware checks
-- Codex-backed review for deeper reasoning over the most relevant changed files
+- Codex CLI-backed review for deeper reasoning over the most relevant changed files
 - WordPress-plugin-specific checks for permission, persistence, public endpoint, and accessibility regressions
 - optional Playwright + axe scans against rendered plugin/admin URLs for dynamic accessibility issues
 - recheck-aware output so a second run after fixes behaves like a follow-up review, not a fresh scan
+
+Architecture in one sentence:
+
+- this repo does the diff selection, repo profiling, heuristics, workflow shaping, confidence scoring, and report rendering itself, and when `engine=codex` it shells out to `codex exec` for the model reasoning step
 
 The report includes:
 
@@ -77,7 +83,7 @@ For repos that are not hardcoded yet, such as `fluent-cart` or `fluent-crm`, you
 - `git`
 - Codex CLI installed and authenticated if you want model-backed review
 
-Heuristic mode works without Codex CLI, but the recommended team workflow is to use the Codex engine.
+Heuristic mode works without Codex CLI, but the recommended team workflow is to use the Codex engine through the installed `codex` CLI.
 
 ## Team Installation
 
@@ -411,6 +417,9 @@ How it works:
 - it detects the current git repo and applies any built-in product profile for that repo
 - it loads repo-local defaults from `.codex/reviewer.yml` if present
 - CLI flags override repo-local config when both are supplied
+- it computes the local git diff and runs built-in heuristic checks in this repo
+- when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with `codex exec`
+- it then applies its own workflow bucketing, confidence scoring, and markdown/github/text rendering on top of the returned model output
 - `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
 - `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
 - the debugger workflow emulates `Finder -> Verifier -> Feedback` sequentially in one local run when no literal sub-agents are used
