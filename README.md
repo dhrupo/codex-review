@@ -35,7 +35,7 @@ It combines:
 
 Architecture in one sentence:
 
-- this repo does the diff selection, repo profiling, heuristics, workflow shaping, confidence scoring, and report rendering itself, and when `engine=codex` it shells out to `codex exec` for the model reasoning step
+- this repo does the diff selection, repo profiling, heuristics, workflow shaping, confidence scoring, and report rendering itself, and when `engine=codex` it shells out to an isolated `codex exec` subprocess for the model reasoning step
 
 The report includes:
 
@@ -378,6 +378,9 @@ accessibility:
   wait_for: .ff_form_wrap
   timeout_ms: 30000
   storage_state: .playwright/auth.json
+
+codex:
+  timeout_ms: 180000
 ```
 
 ## Plugin Repo Workflow
@@ -418,8 +421,10 @@ How it works:
 - it loads repo-local defaults from `.codex/reviewer.yml` if present
 - CLI flags override repo-local config when both are supplied
 - it computes the local git diff and runs built-in heuristic checks in this repo
-- when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with `codex exec`
+- when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with isolated `codex exec --ignore-user-config --ignore-rules --ephemeral`
 - it then applies its own workflow bucketing, confidence scoring, and markdown/github/text rendering on top of the returned model output
+- the default Codex subprocess timeout is `180000ms`; if it times out, the tool falls back to heuristic review and records that fallback in the report notes
+- interactive terminal runs print a short stderr progress line before the Codex step so long reviews do not look hung
 - `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
 - `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
 - the debugger workflow emulates `Finder -> Verifier -> Feedback` sequentially in one local run when no literal sub-agents are used

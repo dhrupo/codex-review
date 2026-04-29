@@ -8,6 +8,7 @@ const { execFileSync } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
+const DEFAULT_CODEX_TIMEOUT_MS = 180000;
 const WORKFLOW_PRESETS = {
   debugger: {
     format: 'markdown',
@@ -59,6 +60,7 @@ const DEFAULT_CONFIG = {
   engine: 'auto',
   model: null,
   maxFindings: DEFAULT_MAX_FINDINGS,
+  codexTimeoutMs: DEFAULT_CODEX_TIMEOUT_MS,
   base: null,
   reviewDepth: 'balanced',
   productProfile: null,
@@ -305,7 +307,8 @@ function runCommand(command, args, options = {}) {
     encoding: 'utf8',
     input: options.input || undefined,
     stdio: ['pipe', 'pipe', 'pipe'],
-    maxBuffer: options.maxBuffer || 16 * 1024 * 1024
+    maxBuffer: options.maxBuffer || 16 * 1024 * 1024,
+    timeout: options.timeout || undefined
   });
 }
 
@@ -711,6 +714,10 @@ function loadRepoConfig(cwd) {
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_CONFIG.model,
       reviewDepth: typeof (parsed.review_depth || parsed.reviewDepth) === 'string' ? (parsed.review_depth || parsed.reviewDepth) : DEFAULT_CONFIG.reviewDepth,
       maxFindings: Math.max(1, parseInt(parsed.max_findings || parsed.maxFindings, 10) || DEFAULT_CONFIG.maxFindings),
+      codexTimeoutMs: normalizeInteger(
+        (parsed.codex && (parsed.codex.timeout_ms || parsed.codex.timeoutMs)) || parsed.codex_timeout || parsed.codexTimeout,
+        DEFAULT_CONFIG.codexTimeoutMs
+      ),
       productProfile: typeof parsed.product_profile === 'object' || typeof parsed.productProfile === 'object'
         ? (parsed.product_profile || parsed.productProfile)
         : DEFAULT_CONFIG.productProfile,
@@ -748,6 +755,7 @@ function resolveOptions(rawOptions, repoConfig) {
   options.focusAreas = repoConfig.focusAreas;
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
+  options.codexTimeoutMs = repoConfig.codexTimeoutMs || DEFAULT_CONFIG.codexTimeoutMs;
   options.configNotes = repoConfig.notes;
   options.a11yUrls = rawOptions._explicit.a11yUrls ? rawOptions.a11yUrls : repoConfig.a11yUrls;
   options.a11yWaitFor = rawOptions._explicit.a11yWaitFor ? rawOptions.a11yWaitFor : repoConfig.a11yWaitFor;
@@ -3526,6 +3534,30 @@ function moduleExists(moduleName) {
   }
 }
 
+function logProgress(message) {
+  if (!process.stderr || !process.stderr.isTTY || process.env.CODEX_REVIEW_SILENT === '1') {
+    return;
+  }
+
+  process.stderr.write(`${message}\n`);
+}
+
+function formatDurationMs(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) {
+    return '0ms';
+  }
+
+  if (durationMs < 1000) {
+    return `${durationMs}ms`;
+  }
+
+  if (durationMs < 60000) {
+    return `${Math.round(durationMs / 1000)}s`;
+  }
+
+  return `${(durationMs / 60000).toFixed(durationMs % 60000 === 0 ? 0 : 1)}m`;
+}
+
 function runRenderedAccessibilityScan(options, cwd) {
   if (!options.a11yUrls || !options.a11yUrls.length) {
     return null;
@@ -3732,9 +3764,14 @@ function runCodexReview(payload, options, cwd) {
   const args = [
     'exec',
     '-',
+    '--ignore-user-config',
+    '--ignore-rules',
+    '--ephemeral',
     '--sandbox',
     'read-only',
     '--skip-git-repo-check',
+    '--color',
+    'never',
     '--output-schema',
     schemaPath,
     '-o',
@@ -3751,7 +3788,8 @@ function runCodexReview(payload, options, cwd) {
     runCommand('codex', args, {
       cwd,
       input: prompt,
-      maxBuffer: 32 * 1024 * 1024
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS
     });
 
     const parsed = JSON.parse(safeReadFile(outputPath));
@@ -3769,6 +3807,14 @@ function runCodexReview(payload, options, cwd) {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function isCodexTimeoutError(error) {
+  if (!error) {
+    return false;
+  }
+
+  return error.code === 'ETIMEDOUT' || /timed out/i.test(error.message || '');
 }
 
 function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuristic', fallbackUsed = false) {
@@ -4032,6 +4078,8 @@ function createReviewReport(options, cwd = process.cwd()) {
       notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for ${resolvedOptions.reviewDepth} review depth.`);
     }
 
+    logProgress(`codex-review: running isolated Codex review over ${selectedEntries.length} file(s)...`);
+
     const payload = {
       mode: resolvedOptions.mode,
       baseRef: reviewContext.baseRef || '--staged',
@@ -4068,6 +4116,22 @@ function createReviewReport(options, cwd = process.cwd()) {
         )
       );
     } catch (error) {
+      if (isCodexTimeoutError(error)) {
+        const timeoutLabel = formatDurationMs(resolvedOptions.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS);
+        logProgress(`codex-review: Codex timed out after ${timeoutLabel}. Falling back to heuristic review.`);
+        notes.push(`Codex review timed out after ${timeoutLabel}, so the report used heuristic fallback.`);
+        const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
+        return buildFinalReport(
+          resolvedOptions,
+          reviewContext,
+          applyWorkflowPostProcessing(
+            resolvedOptions,
+            reviewContext,
+            appendRuntimeAccessibility(fallbackResult, shouldRunRuntimeA11y ? runRenderedAccessibilityScan(resolvedOptions, cwd) : null)
+          )
+        );
+      }
+
       if (resolvedOptions.engine === 'codex') {
         throw new Error(`Codex review failed: ${error.message}`);
       }
