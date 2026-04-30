@@ -8,7 +8,10 @@ const { execFileSync, spawn } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
-const DEFAULT_CODEX_TIMEOUT_MS = 180000;
+const DEFAULT_CODEX_TIMEOUT_MS = 900000;
+const DEFAULT_SEMGREP_TIMEOUT_MS = 120000;
+const DEFAULT_PHPSTAN_TIMEOUT_MS = 120000;
+const DEFAULT_ESLINT_TIMEOUT_MS = 120000;
 const WORKFLOW_PRESETS = {
   debugger: {
     format: 'markdown',
@@ -68,6 +71,16 @@ const DEFAULT_CONFIG = {
   ignorePaths: [],
   highRiskPaths: [],
   notes: [],
+  semgrepEnabled: true,
+  semgrepConfig: 'auto',
+  semgrepTimeoutMs: DEFAULT_SEMGREP_TIMEOUT_MS,
+  phpstanEnabled: true,
+  phpstanConfig: 'auto',
+  phpstanTimeoutMs: DEFAULT_PHPSTAN_TIMEOUT_MS,
+  eslintEnabled: true,
+  eslintConfig: 'auto',
+  eslintTimeoutMs: DEFAULT_ESLINT_TIMEOUT_MS,
+  reviewdogReport: null,
   a11yUrls: [],
   a11yWaitFor: null,
   a11yTimeout: 30000,
@@ -389,6 +402,7 @@ async function runCommandAsync(command, args, options = {}) {
         error.code = code;
       }
       error.stderr = stderr;
+      error.stdout = stdout;
       finish(error);
     });
 
@@ -407,6 +421,7 @@ async function runCommandAsync(command, args, options = {}) {
     const normalizedError = new Error(stderr || error.message);
     normalizedError.code = error.code;
     normalizedError.stderr = stderr;
+    normalizedError.stdout = error.stdout ? String(error.stdout) : '';
     throw normalizedError;
   });
 }
@@ -417,6 +432,33 @@ function fileExists(filePath) {
   } catch (error) {
     return false;
   }
+}
+
+function resolveExecutable(cwd, candidates) {
+  const candidateList = Array.isArray(candidates) ? candidates : [candidates];
+
+  for (const candidate of candidateList) {
+    if (!candidate) {
+      continue;
+    }
+
+    if (candidate.includes('/') || candidate.includes('\\')) {
+      const absolutePath = path.isAbsolute(candidate) ? candidate : path.join(cwd, candidate);
+      if (fileExists(absolutePath)) {
+        return absolutePath;
+      }
+      continue;
+    }
+
+    try {
+      runCommand(candidate, ['--version'], { cwd, timeout: 10000 });
+      return candidate;
+    } catch (error) {
+      continue;
+    }
+  }
+
+  return null;
 }
 
 function safeReadFile(filePath) {
@@ -474,6 +516,16 @@ function parseArgs(argv) {
     engine: 'auto',
     model: null,
     reviewDepth: 'balanced',
+    semgrepEnabled: true,
+    semgrepConfig: DEFAULT_CONFIG.semgrepConfig,
+    semgrepTimeoutMs: DEFAULT_CONFIG.semgrepTimeoutMs,
+    phpstanEnabled: true,
+    phpstanConfig: DEFAULT_CONFIG.phpstanConfig,
+    phpstanTimeoutMs: DEFAULT_CONFIG.phpstanTimeoutMs,
+    eslintEnabled: true,
+    eslintConfig: DEFAULT_CONFIG.eslintConfig,
+    eslintTimeoutMs: DEFAULT_CONFIG.eslintTimeoutMs,
+    reviewdogReport: null,
     a11yUrls: [],
     a11yWaitFor: null,
     a11yTimeout: DEFAULT_CONFIG.a11yTimeout,
@@ -664,6 +716,133 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--semgrep') {
+      options.semgrepEnabled = true;
+      options._explicit.semgrepEnabled = true;
+      continue;
+    }
+
+    if (arg === '--no-semgrep') {
+      options.semgrepEnabled = false;
+      options._explicit.semgrepEnabled = true;
+      continue;
+    }
+
+    if (arg === '--semgrep-config' && argv[i + 1]) {
+      options.semgrepConfig = argv[i + 1];
+      options._explicit.semgrepConfig = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--semgrep-config=')) {
+      options.semgrepConfig = arg.slice('--semgrep-config='.length);
+      options._explicit.semgrepConfig = true;
+      continue;
+    }
+
+    if (arg === '--semgrep-timeout' && argv[i + 1]) {
+      options.semgrepTimeoutMs = normalizeInteger(argv[i + 1], DEFAULT_CONFIG.semgrepTimeoutMs);
+      options._explicit.semgrepTimeoutMs = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--semgrep-timeout=')) {
+      options.semgrepTimeoutMs = normalizeInteger(arg.slice('--semgrep-timeout='.length), DEFAULT_CONFIG.semgrepTimeoutMs);
+      options._explicit.semgrepTimeoutMs = true;
+      continue;
+    }
+
+    if (arg === '--phpstan') {
+      options.phpstanEnabled = true;
+      options._explicit.phpstanEnabled = true;
+      continue;
+    }
+
+    if (arg === '--no-phpstan') {
+      options.phpstanEnabled = false;
+      options._explicit.phpstanEnabled = true;
+      continue;
+    }
+
+    if (arg === '--phpstan-config' && argv[i + 1]) {
+      options.phpstanConfig = argv[i + 1];
+      options._explicit.phpstanConfig = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--phpstan-config=')) {
+      options.phpstanConfig = arg.slice('--phpstan-config='.length);
+      options._explicit.phpstanConfig = true;
+      continue;
+    }
+
+    if (arg === '--phpstan-timeout' && argv[i + 1]) {
+      options.phpstanTimeoutMs = normalizeInteger(argv[i + 1], DEFAULT_CONFIG.phpstanTimeoutMs);
+      options._explicit.phpstanTimeoutMs = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--phpstan-timeout=')) {
+      options.phpstanTimeoutMs = normalizeInteger(arg.slice('--phpstan-timeout='.length), DEFAULT_CONFIG.phpstanTimeoutMs);
+      options._explicit.phpstanTimeoutMs = true;
+      continue;
+    }
+
+    if (arg === '--eslint') {
+      options.eslintEnabled = true;
+      options._explicit.eslintEnabled = true;
+      continue;
+    }
+
+    if (arg === '--no-eslint') {
+      options.eslintEnabled = false;
+      options._explicit.eslintEnabled = true;
+      continue;
+    }
+
+    if (arg === '--eslint-config' && argv[i + 1]) {
+      options.eslintConfig = argv[i + 1];
+      options._explicit.eslintConfig = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--eslint-config=')) {
+      options.eslintConfig = arg.slice('--eslint-config='.length);
+      options._explicit.eslintConfig = true;
+      continue;
+    }
+
+    if (arg === '--eslint-timeout' && argv[i + 1]) {
+      options.eslintTimeoutMs = normalizeInteger(argv[i + 1], DEFAULT_CONFIG.eslintTimeoutMs);
+      options._explicit.eslintTimeoutMs = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--eslint-timeout=')) {
+      options.eslintTimeoutMs = normalizeInteger(arg.slice('--eslint-timeout='.length), DEFAULT_CONFIG.eslintTimeoutMs);
+      options._explicit.eslintTimeoutMs = true;
+      continue;
+    }
+
+    if (arg === '--reviewdog-report' && argv[i + 1]) {
+      options.reviewdogReport = argv[i + 1];
+      options._explicit.reviewdogReport = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--reviewdog-report=')) {
+      options.reviewdogReport = arg.slice('--reviewdog-report='.length);
+      options._explicit.reviewdogReport = true;
+      continue;
+    }
+
     if (arg === '--a11y-url' && argv[i + 1]) {
       options.a11yUrls.push(argv[i + 1]);
       options._explicit.a11yUrls = true;
@@ -785,6 +964,24 @@ function normalizeInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizeBoolean(value, fallback) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (['true', 'yes', 'on', '1'].includes(normalized)) {
+      return true;
+    }
+    if (['false', 'no', 'off', '0'].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return fallback;
+}
+
 function loadRepoConfig(cwd) {
   const configPath = path.join(cwd, '.codex', 'reviewer.yml');
 
@@ -817,6 +1014,42 @@ function loadRepoConfig(cwd) {
         (parsed.codex && (parsed.codex.timeout_ms || parsed.codex.timeoutMs)) || parsed.codex_timeout || parsed.codexTimeout,
         DEFAULT_CONFIG.codexTimeoutMs
       ),
+      semgrepEnabled: normalizeBoolean(
+        (parsed.semgrep && (parsed.semgrep.enabled)) || parsed.semgrep_enabled || parsed.semgrepEnabled,
+        DEFAULT_CONFIG.semgrepEnabled
+      ),
+      semgrepConfig: typeof ((parsed.semgrep && (parsed.semgrep.config)) || parsed.semgrep_config || parsed.semgrepConfig) === 'string'
+        ? ((parsed.semgrep && (parsed.semgrep.config)) || parsed.semgrep_config || parsed.semgrepConfig)
+        : DEFAULT_CONFIG.semgrepConfig,
+      semgrepTimeoutMs: normalizeInteger(
+        (parsed.semgrep && (parsed.semgrep.timeout_ms || parsed.semgrep.timeoutMs)) || parsed.semgrep_timeout || parsed.semgrepTimeout,
+        DEFAULT_CONFIG.semgrepTimeoutMs
+      ),
+      phpstanEnabled: normalizeBoolean(
+        (parsed.phpstan && parsed.phpstan.enabled) || parsed.phpstan_enabled || parsed.phpstanEnabled,
+        DEFAULT_CONFIG.phpstanEnabled
+      ),
+      phpstanConfig: typeof ((parsed.phpstan && parsed.phpstan.config) || parsed.phpstan_config || parsed.phpstanConfig) === 'string'
+        ? ((parsed.phpstan && parsed.phpstan.config) || parsed.phpstan_config || parsed.phpstanConfig)
+        : DEFAULT_CONFIG.phpstanConfig,
+      phpstanTimeoutMs: normalizeInteger(
+        (parsed.phpstan && (parsed.phpstan.timeout_ms || parsed.phpstan.timeoutMs)) || parsed.phpstan_timeout || parsed.phpstanTimeout,
+        DEFAULT_CONFIG.phpstanTimeoutMs
+      ),
+      eslintEnabled: normalizeBoolean(
+        (parsed.eslint && parsed.eslint.enabled) || parsed.eslint_enabled || parsed.eslintEnabled,
+        DEFAULT_CONFIG.eslintEnabled
+      ),
+      eslintConfig: typeof ((parsed.eslint && parsed.eslint.config) || parsed.eslint_config || parsed.eslintConfig) === 'string'
+        ? ((parsed.eslint && parsed.eslint.config) || parsed.eslint_config || parsed.eslintConfig)
+        : DEFAULT_CONFIG.eslintConfig,
+      eslintTimeoutMs: normalizeInteger(
+        (parsed.eslint && (parsed.eslint.timeout_ms || parsed.eslint.timeoutMs)) || parsed.eslint_timeout || parsed.eslintTimeout,
+        DEFAULT_CONFIG.eslintTimeoutMs
+      ),
+      reviewdogReport: typeof ((parsed.reviewdog && (parsed.reviewdog.report)) || parsed.reviewdog_report || parsed.reviewdogReport) === 'string'
+        ? ((parsed.reviewdog && (parsed.reviewdog.report)) || parsed.reviewdog_report || parsed.reviewdogReport)
+        : DEFAULT_CONFIG.reviewdogReport,
       productProfile: typeof parsed.product_profile === 'object' || typeof parsed.productProfile === 'object'
         ? (parsed.product_profile || parsed.productProfile)
         : DEFAULT_CONFIG.productProfile,
@@ -855,6 +1088,16 @@ function resolveOptions(rawOptions, repoConfig) {
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
   options.codexTimeoutMs = repoConfig.codexTimeoutMs || DEFAULT_CONFIG.codexTimeoutMs;
+  options.semgrepEnabled = rawOptions._explicit.semgrepEnabled ? rawOptions.semgrepEnabled : repoConfig.semgrepEnabled;
+  options.semgrepConfig = rawOptions._explicit.semgrepConfig ? rawOptions.semgrepConfig : repoConfig.semgrepConfig;
+  options.semgrepTimeoutMs = rawOptions._explicit.semgrepTimeoutMs ? rawOptions.semgrepTimeoutMs : repoConfig.semgrepTimeoutMs;
+  options.phpstanEnabled = rawOptions._explicit.phpstanEnabled ? rawOptions.phpstanEnabled : repoConfig.phpstanEnabled;
+  options.phpstanConfig = rawOptions._explicit.phpstanConfig ? rawOptions.phpstanConfig : repoConfig.phpstanConfig;
+  options.phpstanTimeoutMs = rawOptions._explicit.phpstanTimeoutMs ? rawOptions.phpstanTimeoutMs : repoConfig.phpstanTimeoutMs;
+  options.eslintEnabled = rawOptions._explicit.eslintEnabled ? rawOptions.eslintEnabled : repoConfig.eslintEnabled;
+  options.eslintConfig = rawOptions._explicit.eslintConfig ? rawOptions.eslintConfig : repoConfig.eslintConfig;
+  options.eslintTimeoutMs = rawOptions._explicit.eslintTimeoutMs ? rawOptions.eslintTimeoutMs : repoConfig.eslintTimeoutMs;
+  options.reviewdogReport = rawOptions._explicit.reviewdogReport ? rawOptions.reviewdogReport : repoConfig.reviewdogReport;
   options.configNotes = repoConfig.notes;
   options.a11yUrls = rawOptions._explicit.a11yUrls ? rawOptions.a11yUrls : repoConfig.a11yUrls;
   options.a11yWaitFor = rawOptions._explicit.a11yWaitFor ? rawOptions.a11yWaitFor : repoConfig.a11yWaitFor;
@@ -1445,6 +1688,33 @@ function buildProductSpecificFindings(options, reviewContext) {
         fixDirection: 'Update the save-time sanitizer/whitelist logic for any new field keys or nested settings introduced by this change.'
       });
     }
+
+    const helperEntry = findChangedEntry(fileEntries, (filePath) => /app\/Helpers\/Helper\.php$/i.test(filePath));
+    const advancedOptionsEntry = findChangedEntry(fileEntries, (filePath) => /advanced-options\.vue$/i.test(filePath));
+    if (helperEntry && advancedOptionsEntry && changedPathList.some((filePath) => /input_ranking|RankingField|rankingField/i.test(filePath))) {
+      const helperContent = getCurrentContentForContext(reviewContext, helperEntry.path);
+      const advancedOptionsContent = getCurrentContentForContext(reviewContext, advancedOptionsEntry.path);
+      const rankingValidatorRequiresUniqueCompleteSet = /case\s*'input_ranking'[\s\S]*count\(\$inputValue\)\s*===\s*count\(\$options\)[\s\S]*count\(\$filteredValues\)\s*===\s*count\(array_unique\(\$filteredValues\)\)[\s\S]*\$filteredValues\s*===\s*\$normalizedOptions/.test(helperContent);
+      const rankingValidatorUsesOptionValues = /in_array\s*\(\s*\$fieldType\s*,\s*\[[^\]]*'input_ranking'[^\]]*\]\)[\s\S]*array_column\s*\(\s*self::flattenAdvancedOptions\(\$formattedOptions\)\s*,\s*'value'/.test(helperContent);
+      const editorAllowsDirectValueEditing = /<el-input[^>]*v-model="option\.value"/.test(advancedOptionsContent)
+        && /confirmBulkEdit\(\)[\s\S]*values\.push\(\{[\s\S]*value:\s*value/.test(advancedOptionsContent);
+      const editorHasUniqueValueGuard = /duplicate|unique|already exists|must be unique|uniqBy|new\s+Set\s*\(/i.test(advancedOptionsContent);
+
+      if (rankingValidatorRequiresUniqueCompleteSet && rankingValidatorUsesOptionValues && editorAllowsDirectValueEditing && !editorHasUniqueValueGuard) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'high',
+          file: helperEntry.path,
+          line: findLineNumber(helperContent, /case\s*'input_ranking'/),
+          title: 'Ranking config can save duplicate option values that the validator later rejects',
+          evidence: 'The ranking validator now requires a complete unique set of option values, but the advanced options editor still allows direct value edits and bulk-imported value pairs without any visible duplicate-value guard.',
+          impact: 'Builders can save a ranking field configuration that looks valid in the editor, but submissions for that field will later fail validation because duplicate option values can never satisfy the unique complete-set check.',
+          explanation: 'This is a Fluent Forms save-time contract mismatch. The runtime validator treats ranking option values as a unique identity set, so the field editor must enforce that same uniqueness constraint when option values are entered or bulk imported.',
+          verification: 'Create a ranking field with duplicate option values through the builder or bulk editor and confirm the configuration is rejected before save, rather than allowing a field that later rejects normal submissions.',
+          fixDirection: 'Add ranking-specific duplicate-value validation in the advanced options editor or save path so ranking option values stay unique before the Helper.php validator runs.'
+        });
+      }
+    }
   }
 
   if (productProfile.repoLabel === 'fluentformpro') {
@@ -1561,6 +1831,58 @@ function buildProductSpecificFindings(options, reviewContext) {
           explanation: 'This is a product-specific race in the conversational uploader because there is no PHP fallback or second render pass to hide it. If the modal closes first and the image finishes later, the late callback still executes unless it checks the cleanup flag before creating Cropper.',
           verification: 'Close the crop dialog quickly on a large image or slow device and confirm no cropper instance is created after teardown.',
           fixDirection: 'Guard the image.onload callback with the cleanup flag before creating Cropper and return early after teardown.'
+        });
+      }
+    }
+
+    const rankingTypeEntry = findChangedEntry(fileEntries, (filePath) => /RankingType\.vue$/i.test(filePath));
+    const rankingStyleEntry = findChangedEntry(fileEntries, (filePath) => /src\/form\/styles\/app\.scss$/i.test(filePath));
+
+    if (rankingTypeEntry && rankingStyleEntry) {
+      const rankingTypeContent = getCurrentContentForContext(reviewContext, rankingTypeEntry.path);
+      const rankingStyleContent = getCurrentContentForContext(reviewContext, rankingStyleEntry.path);
+      const supportsMultiColumnGrid = /rankingDisplayType\s*===\s*['"]grid['"]/.test(rankingTypeContent)
+        && /columns\s*>=\s*2\s*&&\s*columns\s*<=\s*6/.test(rankingTypeContent)
+        && /--ff-conv-ranking-columns/.test(rankingTypeContent);
+      const hasGridColumnsRule = /\.ff_conv_ranking--grid\s*\{[\s\S]*grid-template-columns\s*:\s*repeat\(var\(--ff-conv-ranking-columns,\s*3\)/.test(rankingStyleContent);
+      const hasMobileGridOverride = /@media[\s\S]{0,800}\(max-width:\s*767px\)[\s\S]*\.ff_conv_ranking--grid\s*\{[\s\S]*grid-template-columns\s*:\s*(1fr|repeat\(\s*[12]\s*,)/.test(rankingStyleContent)
+        || /@media[\s\S]{0,800}\(max-width:\s*767px\)[\s\S]*\.ff_conv_ranking--grid[\s\S]*--ff-conv-ranking-columns\s*:\s*[12]\b/.test(rankingStyleContent);
+
+      if (supportsMultiColumnGrid && hasGridColumnsRule && !hasMobileGridOverride) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'high',
+          file: rankingStyleEntry.path,
+          line: findLineNumber(rankingStyleContent, /\.ff_conv_ranking--grid\s*\{/),
+          title: 'Ranking grid can become unusable on small screens',
+          evidence: 'The ranking question supports grid display with 2-6 columns through --ff-conv-ranking-columns, but the SCSS does not show a max-width mobile override that collapses .ff_conv_ranking--grid to 1 or 2 columns.',
+          impact: 'On narrow viewports, 3-6 columns produce cramped cards and controls, which reduces tap accuracy and makes the conversational ranking question difficult to use on phones.',
+          explanation: 'This is a user-facing responsive regression rather than a generic CSS preference. Conversational questions are primarily completed on mobile screens, so a new interactive card grid needs an explicit small-screen layout fallback even if the desktop layout is correct.',
+          verification: 'Render the ranking question on a narrow mobile viewport and confirm grid mode collapses to a safe 1-column or 2-column layout regardless of the configured desktop column count.',
+          fixDirection: 'Add a mobile breakpoint override for .ff_conv_ranking--grid so small screens use at most 1 or 2 columns.'
+        });
+      }
+    }
+
+    if (rankingTypeEntry) {
+      const rankingTypeContent = getCurrentContentForContext(reviewContext, rankingTypeEntry.path);
+      const buildItemsBlockMatch = rankingTypeContent.match(/buildItems\s*\(\)\s*\{[\s\S]*?\n\s*\},/);
+      const buildItemsBlock = buildItemsBlockMatch ? buildItemsBlockMatch[0] : rankingTypeContent;
+      const quadraticOrderingBuild = /answer\.forEach\s*\(\s*value\s*=>\s*\{[\s\S]*availableOptions\.find\s*\([\s\S]*usedValues\.includes\s*\([\s\S]*\}[\s\S]*availableOptions\.forEach\s*\(\s*option\s*=>\s*\{[\s\S]*usedValues\.includes\s*\(/.test(buildItemsBlock);
+      const usesMapOrSetOptimization = /new\s+Set\s*\(|new\s+Map\s*\(|Object\.create\s*\(\s*null\s*\)|reduce\s*\(\s*\([^)]*\)\s*=>\s*\{[\s\S]*\[[^\]]+\]\s*=/.test(buildItemsBlock);
+
+      if (quadraticOrderingBuild && !usesMapOrSetOptimization) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'high',
+          file: rankingTypeEntry.path,
+          line: findLineNumber(rankingTypeContent, /buildItems\s*\(\)\s*\{/),
+          title: 'Quadratic ordering build for ranking options',
+          evidence: 'buildItems() performs repeated linear scans across answers and options through availableOptions.find(...) and usedValues.includes(...), then scans availableOptions again with usedValues.includes(...), making initialization quadratic as the option set grows.',
+          impact: 'Large ranking option sets can noticeably slow mount or rehydration when the question is activated, which is especially visible in a frontend-only conversational flow.',
+          explanation: 'This is a real performance bug rather than a style preference. The ranking initializer rebuilds ordered items from two collections, but each answer match and used-value check walks arrays repeatedly. That scales poorly compared with pre-indexing options and using a Set for membership checks.',
+          verification: 'Test ranking question activation and rehydration with larger option sets and confirm initialization stays responsive without repeated linear scans over the same arrays.',
+          fixDirection: 'Pre-index options by value and use a Set for used values so matching and membership checks stay O(1) during buildItems().'
         });
       }
     }
@@ -1842,7 +2164,7 @@ function analyzeFile(context) {
   const { filePath, currentContent, baseContent, changedLines, mode, highRiskPaths, productProfile } = context;
   const repoLabel = productProfile ? productProfile.repoLabel : '';
   const isPhpFile = filePath.endsWith('.php');
-  const isScriptFile = /\.(js|jsx|ts|tsx)$/i.test(filePath);
+  const isScriptFile = /\.(js|jsx|ts|tsx|vue)$/i.test(filePath);
   const isFrontendFile = isFrontendTemplateFile(filePath);
   const isStyleLikeFile = isStyleFile(filePath);
   const runAccessibilityChecks = mode === 'full' || mode === 'compatibility' || mode === 'accessibility';
@@ -2067,6 +2389,58 @@ function analyzeFile(context) {
   }
 
   if (isScriptFile) {
+    const duplicateResourceFetchMatch = currentContent.match(/then\s*\(\s*\(\)\s*=>\s*\{[\s\S]*?this\.getEntryResources\s*\(\)\s*;[\s\S]*?update_status[\s\S]*?this\.handleStatusChange\s*\([^)]*\)\s*;[\s\S]*?this\.getEntryResources\s*\(\)\s*;[\s\S]*?\}\s*\)/);
+    if (duplicateResourceFetchMatch) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /this\.getEntryResources\s*\(\)\s*;/),
+        title: 'Duplicate resource fetch on entry load',
+        evidence: 'The entry-load flow fetches resources once before checking update_status and then fetches them again inside the status-update branch after calling handleStatusChange().',
+        impact: 'This adds an avoidable extra request on entry-load paths, increasing admin latency and backend load on a high-traffic screen.',
+        explanation: 'This is a control-flow regression, not just a repeated line. If one branch updates status before loading resources, the component should await that status change and then fetch resources once for that path instead of always fetching before and after the branch.',
+        verification: 'Trace the mounted or initial load path with and without update_status present and confirm resource loading happens exactly once per branch.',
+        fixDirection: 'Restructure the load flow so getEntryResources() runs once per path, awaiting status change first when the update_status branch needs to run.'
+      });
+    }
+
+    const dragoverFullReset = /on\s*\(\s*['"]dragover['"][\s\S]*?clearDropState\s*\(\)/.test(currentContent)
+      && /clearDropState\s*=\s*\(\)\s*=>\s*\{[\s\S]*find\s*\(\s*['"][^'"]+['"]\s*\)[\s\S]*removeClass\s*\(\s*['"][^'"]+['"]\s*\)/.test(currentContent)
+      && /addClass\s*\(\s*['"][^'"]*over[^'"]*['"]\s*\)/.test(currentContent);
+
+    if (dragoverFullReset) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /on\s*\(\s*['"]dragover['"]/),
+        title: 'High-frequency dragover does full-list class reset each event',
+        evidence: 'The dragover handler calls clearDropState() on each drag event, and clearDropState() scans the full item list to remove drop-state classes before the current target adds the class back.',
+        impact: 'Dragover fires very frequently while the pointer moves. Re-querying and mutating every item on each event creates avoidable DOM churn and can cause jank on larger sortable lists.',
+        explanation: 'This is a real client-side performance issue rather than a micro-optimization. Drag/drop handlers run on a very hot path, so full-list DOM queries and class resets inside dragover scale poorly as item counts increase.',
+        verification: 'Profile drag interactions on larger lists and confirm drop-state highlighting updates only when the hovered target changes, not on every dragover event.',
+        fixDirection: 'Track the currently highlighted drop target and only update classes when the target actually changes, instead of clearing the full list on every dragover event.'
+      });
+    }
+
+    const adjacentForwardDropNoOp = /onDrop\s*\(\s*index\s*\)\s*\{[\s\S]*const\s+sourceIndex\s*=\s*this\.dragIndex\s*;[\s\S]*let\s+insertIndex\s*=\s*index\s*;[\s\S]*if\s*\(\s*sourceIndex\s*<\s*insertIndex\s*\)\s*\{[\s\S]*insertIndex\s*-?=\s*1\s*;[\s\S]*\}[\s\S]*if\s*\(\s*insertIndex\s*===\s*sourceIndex\s*\)\s*\{[\s\S]*return\s*;[\s\S]*\}/.test(currentContent);
+
+    if (adjacentForwardDropNoOp) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /onDrop\s*\(\s*index\s*\)\s*\{/),
+        title: 'Drag-and-drop cannot move item to immediate next position',
+        evidence: 'The drop handler initializes insertIndex from the hovered index, decrements it for forward moves, and then returns when insertIndex equals sourceIndex. Dropping an item onto the immediately following slot therefore collapses to a no-op instead of moving the item down by one position.',
+        impact: 'Users cannot complete some valid reorder operations with drag-and-drop, so ranking and sortable list interactions behave inconsistently and feel broken even though the drag UI appears to accept the drop.',
+        explanation: 'This is a concrete reorder-logic bug, not a cosmetic drag/drop concern. Forward moves need different insertion math depending on whether the target index represents the hovered item or the insertion boundary after removal. The current equality guard accidentally rejects the adjacent-next case entirely.',
+        verification: 'Drag an item onto the immediately following item and confirm the order changes by one position instead of snapping back to the original order.',
+        fixDirection: 'Adjust the drop-index math so a forward move onto the next item still inserts after removal, or derive the insertion point from an explicit before/after drop target instead of decrementing and then treating equality as no-op.'
+      });
+    }
+
     const changedText = changedLines.map((entry) => entry.text).join('\n');
     const helperDeclaration = changedText.match(/var\s+([A-Za-z0-9_]+)\s*=\s*function\s*\(/);
     const stateClassMatch = changedText.match(/toggleClass\s*\(\s*['"]([^'"]+)['"]|addClass\s*\(\s*['"]([^'"]+)['"]|removeClass\s*\(\s*['"]([^'"]+)['"]/);
@@ -2095,6 +2469,28 @@ function analyzeFile(context) {
         explanation: 'This is a lifecycle regression rather than a rendering bug in the changed lines themselves. When a frontend feature introduces state-sync logic that mutates CSS classes in response to input events, the same state usually needs to be recomputed after reset, clear, or success-driven form resets.',
         verification: 'Reset the rendered form after typing into the affected field types and confirm the state-driven class is recomputed or removed so the cleared UI matches the underlying field values.',
         fixDirection: 'Re-run the state-sync helper after reset, or explicitly remove and recompute the affected state class at the end of the reset handler.'
+      });
+    }
+
+    const derivedStateOnMountOnly = /props\s*:\s*\[[^\]]*['"]value['"][^\]]*['"]field['"][^\]]*\]/.test(currentContent)
+      && /data\s*\(\)\s*\{[\s\S]*orderedItems\s*:\s*\[\]/.test(currentContent)
+      && /buildItems\s*\(\)\s*\{[\s\S]*this\.orderedItems\s*=/.test(currentContent)
+      && /mounted\s*\(\)\s*\{[\s\S]*this\.buildItems\s*\(\)\s*;[\s\S]*\}/.test(currentContent)
+      && !/watch\s*:\s*\{[\s\S]*(value|field)/.test(currentContent)
+      && !/watch\s*\(\s*\(\s*\)\s*=>\s*(this\.)?(value|field)|watch\s*\(\s*['"](value|field)/.test(currentContent);
+
+    if (derivedStateOnMountOnly) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /mounted\s*\(\)\s*\{/),
+        title: 'Entry editor derived list does not react to prop updates',
+        evidence: 'The component derives orderedItems from value/field props in buildItems(), calls it only in mounted(), and does not show watchers or another reactive path for later prop updates.',
+        impact: 'When entry data or field options are refreshed after initial render, the editor can display stale order or labels and allow edits against outdated state.',
+        explanation: 'This is a common Vue editor regression: copying prop-derived state into local mutable arrays on mount is fine only if the component also resynchronizes when the source props change. Entry and settings editors often receive async-loaded data after first render.',
+        verification: 'Reload or update the editor with new value and field option data after initial render and confirm the local ordered list rebuilds to reflect the latest props.',
+        fixDirection: 'Add watchers or a computed-driven synchronization path so buildItems() reruns when value or the relevant field option source changes.'
       });
     }
   }
@@ -2159,19 +2555,41 @@ function analyzeFile(context) {
       });
     }
 
-    const unnamedButton = changedLines.find((entry) => /<button\b[^>]*>\s*(<[^/][^>]*>\s*)*<\/button>/i.test(entry.text) && !/aria-label\s*=|aria-labelledby\s*=|title\s*=/.test(entry.text));
+    const unnamedButton = changedLines.find((entry) => {
+      const nativeEmptyButton = /<button\b[^>]*>\s*(<[^/][^>]*>\s*)*<\/button>/i.test(entry.text);
+      const iconOnlyComponentButton = /<el-button\b[^>]*\bicon=/.test(entry.text)
+        && /<\/el-button>/.test(entry.text)
+        && !/>\s*[^<\s][\s\S]*<\/el-button>/.test(entry.text);
+
+      if (!(nativeEmptyButton || iconOnlyComponentButton)) {
+        return false;
+      }
+
+      return !/aria-label\s*=|aria-labelledby\s*=|title\s*=/.test(entry.text);
+    });
     if (unnamedButton) {
+      const isReorderButton = /move\s*\(/.test(unnamedButton.text) || /orderedItems|moveButtonLabel/.test(currentContent);
       pushFinding(findings, {
-        severity: 'medium',
-        confidence: 'medium',
+        severity: isReorderButton ? 'important' : 'medium',
+        confidence: isReorderButton ? 'high' : 'medium',
         file: filePath,
         line: unnamedButton.line,
-        title: 'Button does not show an accessible name',
-        evidence: 'A changed button appears to render without visible text or aria labeling.',
-        impact: 'Icon-only or visually minimal controls can become silent to screen readers, which makes toolbars, modal controls, and media actions hard to discover and use.',
-        explanation: 'WordPress plugin screens often rely on compact action buttons. If the control name is only implied by an icon, assistive technology may announce it as a generic button with no purpose.',
-        verification: 'Inspect the rendered button and confirm it exposes a clear accessible name through visible text or aria-label/aria-labelledby.',
-        fixDirection: 'Add visible button text or an explicit accessible name for icon-only controls.'
+        title: isReorderButton ? 'Icon-only reorder buttons missing accessible names' : 'Button does not show an accessible name',
+        evidence: isReorderButton
+          ? 'The changed reorder control renders as an icon-only button/component button without visible text or aria labeling.'
+          : 'A changed button appears to render without visible text or aria labeling.',
+        impact: isReorderButton
+          ? 'Screen-reader users cannot tell which reorder action each control performs, so the ranking or sortable editor becomes difficult or impossible to operate reliably.'
+          : 'Icon-only or visually minimal controls can become silent to screen readers, which makes toolbars, modal controls, and media actions hard to discover and use.',
+        explanation: isReorderButton
+          ? 'Reorder controls are workflow-critical actions, not decorative icons. If move-up and move-down buttons are rendered only as arrows, they need explicit accessible names so assistive technology can distinguish the actions.'
+          : 'WordPress plugin screens often rely on compact action buttons. If the control name is only implied by an icon, assistive technology may announce it as a generic button with no purpose.',
+        verification: isReorderButton
+          ? 'Inspect the rendered reorder controls with assistive technology and confirm each button exposes a distinct accessible name such as Move up or Move down.'
+          : 'Inspect the rendered button and confirm it exposes a clear accessible name through visible text or aria-label/aria-labelledby.',
+        fixDirection: isReorderButton
+          ? 'Add explicit accessible names such as aria-label or aria-labelledby for each icon-only reorder action.'
+          : 'Add visible button text or an explicit accessible name for icon-only controls.'
       });
     }
 
@@ -3113,6 +3531,11 @@ function renderText(report) {
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
+  if (report.stageSummaries && report.stageSummaries.length) {
+    lines.push('', 'Engine Stages:');
+    report.stageSummaries.forEach((stage) => lines.push(`- ${stage.name}: ${stage.status}, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`));
+  }
+
   if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
     lines.push('', 'Rendered Accessibility Scan:');
     lines.push(`- Pages scanned: ${report.runtimeAccessibility.pages.length}`);
@@ -3260,6 +3683,13 @@ function renderDebuggerMarkdown(report) {
     `| Needs manual verification | ${manualCandidates.length} |`
   ];
 
+  if (report.stageSummaries && report.stageSummaries.length) {
+    lines.push('', '## Engine Stages', '');
+    report.stageSummaries.forEach((stage) => {
+      lines.push(`- \`${stage.name}\`: \`${stage.status}\`, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`);
+    });
+  }
+
   if (confirmedFindings.length) {
     lines.push('', '## Table of Contents', '');
     confirmedFindings.forEach((finding) => {
@@ -3380,6 +3810,13 @@ function renderPluginAuditMarkdown(report) {
     `| SUGGESTION | ${severityCounts.low} |`
   ];
 
+  if (report.stageSummaries && report.stageSummaries.length) {
+    lines.push('', '## Engine Stages', '');
+    report.stageSummaries.forEach((stage) => {
+      lines.push(`- \`${stage.name}\`: \`${stage.status}\`, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`);
+    });
+  }
+
   if (workstreamSummaries.length) {
     lines.push('', '### Workstream Summary', '');
     workstreamSummaries.forEach((item) => {
@@ -3499,6 +3936,11 @@ function renderMarkdown(report) {
   if (report.notes.length) {
     lines.push('', '## Notes', '');
     report.notes.forEach((note) => lines.push(`- ${note}`));
+  }
+
+  if (report.stageSummaries && report.stageSummaries.length) {
+    lines.push('', '## Engine Stages', '');
+    report.stageSummaries.forEach((stage) => lines.push(`- \`${stage.name}\`: \`${stage.status}\`, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`));
   }
 
   if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
@@ -3674,6 +4116,13 @@ function renderGitHub(report) {
     lines.push('</ul>');
   }
 
+  if (report.stageSummaries && report.stageSummaries.length) {
+    lines.push('<p><strong>Engine stages:</strong></p>');
+    lines.push('<ul>');
+    report.stageSummaries.forEach((stage) => lines.push(`<li><code>${stage.name}</code>: <code>${stage.status}</code>, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}</li>`));
+    lines.push('</ul>');
+  }
+
   if (report.runtimeAccessibility && report.runtimeAccessibility.pages && report.runtimeAccessibility.pages.length) {
     lines.push('<p><strong>Rendered accessibility scan:</strong></p>');
     lines.push('<ul>');
@@ -3775,6 +4224,55 @@ function renderGitHub(report) {
   return lines.join('\n');
 }
 
+function renderRdjson(report) {
+  const displayFindings = getFindingDisplayEntries(report.findings);
+  const diagnostics = displayFindings.map((finding) => {
+    const severity = finding.severity === 'critical' || finding.severity === 'important'
+      ? 'ERROR'
+      : finding.severity === 'medium'
+        ? 'WARNING'
+        : 'INFO';
+
+    return {
+      message: [
+        finding.title,
+        '',
+        finding.evidence,
+        '',
+        `Why it matters: ${finding.impact}`,
+        `Fix: ${finding.fixDirection}`
+      ].join('\n'),
+      location: {
+        path: finding.file,
+        range: {
+          start: {
+            line: finding.line,
+            column: 1
+          },
+          end: {
+            line: finding.line,
+            column: 1
+          }
+        }
+      },
+      severity,
+      source: {
+        name: 'codex-review'
+      },
+      code: {
+        value: finding.severityKey || finding.fingerprint || finding.title
+      }
+    };
+  });
+
+  return JSON.stringify({
+    source: {
+      name: 'codex-review'
+    },
+    diagnostics
+  }, null, 2);
+}
+
 function shouldFail(report, failOn) {
   if (!failOn) {
     return false;
@@ -3819,6 +4317,515 @@ function normalizeOutsideDiffFinding(finding) {
     explanation: finding.explanation,
     verification: finding.verification,
     fixDirection: finding.fix_direction
+  };
+}
+
+function lineTouchesChangedDiff(reviewContext, filePath, lineNumber, radius = 2) {
+  const changedLines = getChangedLinesForContext(reviewContext, filePath);
+  if (!changedLines.length) {
+    return Boolean(reviewContext.explicitFileScope);
+  }
+
+  return changedLines.some((entry) => Math.abs(entry.line - lineNumber) <= radius);
+}
+
+function mapSemgrepSeverity(result) {
+  const severity = String((result.extra && result.extra.severity) || '').toUpperCase();
+  const metadata = result.extra && result.extra.metadata ? result.extra.metadata : {};
+  const category = String(metadata.category || '').toLowerCase();
+  const confidence = String(metadata.confidence || '').toLowerCase();
+
+  if (severity === 'ERROR') {
+    return category === 'security' ? 'critical' : 'important';
+  }
+
+  if (severity === 'WARNING') {
+    return 'important';
+  }
+
+  if (confidence === 'high') {
+    return 'important';
+  }
+
+  return 'medium';
+}
+
+function mapSemgrepConfidence(result) {
+  const confidence = String((result.extra && result.extra.metadata && result.extra.metadata.confidence) || '').toLowerCase();
+  if (confidence === 'high' || confidence === 'medium' || confidence === 'low') {
+    return confidence;
+  }
+
+  const severity = String((result.extra && result.extra.severity) || '').toUpperCase();
+  if (severity === 'ERROR' || severity === 'WARNING') {
+    return 'high';
+  }
+
+  return 'medium';
+}
+
+function buildSemgrepFinding(result, cwd) {
+  const rawPath = String(result.path || '');
+  const filePath = path.isAbsolute(rawPath) ? path.relative(cwd, rawPath) : rawPath;
+  const line = Math.max(1, parseInt(result.start && result.start.line, 10) || 1);
+  const checkId = String(result.check_id || 'semgrep');
+  const extra = result.extra || {};
+  const metadata = extra.metadata || {};
+  const message = String(extra.message || checkId).trim();
+  const shortMessage = message.split('\n')[0].trim();
+  const title = shortMessage.length > 120 ? `${shortMessage.slice(0, 117)}...` : shortMessage;
+  const docsUrl = metadata.source || metadata.shortlink || metadata.help || '';
+
+  return {
+    severity: mapSemgrepSeverity(result),
+    confidence: mapSemgrepConfidence(result),
+    source: 'semgrep',
+    file: filePath,
+    line,
+    title,
+    evidence: message,
+    impact: `Semgrep flagged this changed path via rule \`${checkId}\`${docsUrl ? ` (${docsUrl})` : ''}.`,
+    explanation: 'This is a deterministic static-analysis signal from Semgrep. Review the exact sink, guard, or data-flow pattern matched by the rule and confirm whether the changed code intentionally preserves the required protection or invariant.',
+    verification: 'Inspect the changed code path against the matched rule intent and confirm the expected guard, sanitization, or API usage is still present at runtime.',
+    fixDirection: 'Apply the narrowest fix that satisfies the matched Semgrep rule without changing unrelated behavior.'
+  };
+}
+
+async function runSemgrepReviewAsync(reviewContext, options, cwd) {
+  if (!options.semgrepEnabled) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'semgrep',
+        status: 'disabled',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  if (!commandExists('semgrep')) {
+    return {
+      findings: [],
+      notes: ['Semgrep was enabled, but the semgrep CLI is not available in PATH.'],
+      stage: {
+        name: 'semgrep',
+        status: 'unavailable',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const startedAt = Date.now();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-review-semgrep-'));
+  const outputPath = path.join(tempDir, 'semgrep.json');
+  const filePaths = reviewContext.fileEntries.map((entry) => entry.path).filter(Boolean);
+
+  if (!filePaths.length) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'semgrep',
+        status: 'skipped',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const args = [
+    'scan',
+    '--json',
+    '--quiet',
+    '--metrics=off',
+    '--config',
+    options.semgrepConfig || DEFAULT_CONFIG.semgrepConfig,
+    '--output',
+    outputPath,
+    '--',
+    ...filePaths
+  ];
+
+  try {
+    await runCommandAsync('semgrep', args, {
+      cwd,
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.semgrepTimeoutMs || DEFAULT_SEMGREP_TIMEOUT_MS
+    });
+  } catch (error) {
+    if (error.code === 'ETIMEDOUT') {
+      return {
+        findings: [],
+        notes: [`Semgrep timed out after ${formatDurationMs(options.semgrepTimeoutMs || DEFAULT_SEMGREP_TIMEOUT_MS)} and was skipped.`],
+        stage: {
+          name: 'semgrep',
+          status: 'timed_out',
+          durationMs: Date.now() - startedAt,
+          findings: 0
+        }
+      };
+    }
+
+    return {
+      findings: [],
+      notes: [`Semgrep failed and was skipped: ${error.message}`],
+      stage: {
+        name: 'semgrep',
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        findings: 0
+      }
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(safeReadFile(outputPath) || '{"results":[]}');
+    const findings = [];
+
+    (parsed.results || []).forEach((result) => {
+      const rawPath = String(result.path || '');
+      const filePath = path.isAbsolute(rawPath) ? path.relative(cwd, rawPath) : rawPath;
+      const line = Math.max(1, parseInt(result.start && result.start.line, 10) || 1);
+      if (!filePath || !lineTouchesChangedDiff(reviewContext, filePath, line, 3)) {
+        return;
+      }
+
+      pushFinding(findings, buildSemgrepFinding({ ...result, path: filePath }, cwd));
+    });
+
+    const durationMs = Date.now() - startedAt;
+    return {
+      findings,
+      notes: [`Semgrep scanned the changed files with config \`${options.semgrepConfig || DEFAULT_CONFIG.semgrepConfig}\` and contributed ${findings.length} merged finding(s) in ${formatDurationMs(durationMs)}.`],
+      stage: {
+        name: 'semgrep',
+        status: 'completed',
+        durationMs,
+        findings: findings.length
+      }
+    };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function buildPhpstanFinding(filePath, message) {
+  const line = Math.max(1, parseInt(message.line, 10) || 1);
+  const identifier = message.identifier || 'phpstan';
+  const tip = message.tip ? ` Tip: ${message.tip}` : '';
+  return {
+    severity: 'important',
+    confidence: 'high',
+    source: 'phpstan',
+    file: filePath,
+    line,
+    title: String(message.message || identifier).split('\n')[0].trim(),
+    evidence: `${String(message.message || '').trim()}${tip}`.trim(),
+    impact: `PHPStan reported a correctness or type-contract issue via \`${identifier}\` on this changed PHP path.`,
+    explanation: 'This is a deterministic PHP static-analysis finding. In these plugin repos, PHPStan usually surfaces real contract, nullability, collection-shape, or method-usage problems that can become runtime errors or broken data flow.',
+    verification: 'Re-check the affected method or property contract and confirm the changed code satisfies the expected PHP type and nullability assumptions.',
+    fixDirection: 'Adjust the changed PHP code so the contract, nullability, or collection shape matches what PHPStan expects at this call site.'
+  };
+}
+
+async function runPhpstanReviewAsync(reviewContext, options, cwd) {
+  if (!options.phpstanEnabled) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'phpstan',
+        status: 'disabled',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const phpFiles = reviewContext.fileEntries.map((entry) => entry.path).filter((filePath) => /\.php$/i.test(filePath));
+  if (!phpFiles.length) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'phpstan',
+        status: 'skipped',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const executable = resolveExecutable(cwd, ['vendor/bin/phpstan', 'phpstan']);
+  if (!executable) {
+    return {
+      findings: [],
+      notes: ['PHPStan was enabled, but no phpstan executable was found in vendor/bin or PATH.'],
+      stage: {
+        name: 'phpstan',
+        status: 'unavailable',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const startedAt = Date.now();
+  const args = ['analyse', '--error-format=json', '--no-progress'];
+  if (options.phpstanConfig && options.phpstanConfig !== 'auto') {
+    args.push('--configuration', options.phpstanConfig);
+  }
+  args.push(...phpFiles);
+
+  let output = '';
+  try {
+    output = await runCommandAsync(executable, args, {
+      cwd,
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.phpstanTimeoutMs || DEFAULT_PHPSTAN_TIMEOUT_MS
+    });
+  } catch (error) {
+    if (error.code === 'ETIMEDOUT') {
+      return {
+        findings: [],
+        notes: [`PHPStan timed out after ${formatDurationMs(options.phpstanTimeoutMs || DEFAULT_PHPSTAN_TIMEOUT_MS)} and was skipped.`],
+        stage: {
+          name: 'phpstan',
+          status: 'timed_out',
+          durationMs: Date.now() - startedAt,
+          findings: 0
+        }
+      };
+    }
+
+    const candidateOutput = String(error.stdout || error.stderr || error.message || '').trim();
+    if (!candidateOutput.startsWith('{')) {
+      return {
+        findings: [],
+        notes: [`PHPStan failed and was skipped: ${error.message}`],
+        stage: {
+          name: 'phpstan',
+          status: 'failed',
+          durationMs: Date.now() - startedAt,
+          findings: 0
+        }
+      };
+    }
+
+    output = candidateOutput;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(output || '{}');
+  } catch (error) {
+    return {
+      findings: [],
+      notes: [`PHPStan returned unreadable JSON and was skipped: ${error.message}`],
+      stage: {
+        name: 'phpstan',
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        findings: 0
+      }
+    };
+  }
+
+  const findings = [];
+  Object.entries(parsed.files || {}).forEach(([rawPath, details]) => {
+    const filePath = path.isAbsolute(rawPath) ? path.relative(cwd, rawPath) : rawPath;
+    (details.messages || []).forEach((message) => {
+      const line = Math.max(1, parseInt(message.line, 10) || 1);
+      if (!lineTouchesChangedDiff(reviewContext, filePath, line, 3)) {
+        return;
+      }
+      pushFinding(findings, buildPhpstanFinding(filePath, message));
+    });
+  });
+
+  const durationMs = Date.now() - startedAt;
+  return {
+    findings,
+    notes: [`PHPStan analyzed ${phpFiles.length} changed PHP file(s) and contributed ${findings.length} merged finding(s) in ${formatDurationMs(durationMs)}.`],
+    stage: {
+      name: 'phpstan',
+      status: 'completed',
+      durationMs,
+      findings: findings.length
+    }
+  };
+}
+
+function buildEslintFinding(result, message, cwd) {
+  const rawPath = String(result.filePath || '');
+  const filePath = path.isAbsolute(rawPath) ? path.relative(cwd, rawPath) : rawPath;
+  const line = Math.max(1, parseInt(message.line, 10) || 1);
+  const ruleId = message.ruleId || 'eslint';
+  const severity = message.severity === 2 ? 'important' : 'medium';
+  const confidence = message.severity === 2 ? 'high' : 'medium';
+
+  return {
+    severity,
+    confidence,
+    source: 'eslint',
+    file: filePath,
+    line,
+    title: String(message.message || ruleId).split('\n')[0].trim(),
+    evidence: `${String(message.message || '').trim()}${ruleId ? ` (rule: ${ruleId})` : ''}`,
+    impact: `ESLint reported a deterministic frontend correctness/style-contract issue${ruleId ? ` via \`${ruleId}\`` : ''} on this changed file.`,
+    explanation: 'This is a deterministic JavaScript/Vue linting signal. For these plugin repos, ESLint is most useful for catching broken component logic, unsafe patterns, and framework-level mistakes before they become runtime regressions.',
+    verification: 'Inspect the affected Vue/JS code path and confirm the change still satisfies the expected framework and lint-rule contract.',
+    fixDirection: 'Adjust the changed JS/Vue code to satisfy the ESLint rule or framework contract without altering unrelated behavior.'
+  };
+}
+
+async function runEslintReviewAsync(reviewContext, options, cwd) {
+  if (!options.eslintEnabled) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'eslint',
+        status: 'disabled',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const scriptFiles = reviewContext.fileEntries.map((entry) => entry.path).filter((filePath) => /\.(js|jsx|ts|tsx|vue)$/i.test(filePath));
+  if (!scriptFiles.length) {
+    return {
+      findings: [],
+      notes: [],
+      stage: {
+        name: 'eslint',
+        status: 'skipped',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const executable = resolveExecutable(cwd, ['node_modules/.bin/eslint', 'eslint']);
+  if (!executable) {
+    return {
+      findings: [],
+      notes: ['ESLint was enabled, but no eslint executable was found in node_modules/.bin or PATH.'],
+      stage: {
+        name: 'eslint',
+        status: 'unavailable',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const startedAt = Date.now();
+  const args = ['-f', 'json'];
+  if (options.eslintConfig && options.eslintConfig !== 'auto') {
+    args.push('--config', options.eslintConfig);
+  }
+  args.push(...scriptFiles);
+
+  let output = '';
+  try {
+    output = await runCommandAsync(executable, args, {
+      cwd,
+      maxBuffer: 32 * 1024 * 1024,
+      timeout: options.eslintTimeoutMs || DEFAULT_ESLINT_TIMEOUT_MS
+    });
+  } catch (error) {
+    if (error.code === 'ETIMEDOUT') {
+      return {
+        findings: [],
+        notes: [`ESLint timed out after ${formatDurationMs(options.eslintTimeoutMs || DEFAULT_ESLINT_TIMEOUT_MS)} and was skipped.`],
+        stage: {
+          name: 'eslint',
+          status: 'timed_out',
+          durationMs: Date.now() - startedAt,
+          findings: 0
+        }
+      };
+    }
+
+    const candidateOutput = String(error.stdout || error.stderr || error.message || '').trim();
+    if (!candidateOutput.startsWith('[')) {
+      return {
+        findings: [],
+        notes: [`ESLint failed and was skipped: ${error.message}`],
+        stage: {
+          name: 'eslint',
+          status: 'failed',
+          durationMs: Date.now() - startedAt,
+          findings: 0
+        }
+      };
+    }
+
+    output = candidateOutput;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(output || '[]');
+  } catch (error) {
+    return {
+      findings: [],
+      notes: [`ESLint returned unreadable JSON and was skipped: ${error.message}`],
+      stage: {
+        name: 'eslint',
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        findings: 0
+      }
+    };
+  }
+
+  const findings = [];
+  (parsed || []).forEach((result) => {
+    const rawPath = String(result.filePath || '');
+    const filePath = path.isAbsolute(rawPath) ? path.relative(cwd, rawPath) : rawPath;
+    (result.messages || []).forEach((message) => {
+      const line = Math.max(1, parseInt(message.line, 10) || 1);
+      if (!filePath || !lineTouchesChangedDiff(reviewContext, filePath, line, 3)) {
+        return;
+      }
+      pushFinding(findings, buildEslintFinding({ ...result, filePath }, message, cwd));
+    });
+  });
+
+  const durationMs = Date.now() - startedAt;
+  return {
+    findings,
+    notes: [`ESLint analyzed ${scriptFiles.length} changed JS/Vue file(s) and contributed ${findings.length} merged finding(s) in ${formatDurationMs(durationMs)}.`],
+    stage: {
+      name: 'eslint',
+      status: 'completed',
+      durationMs,
+      findings: findings.length
+    }
+  };
+}
+
+function appendStageFindings(reviewResult, stageResult) {
+  if (!stageResult) {
+    return reviewResult;
+  }
+
+  const mergedFindings = (reviewResult.findings || []).concat(stageResult.findings || []);
+
+  return {
+    ...reviewResult,
+    verdict: buildVerdict(mergedFindings),
+    confidenceScore: buildConfidence(mergedFindings),
+    summary: (stageResult.findings || []).length ? null : reviewResult.summary,
+    findings: mergedFindings,
+    notes: (reviewResult.notes || []).concat(stageResult.notes || []),
+    stageSummaries: (reviewResult.stageSummaries || []).concat(stageResult.stage ? [stageResult.stage] : [])
   };
 }
 
@@ -3985,6 +4992,12 @@ function buildPrompt(payload) {
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
     'When a frontend diff adds state-sync helpers, CSS state classes, or input/change/blur listeners, trace reset, clear, success, and teardown paths in the same file before approving.',
+    'When a frontend diff introduces interactive grid, card, or multi-column choice layouts, check mobile breakpoints and narrow-viewport usability before approving.',
+    'When a Vue admin/editor component derives local mutable state from props, check whether prop updates after mount will resynchronize that state before approving.',
+    'When a changed mounted/load path performs async status updates or resource loads, trace each branch and check for duplicate fetches before approving.',
+    'When a frontend initializer rebuilds ordered lists from answers and options, check for repeated find/includes scans that can make mount or rehydration quadratic as option counts grow.',
+    'When drag/drop UI is added, inspect dragover and pointer-move hot paths for repeated full-list DOM queries or class resets that can cause interaction jank.',
+    'When drag/drop reorder logic adjusts target indexes after removing the source item, test adjacent forward moves explicitly so the immediate-next drop case does not collapse into a no-op.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
     '',
@@ -4329,6 +5342,7 @@ function createReviewContext(options, cwd) {
     instructions,
     diffText,
     diffIndex,
+    explicitFileScope: Boolean(options.files && options.files.length),
     currentContentByPath: new Map(),
     baseContentByPath: new Map(),
     changedLinesByPath: new Map(),
@@ -4361,6 +5375,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     confidenceScore: 0,
     workflow: options.workflow || null,
     reportPath: options.report || null,
+    reviewdogReportPath: options.reviewdogReport || null,
     workflowData: reviewResult.workflowData || null,
     currentBranch,
     generatedAt: new Date().toISOString().slice(0, 10),
@@ -4382,6 +5397,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     findings: rankedFindings,
     outsideDiffFindings: reviewResult.outsideDiffFindings || [],
     runtimeAccessibility: reviewResult.runtimeAccessibility || null,
+    stageSummaries: reviewResult.stageSummaries || [],
     diffStats: {
       files: fileEntries.length,
       testsChanged: getChangedTestFiles(fileEntries).length
@@ -4403,8 +5419,12 @@ function buildFinalReport(options, reviewContext, reviewResult) {
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit, report);
 
+  report.reviewdogRendered = renderRdjson(report);
+
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
+  } else if (options.format === 'rdjson') {
+    report.rendered = report.reviewdogRendered;
   } else if (options.format === 'github') {
     report.rendered = renderGitHub(report);
   } else if (options.format === 'markdown') {
@@ -4423,10 +5443,16 @@ function appendRuntimeAccessibility(reviewResult, runtimeScan) {
     return reviewResult;
   }
 
+  const mergedFindings = (reviewResult.findings || []).concat(runtimeScan.findings || []);
+
   return {
     ...reviewResult,
-    findings: (reviewResult.findings || []).concat(runtimeScan.findings || []),
+    verdict: buildVerdict(mergedFindings),
+    confidenceScore: buildConfidence(mergedFindings),
+    summary: (runtimeScan.findings || []).length ? null : reviewResult.summary,
+    findings: mergedFindings,
     notes: (reviewResult.notes || []).concat(runtimeScan.notes || []),
+    stageSummaries: (reviewResult.stageSummaries || []).concat(runtimeScan.stage ? [runtimeScan.stage] : []),
     runtimeAccessibility: {
       pages: runtimeScan.pages || []
     }
@@ -4465,17 +5491,51 @@ async function createReviewReport(options, cwd = process.cwd()) {
       engine: resolvedOptions.engine === 'codex' ? 'codex' : 'heuristic',
       fallbackUsed: false,
       notes: baseNotes,
+      stageSummaries: [],
       verdict: 'APPROVE',
       confidenceScore: 3,
       summary: 'No local diff was selected, but rendered accessibility pages were scanned.',
       findings: []
-    }, await runRenderedAccessibilityScanAsync(resolvedOptions, cwd)));
+    }, await (async () => {
+      const startedAt = Date.now();
+      const scan = await runRenderedAccessibilityScanAsync(resolvedOptions, cwd);
+      return {
+        ...scan,
+        stage: {
+          name: 'accessibility',
+          status: 'completed',
+          durationMs: Date.now() - startedAt,
+          findings: (scan.findings || []).length
+        }
+      };
+    })()));
 
     return buildFinalReport(resolvedOptions, reviewContext, runtimeOnlyResult);
   }
 
   const runtimeScanPromise = shouldRunRuntimeA11y
-    ? toSettledPromise(runRenderedAccessibilityScanAsync(resolvedOptions, cwd))
+    ? toSettledPromise((async () => {
+      const startedAt = Date.now();
+      const scan = await runRenderedAccessibilityScanAsync(resolvedOptions, cwd);
+      return {
+        ...scan,
+        stage: {
+          name: 'accessibility',
+          status: 'completed',
+          durationMs: Date.now() - startedAt,
+          findings: (scan.findings || []).length
+        }
+      };
+    })())
+    : Promise.resolve({ status: 'fulfilled', value: null });
+  const semgrepPromise = resolvedOptions.semgrepEnabled
+    ? toSettledPromise(runSemgrepReviewAsync(reviewContext, resolvedOptions, cwd))
+    : Promise.resolve({ status: 'fulfilled', value: null });
+  const phpstanPromise = resolvedOptions.phpstanEnabled
+    ? toSettledPromise(runPhpstanReviewAsync(reviewContext, resolvedOptions, cwd))
+    : Promise.resolve({ status: 'fulfilled', value: null });
+  const eslintPromise = resolvedOptions.eslintEnabled
+    ? toSettledPromise(runEslintReviewAsync(reviewContext, resolvedOptions, cwd))
     : Promise.resolve({ status: 'fulfilled', value: null });
   const heuristicSeed = runHeuristicReview(resolvedOptions, reviewContext, baseNotes.slice(), 'heuristic', false);
   const shouldUseCodex = resolvedOptions.engine === 'codex' || resolvedOptions.engine === 'auto';
@@ -4496,7 +5556,16 @@ async function createReviewReport(options, cwd = process.cwd()) {
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(heuristicResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
+          appendRuntimeAccessibility(
+            appendStageFindings(
+              appendStageFindings(
+                appendStageFindings(heuristicResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+                unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+              ),
+              unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
+            ),
+            unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+          )
         )
       );
     }
@@ -4533,9 +5602,24 @@ async function createReviewReport(options, cwd = process.cwd()) {
     };
 
     try {
-      const [codexOutcome, runtimeOutcome] = await Promise.all([
-        toSettledPromise(runCodexReviewAsync(payload, resolvedOptions, cwd)),
-        runtimeScanPromise
+      const [codexOutcome, runtimeOutcome, semgrepOutcome, phpstanOutcome, eslintOutcome] = await Promise.all([
+        toSettledPromise((async () => {
+          const startedAt = Date.now();
+          const result = await runCodexReviewAsync(payload, resolvedOptions, cwd);
+          return {
+            ...result,
+            stageSummaries: [{
+              name: 'codex',
+              status: 'completed',
+              durationMs: Date.now() - startedAt,
+              findings: (result.findings || []).length
+            }]
+          };
+        })()),
+        runtimeScanPromise,
+        semgrepPromise,
+        phpstanPromise,
+        eslintPromise
       ]);
       if (codexOutcome.status === 'rejected') {
         throw codexOutcome.reason;
@@ -4543,6 +5627,9 @@ async function createReviewReport(options, cwd = process.cwd()) {
 
       const codexResult = codexOutcome.value;
       const runtimeScan = unwrapSettledResult(runtimeOutcome, 'Rendered accessibility scan failed');
+      const semgrepResult = unwrapSettledResult(semgrepOutcome, 'Semgrep scan failed');
+      const phpstanResult = unwrapSettledResult(phpstanOutcome, 'PHPStan scan failed');
+      const eslintResult = unwrapSettledResult(eslintOutcome, 'ESLint scan failed');
       codexResult.notes = notes.slice();
       codexResult.codexReviewedFiles = selectedEntries.map((entry) => entry.path);
       return buildFinalReport(
@@ -4551,7 +5638,16 @@ async function createReviewReport(options, cwd = process.cwd()) {
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(codexResult, runtimeScan)
+          appendRuntimeAccessibility(
+            appendStageFindings(
+              appendStageFindings(
+                appendStageFindings(codexResult, semgrepResult),
+                phpstanResult
+              ),
+              eslintResult
+            ),
+            runtimeScan
+          )
         )
       );
     } catch (error) {
@@ -4560,13 +5656,28 @@ async function createReviewReport(options, cwd = process.cwd()) {
         logProgress(`codex-review: Codex timed out after ${timeoutLabel}. Falling back to heuristic review.`);
         notes.push(`Codex review timed out after ${timeoutLabel}, so the report used heuristic fallback.`);
         const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
+        fallbackResult.stageSummaries = [{
+          name: 'codex',
+          status: 'timed_out',
+          durationMs: resolvedOptions.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS,
+          findings: 0
+        }];
         return buildFinalReport(
           resolvedOptions,
           reviewContext,
           applyWorkflowPostProcessing(
             resolvedOptions,
             reviewContext,
-            appendRuntimeAccessibility(fallbackResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
+            appendRuntimeAccessibility(
+              appendStageFindings(
+                appendStageFindings(
+                  appendStageFindings(fallbackResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+                  unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+                ),
+                unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
+              ),
+              unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+            )
           )
         );
       }
@@ -4577,13 +5688,28 @@ async function createReviewReport(options, cwd = process.cwd()) {
 
       notes.push(`Codex review failed, so the report used heuristic fallback: ${error.message}`);
       const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
+      fallbackResult.stageSummaries = [{
+        name: 'codex',
+        status: 'failed',
+        durationMs: 0,
+        findings: 0
+      }];
       return buildFinalReport(
         resolvedOptions,
         reviewContext,
         applyWorkflowPostProcessing(
           resolvedOptions,
           reviewContext,
-          appendRuntimeAccessibility(fallbackResult, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
+          appendRuntimeAccessibility(
+            appendStageFindings(
+              appendStageFindings(
+                appendStageFindings(fallbackResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+                unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+              ),
+              unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
+            ),
+            unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+          )
         )
       );
     }
@@ -4595,7 +5721,16 @@ async function createReviewReport(options, cwd = process.cwd()) {
     applyWorkflowPostProcessing(
       resolvedOptions,
       reviewContext,
-      appendRuntimeAccessibility(heuristicSeed, unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed'))
+      appendRuntimeAccessibility(
+        appendStageFindings(
+          appendStageFindings(
+            appendStageFindings(heuristicSeed, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+            unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+          ),
+          unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
+        ),
+        unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+      )
     )
   );
 }

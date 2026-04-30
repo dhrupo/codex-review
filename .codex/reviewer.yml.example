@@ -37,3 +37,19 @@ accessibility:
   wait_for:
   timeout_ms: 30000
   storage_state:
+codex:
+  timeout_ms: 900000
+semgrep:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+phpstan:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+eslint:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+reviewdog:
+  report:

@@ -380,7 +380,25 @@ accessibility:
   storage_state: .playwright/auth.json
 
 codex:
-  timeout_ms: 180000
+  timeout_ms: 900000
+
+semgrep:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+
+phpstan:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+
+eslint:
+  enabled: true
+  config: auto
+  timeout_ms: 120000
+
+reviewdog:
+  report: .codex/reviewdog.rdjson
 ```
 
 ## Plugin Repo Workflow
@@ -415,17 +433,29 @@ cd /Volumes/Projects/forms/wp-content/plugins/fluentform
 codex-review --mode accessibility --engine codex
 ```
 
+For a merged multi-engine run with a reviewdog artifact:
+
+```bash
+cd /Volumes/Projects/forms/wp-content/plugins/fluentform
+codex-review --engine codex --thorough --reviewdog-report .codex/reviewdog.rdjson
+```
+
 How it works:
 
 - it detects the current git repo and applies any built-in product profile for that repo
 - it loads repo-local defaults from `.codex/reviewer.yml` if present
 - CLI flags override repo-local config when both are supplied
-- it computes the local git diff once, memoizes file/base/diff data for the run, and uses that cached context for both heuristic and Codex stages
-- it runs built-in heuristic checks first to rank risk, build product-aware hotspots, and choose the Codex deep-review scope
+- it computes the local git diff once, memoizes file/base/diff data for the run, and uses that cached context for heuristic, Semgrep, and Codex stages
+- it runs a lightweight heuristic seed first to rank risk, build product-aware hotspots, and choose the Codex deep-review scope
+- if the `semgrep` CLI is installed and not disabled, it scans the changed files in parallel and merges deterministic findings into the same final report
+- if `vendor/bin/phpstan` or `phpstan` is available and not disabled, it analyzes changed PHP files in parallel and merges diff-adjacent findings into the same final report
+- if `node_modules/.bin/eslint` or `eslint` is available and not disabled, it analyzes changed JS/Vue files in parallel and merges diff-adjacent findings into the same final report
 - when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with isolated `codex exec --ignore-user-config --ignore-rules --ephemeral`
 - it then applies its own workflow bucketing, confidence scoring, and markdown/github/text rendering on top of the returned model output
-- when rendered accessibility URLs are configured, the Playwright + axe scan runs in parallel with the Codex subprocess instead of waiting for it to finish first
-- the default Codex subprocess timeout is `180000ms`; if it times out, the tool falls back to heuristic review and records that fallback in the report notes
+- when rendered accessibility URLs are configured, the Playwright + axe scan runs in parallel with the Codex, Semgrep, PHPStan, and ESLint subprocesses instead of waiting for them to finish first
+- the default Codex subprocess timeout is `900000ms` (15 minutes); if it times out, the tool then falls back to the full heuristic review and records that fallback in the report notes
+- the default Semgrep timeout is `120000ms`; if Semgrep is unavailable, times out, or fails, the review still completes and records that in the notes instead of aborting the whole run
+- the default PHPStan and ESLint timeouts are `120000ms`; if either tool is unavailable, times out, or fails, the review still completes and records that in the notes instead of aborting the whole run
 - `--thorough` increases the scoped Codex review set, but it does not guarantee a Codex-backed final result if the model step times out
 - interactive terminal runs print a short stderr progress line before the Codex step so long reviews do not look hung
 - `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
@@ -434,11 +464,14 @@ How it works:
 - the plugin-audit workflow emulates the five audit workstreams plus a final verification pass sequentially in one local run
 - heuristic and Codex review use the repo profile plus local `focus_areas`, `paths.high_risk`, and `notes`
 - rendered accessibility scanning runs only when `accessibility.urls` are configured in `.codex/reviewer.yml` or when `--a11y-url` / `--a11y-urls` are passed explicitly
+- `--reviewdog-report <path>` writes the merged final findings as reviewdog `rdjson`, so another CI step can post the combined Codex + Semgrep + heuristic review instead of only one engine
 
 That means plugin-specific `.codex/reviewer.yml` files are the right place to store:
 
 - high-risk directories for that repo
 - repeated regression reminders for that plugin
+- Semgrep defaults for that repo
+- PHPStan and ESLint defaults for that repo
 - default admin/frontend URLs for Playwright + axe scans
 - storage-state paths for authenticated wp-admin scans
 
@@ -451,6 +484,7 @@ For workflow reports:
 Practical expectation:
 
 - local wrapper overhead is now lower because repeated file reads, changed-line extraction, and Codex-scoped diff assembly are reused inside one run
+- Semgrep, PHPStan, ESLint, Codex, and rendered accessibility stages now run concurrently when enabled, so wall time is usually closer to the slowest stage than to the sum of all stages
 - total wall time can still be dominated by the Codex model itself on large or complex diffs, especially with `--thorough`
 
 For most WPManageNinja repos, the main useful defaults are:

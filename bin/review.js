@@ -28,13 +28,27 @@ function printHelp() {
     --model <name>         Codex model override for engine=auto or codex
     --thorough             Increase Codex deep-review scope
     --review-depth <name>  Review depth: balanced or thorough
+    --semgrep              Force-enable Semgrep if the CLI is installed
+    --no-semgrep           Disable the Semgrep stage
+    --semgrep-config <id>  Semgrep config to run alongside Codex (default: auto)
+    --semgrep-timeout <ms> Timeout for the Semgrep scan
+    --phpstan              Force-enable PHPStan if vendor/bin or global phpstan exists
+    --no-phpstan           Disable the PHPStan stage
+    --phpstan-config <id>  PHPStan config file path (default: auto)
+    --phpstan-timeout <ms> Timeout for the PHPStan scan
+    --eslint               Force-enable ESLint if node_modules/.bin or global eslint exists
+    --no-eslint            Disable the ESLint stage
+    --eslint-config <id>   ESLint config file path (default: auto)
+    --eslint-timeout <ms>  Timeout for the ESLint scan
     --a11y-url <url>       Scan one rendered URL with Playwright + axe (repeatable)
     --a11y-urls <a,b>      Scan multiple rendered URLs with Playwright + axe
     --a11y-wait-for <sel>  Wait for a selector before running the accessibility scan
     --a11y-timeout <ms>    Timeout for page load and selector waits during a11y scan
     --a11y-storage-state <path>
                            Optional Playwright storage state JSON for authenticated scans
-    --format <name>        Output format: text, markdown, github, json
+    --reviewdog-report <path>
+                           Write merged findings as reviewdog rdjson
+    --format <name>        Output format: text, markdown, github, json, rdjson
     --report <path>        Write the rendered report to a file
     --max-findings <n>     Limit the number of findings in the output
     --fail-on <severity>   Exit non-zero for low, medium, important, or critical findings
@@ -87,6 +101,11 @@ async function main() {
       const resolvedReportPath = path.resolve(process.cwd(), report.reportPath);
       archiveExistingReportIfNeeded(resolvedReportPath, report.workflow);
       fs.writeFileSync(resolvedReportPath, report.rendered);
+    }
+
+    if (report.reviewdogReportPath) {
+      const resolvedReviewdogPath = path.resolve(process.cwd(), report.reviewdogReportPath);
+      fs.writeFileSync(resolvedReviewdogPath, report.reviewdogRendered);
     }
 
     console.log(report.rendered);
