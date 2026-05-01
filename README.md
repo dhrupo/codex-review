@@ -442,7 +442,7 @@ codex-review --engine codex --thorough --reviewdog-report .codex/reviewdog.rdjso
 
 How it works:
 
-- it detects the current git repo and applies any built-in product profile for that repo
+- it detects the current git repo for naming/report context only
 - it loads repo-local defaults from `.codex/reviewer.yml` if present
 - CLI flags override repo-local config when both are supplied
 - it computes the local git diff once, memoizes file/base/diff data for the run, and uses that cached context for heuristic, Semgrep, and Codex stages
@@ -462,7 +462,7 @@ How it works:
 - `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
 - the debugger workflow emulates `Finder -> Verifier -> Feedback` sequentially in one local run when no literal sub-agents are used
 - the plugin-audit workflow emulates the five audit workstreams plus a final verification pass sequentially in one local run
-- heuristic and Codex review use the repo profile plus local `focus_areas`, `paths.high_risk`, and `notes`
+- heuristic and Codex review use only the local `.codex/reviewer.yml` profile plus `focus_areas`, `paths.high_risk`, and `notes`
 - rendered accessibility scanning runs only when `accessibility.urls` are configured in `.codex/reviewer.yml` or when `--a11y-url` / `--a11y-urls` are passed explicitly
 - `--reviewdog-report <path>` writes the merged final findings as reviewdog `rdjson`, so another CI step can post the combined Codex + Semgrep + heuristic review instead of only one engine
 
@@ -493,7 +493,14 @@ For most WPManageNinja repos, the main useful defaults are:
 - `engine: codex`
 - `review_depth: thorough`
 
-You can also define a repo-specific product profile there. This is the calibration path for teams working on repos that are not built into `codex-review` yet.
+You can define a repo-specific product profile there. This is the only calibration path for repo-specific behavior. `codex-review` no longer ships built-in plugin profiles.
+
+Useful `product_profile` fields:
+
+- `name`: report label
+- `text_domain`: expected WordPress text domain for i18n checks
+- `tags`: opt-in domain heuristics such as `conversational-ui`, `player-runtime`, `pdf-output`, `translation-sync`, or `signature-pad`
+- `focus` / `regression_checks`: report context and review emphasis
 
 Example for a repo like `fluent-cart`:
 
@@ -503,6 +510,9 @@ engine: codex
 review_depth: thorough
 product_profile:
   name: Fluent Cart
+  text_domain: fluent-cart
+  tags:
+    - payments
   focus:
     - checkout, cart totals, coupon, and order-state regressions
     - payment callback, webhook, and persisted order amount consistency
@@ -533,6 +543,9 @@ engine: codex
 review_depth: thorough
 product_profile:
   name: FluentCRM
+  text_domain: fluentcrm
+  tags:
+    - automation
   focus:
     - contact sync, automation state, and campaign/event regressions
     - segment/filter logic, background jobs, and idempotent processing

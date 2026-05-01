@@ -5,6 +5,10 @@ review_depth: thorough
 max_findings: 12
 product_profile:
   name: WPManageNinja Product
+  text_domain: your-text-domain
+  tags:
+    - payments
+    - pdf-output
   focus:
     - key product workflow 1
     - key product workflow 2

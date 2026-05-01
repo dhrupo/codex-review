@@ -91,113 +91,6 @@ const CODEX_FILE_LIMITS = {
   thorough: 24
 };
 const COMMAND_EXISTS_CACHE = new Map();
-const PRODUCT_PROFILES = {
-  fluentform: {
-    name: 'Fluent Forms',
-    focus: [
-      'form setting round-trips through sanitizers and JS payload producers',
-      'route policy and capability enforcement on REST/admin mutations',
-      'public uploader and crop flow integration between PHP settings and frontend JS'
-    ],
-    regressionChecks: [
-      'new field settings must survive save-time sanitizers in app/Services/Form/Updater.php and app/Modules/Form/Form.php',
-      'frontend upload/crop flows must have a matching PHP producer or settings export path',
-      'uploader or crop UI changes must preserve runtime asset/bootstrap wiring'
-    ]
-  },
-  fluentformpro: {
-    name: 'Fluent Forms Pro',
-    focus: [
-      'payment acceptance, transaction totals, and subscription/payment workflow regressions',
-      'Pro uploader bootstrap and shared image/crop settings between input_image and featured_image',
-      'asset registration for bundled frontend libraries under public/'
-    ],
-    regressionChecks: [
-      'payment processor changes need evidence for both happy-path and mismatch-path payload shapes',
-      'crop/upload enhancements must wire both settings export and packaged asset bundles',
-      'changes in shared upload components should be checked against featured_image and other Pro-only renderers'
-    ]
-  },
-  'fluent-conversational-js': {
-    name: 'Fluent Conversational JS',
-    focus: [
-      'Vue 3 conversational question flows and question-type runtime behavior',
-      'crop modal lifecycle, async image handling, and cleanup race conditions',
-      'frontend-only regressions with no PHP safety net'
-    ],
-    regressionChecks: [
-      'image.onload and cropper creation must be guarded against late cleanup',
-      'question-type UI changes must preserve submit gating and cleanup behavior',
-      'state transitions must still work on slow devices and large uploads'
-    ]
-  },
-  'fluentforms-pdf': {
-    name: 'Fluent Forms PDF',
-    focus: [
-      'PDF template rendering, entry-to-document mapping, and output formatting stability',
-      'attachment/download generation paths and file naming/storage behavior',
-      'invoice/report template data completeness and formatting regressions'
-    ],
-    regressionChecks: [
-      'new template fields must be available in the template data map before rendering',
-      'PDF generation changes should preserve attachment/download and filename behavior',
-      'invoice/report formatting changes must be checked against totals, currencies, and empty-field handling'
-    ]
-  },
-  'multilingual-forms-fluent-forms-wpml': {
-    name: 'Fluent Forms WPML',
-    focus: [
-      'translation package registration, field mapping, and string synchronization',
-      'language-specific form metadata and translated submission/render behavior',
-      'WPML hook wiring without losing original-form fallback behavior'
-    ],
-    regressionChecks: [
-      'new translatable fields must be added to WPML package/string extraction paths',
-      'translation sync changes must preserve fallback to source-language data when translations are absent',
-      'form meta/key mapping changes must still keep translated and source forms aligned'
-    ]
-  },
-  'fluentform-signature': {
-    name: 'Fluent Forms Signature',
-    focus: [
-      'signature capture lifecycle, PNG/data URL generation, and persistence shape',
-      'frontend pad initialization and clear/redraw behavior',
-      'saved signature attachment or field-value compatibility with core Fluent Forms flows'
-    ],
-    regressionChecks: [
-      'signature field changes must preserve the stored payload format expected by submission/render flows',
-      'canvas/data URL handling must still work after clear, redraw, and empty-signature validation cases',
-      'frontend signature assets and field renderer hooks must stay aligned'
-    ]
-  },
-  'fluent-player': {
-    name: 'Fluent Player',
-    focus: [
-      'player initialization, shortcode/block attribute mapping, and frontend playback behavior',
-      'video source, subtitle, and chapter/metadata configuration round-trips',
-      'public asset bootstrap and browser-side player controls/state changes'
-    ],
-    regressionChecks: [
-      'new player settings must survive save/load and reach frontend initialization payloads',
-      'source/subtitle/chapter changes must keep player config and rendered UI in sync',
-      'asset/bootstrap changes must still initialize the player for shortcode and block paths'
-    ]
-  },
-  'fluent-player-pro': {
-    name: 'Fluent Player Pro',
-    focus: [
-      'Pro player feature wiring such as analytics, DRM/protected media, and premium UI overlays',
-      'free/pro shared player bootstrapping and config compatibility',
-      'subtitle-service, attachment, and storyboard workflows where remote or destructive behavior can break real users silently'
-    ],
-    regressionChecks: [
-      'Pro-only settings must extend, not break, the shared frontend player config contract',
-      'analytics/protection changes must preserve playback start, resume, and event reporting behavior',
-      'shared player changes should be checked against both free and pro feature entry points',
-      'subtitle import and storyboard changes must enforce attachment ownership, sanitize remote metadata, and avoid synchronous remote work on save paths'
-    ]
-  }
-};
 const REVIEW_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object',
@@ -473,11 +366,6 @@ function writeJsonFile(filePath, data) {
   fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`);
 }
 
-function getProductProfile(repoLabel) {
-  const profile = PRODUCT_PROFILES[repoLabel];
-  return profile ? { repoLabel, ...profile } : null;
-}
-
 function buildCustomProductProfile(repoLabel, configProfile) {
   if (!configProfile || typeof configProfile !== 'object') {
     return null;
@@ -488,8 +376,12 @@ function buildCustomProductProfile(repoLabel, configProfile) {
     : repoLabel;
   const focus = normalizeStringArray(configProfile.focus);
   const regressionChecks = normalizeStringArray(configProfile.regression_checks || configProfile.regressionChecks);
+  const tags = normalizeStringArray(configProfile.tags || configProfile.capabilities || configProfile.domains).map((item) => item.toLowerCase());
+  const textDomain = typeof (configProfile.text_domain || configProfile.textDomain) === 'string'
+    ? String(configProfile.text_domain || configProfile.textDomain).trim()
+    : '';
 
-  if (!focus.length && !regressionChecks.length) {
+  if (!focus.length && !regressionChecks.length && !textDomain && !tags.length) {
     return null;
   }
 
@@ -497,7 +389,9 @@ function buildCustomProductProfile(repoLabel, configProfile) {
     repoLabel,
     name,
     focus,
-    regressionChecks
+    regressionChecks,
+    tags,
+    textDomain
   };
 }
 
@@ -1586,35 +1480,21 @@ function buildProductSpecificKeyChanges(reviewContext, findings) {
   const { productProfile, fileEntries } = reviewContext;
   const changes = [];
 
-  if (!productProfile) {
-    return changes;
+  const changedPathList = Array.from(getChangedPathsSet(fileEntries));
+
+  if (changedPathList.some((filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath))) {
+    changes.push('Touches a payment gateway processor, so acceptance, mismatch handling, and stored transaction totals were reviewed as one workflow.');
   }
 
-  const changedPaths = getChangedPathsSet(fileEntries);
-
-  if (productProfile.repoLabel === 'fluentformpro') {
-    if (Array.from(changedPaths).some((filePath) => filePath.includes('/Payments/PaymentMethods/'))) {
-      changes.push('Touches a payment gateway processor, so acceptance, mismatch handling, and stored transaction totals were reviewed as a single workflow.');
-    }
-
-    if (Array.from(changedPaths).some((filePath) => /Uploader|FeaturedImage|crop/i.test(filePath))) {
-      changes.push('Touches shared upload/crop behavior, so asset bootstrap and image-field wiring were treated as cross-component regression risks.');
-    }
+  if (changedPathList.some((filePath) => /file-uploader|Uploader|FeaturedImage|crop|Cropper/i.test(filePath))) {
+    changes.push('Touches upload or crop behavior, so settings production, save-time persistence, and asset bootstrap were treated as one feature path.');
   }
 
-  if (productProfile.repoLabel === 'fluentform') {
-    if (Array.from(changedPaths).some((filePath) => /file-uploader|Uploader|crop/i.test(filePath))) {
-      changes.push('Touches the public uploader crop flow, so save-time setting persistence and JS settings production were treated as part of the same feature path.');
-    }
+  if (changedPathList.some((filePath) => /FileType\.vue$|RankingType\.vue$|ToggleType\.vue$|drag|sortable|ranking/i.test(filePath))) {
+    changes.push('Touches stateful frontend interaction code, so reset, drag/drop, accessibility, and responsive behavior were reviewed together.');
   }
 
-  if (productProfile.repoLabel === 'fluent-conversational-js') {
-    if (Array.from(changedPaths).some((filePath) => /FileType\.vue$/i.test(filePath))) {
-      changes.push('Touches the conversational file-upload question type, so modal teardown and asynchronous image/cropper lifecycle behavior were reviewed together.');
-    }
-  }
-
-  if (!changes.length && findings.length) {
+  if (!changes.length && findings.length && productProfile && productProfile.focus.length) {
     changes.push(`This repository matches the ${productProfile.name} profile, so the review emphasized ${productProfile.focus[0]}.`);
   }
 
@@ -1626,191 +1506,80 @@ function buildProductSpecificFindings(options, reviewContext) {
   const outsideDiffFindings = [];
   const notes = [];
   const { cwd, fileEntries, productProfile } = reviewContext;
+  const profileTags = new Set((productProfile && Array.isArray(productProfile.tags)) ? productProfile.tags : []);
 
-  if (!productProfile) {
-    return { findings, outsideDiffFindings, notes };
-  }
-
-  const changedPaths = getChangedPathsSet(fileEntries);
-  const changedPathList = Array.from(changedPaths);
-  const hasCropChange = changedPathList.some((filePath) => /crop|file-uploader|Uploader|FeaturedImage/i.test(filePath));
+  const changedPathList = Array.from(getChangedPathsSet(fileEntries));
   const hasPaymentProcessorChange = changedPathList.some((filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath));
 
-  if (productProfile.repoLabel === 'fluentform') {
-    const touchesUploaderSettingsContract = changedPathList.some((filePath) => /file-uploader\.js$|Component\.php$/i.test(filePath));
-    const referencesSettingsPayload = repoSearch(cwd, 'file_upload_settings|fluentform/file_upload_settings_for_js', [
-      'app/Modules/Component/Component.php',
-      'resources/assets/public/Pro/file-uploader.js'
-    ]);
-    const producerExists = repoSearch(cwd, "add_filter\\s*\\(\\s*['\"]fluentform/file_upload_settings_for_js['\"]");
+  const helperEntry = findChangedEntry(fileEntries, (filePath) => /app\/Helpers\/Helper\.php$/i.test(filePath));
+  const advancedOptionsEntry = findChangedEntry(fileEntries, (filePath) => /advanced-options\.vue$/i.test(filePath));
+  if (helperEntry && advancedOptionsEntry && changedPathList.some((filePath) => /input_ranking|RankingField|rankingField/i.test(filePath))) {
+    const helperContent = getCurrentContentForContext(reviewContext, helperEntry.path);
+    const advancedOptionsContent = getCurrentContentForContext(reviewContext, advancedOptionsEntry.path);
+    const rankingValidatorRequiresUniqueCompleteSet = /case\s*'input_ranking'[\s\S]*count\(\$inputValue\)\s*===\s*count\(\$options\)[\s\S]*count\(\$filteredValues\)\s*===\s*count\(array_unique\(\$filteredValues\)\)[\s\S]*\$filteredValues\s*===\s*\$normalizedOptions/.test(helperContent);
+    const rankingValidatorUsesOptionValues = /array_column\s*\(\s*self::flattenAdvancedOptions\(\$formattedOptions\)\s*,\s*'value'/.test(helperContent);
+    const editorAllowsDirectValueEditing = /<el-input[^>]*v-model="option\.value"/.test(advancedOptionsContent)
+      && /confirmBulkEdit\(\)[\s\S]*values\.push\(\{[\s\S]*value:\s*value/.test(advancedOptionsContent);
+    const editorHasUniqueValueGuard = /duplicate|unique|already exists|must be unique|uniqBy|new\s+Set\s*\(/i.test(advancedOptionsContent);
 
-    if (touchesUploaderSettingsContract && referencesSettingsPayload && !producerExists) {
+    if (rankingValidatorRequiresUniqueCompleteSet && rankingValidatorUsesOptionValues && editorAllowsDirectValueEditing && !editorHasUniqueValueGuard) {
       pushFinding(findings, {
         severity: 'important',
         confidence: 'high',
-        file: findChangedEntry(fileEntries, (filePath) => /Component\.php$/i.test(filePath))?.path || 'app/Modules/Component/Component.php',
-        line: 1,
-        title: 'Uploader settings payload has no producer for runtime crop configuration',
-        evidence: 'The changed uploader flow references the file_upload_settings payload, but the repository does not currently expose a matching add_filter() producer for fluentform/file_upload_settings_for_js.',
-        impact: 'The frontend crop flow can be wired correctly in JS but still never activate at runtime if the per-field settings payload is never produced on the PHP side.',
-        explanation: 'This is the same class of break where a feature appears complete in the diff but the data contract stops one step earlier. In Fluent Forms, upload-field runtime behavior often depends on PHP building a JS payload keyed by field name. If that producer is missing, the frontend waits on settings that never arrive.',
-        verification: 'Confirm the repo contains a producer that maps saved upload/crop field settings into file_upload_settings for the uploader runtime path.',
-        fixDirection: 'Add or update the PHP settings producer so the uploader receives per-field crop configuration at runtime.'
+        file: helperEntry.path,
+        line: findLineNumber(helperContent, /case\s*'input_ranking'/),
+        title: 'Ranking config can save duplicate option values that the validator later rejects',
+        evidence: 'The validator now requires a complete unique set of option values, but the paired options editor still allows direct value edits and bulk-imported value pairs without any visible duplicate-value guard.',
+        impact: 'Builders can save a ranking-style field configuration that looks valid in the editor, but submissions for that field will later fail validation because duplicate option values can never satisfy the unique complete-set check.',
+        explanation: 'This is a generic validator/editor contract mismatch. If the runtime validator treats option values as a unique identity set, the editor must enforce that same uniqueness constraint when values are entered or bulk imported.',
+        verification: 'Create a ranking-style field with duplicate option values through the builder or bulk editor and confirm the configuration is rejected before save, rather than allowing a field that later rejects normal submissions.',
+        fixDirection: 'Add duplicate-value validation in the options editor or save path so option identity stays unique before the runtime validator runs.'
       });
-    }
-
-    const cropSettingKeysTouched = repoSearch(cwd, 'enable_crop|crop_mode|crop_ratio|crop_width|crop_height|enforce_image_dimensions', [
-      ...changedPathList
-    ]);
-    if (hasCropChange && cropSettingKeysTouched && !changedPaths.has('app/Services/Form/Updater.php') && !changedPaths.has('app/Modules/Form/Form.php')) {
-      pushOutsideDiffFinding(outsideDiffFindings, {
-        severity: 'important',
-        file: 'app/Services/Form/Updater.php',
-        line: 138,
-        title: 'New crop settings may still be stripped during form save',
-        explanation: 'Fluent Forms persists field settings through sanitizer/whitelist logic in the form update path. When new crop keys are introduced in UI/runtime code but the save-time whitelist is untouched, forms can appear to support the feature until the next edit/save silently removes those settings.',
-        verification: 'Check both app/Services/Form/Updater.php and app/Modules/Form/Form.php to confirm the new crop settings are preserved and sanitized during form save.',
-        fixDirection: 'Mirror any new upload/crop setting keys into the save-time field settings whitelist and sanitization logic.'
-      });
-    }
-
-    if (
-      changedPathList.some((filePath) => /FormEditor|editor|field|Component/i.test(filePath)) &&
-      !changedPathList.some((filePath) => /app\/Services\/Form\/Updater\.php|app\/Modules\/Form\/Form\.php/i.test(filePath))
-    ) {
-      pushOutsideDiffFinding(outsideDiffFindings, {
-        severity: 'medium',
-        file: 'app/Services/Form/Updater.php',
-        line: 138,
-        title: 'Field-schema changes may need save-time sanitizer updates',
-        explanation: 'In Fluent Forms, editor-side field and settings changes often need matching save-time sanitizer/whitelist updates. Without that, fields can look correct in the builder but lose data after save or duplicate operations.',
-        verification: 'Check whether the changed field/settings keys are preserved by the Form updater and any duplicate/import/export path that sanitizes form schema.',
-        fixDirection: 'Update the save-time sanitizer/whitelist logic for any new field keys or nested settings introduced by this change.'
-      });
-    }
-
-    const helperEntry = findChangedEntry(fileEntries, (filePath) => /app\/Helpers\/Helper\.php$/i.test(filePath));
-    const advancedOptionsEntry = findChangedEntry(fileEntries, (filePath) => /advanced-options\.vue$/i.test(filePath));
-    if (helperEntry && advancedOptionsEntry && changedPathList.some((filePath) => /input_ranking|RankingField|rankingField/i.test(filePath))) {
-      const helperContent = getCurrentContentForContext(reviewContext, helperEntry.path);
-      const advancedOptionsContent = getCurrentContentForContext(reviewContext, advancedOptionsEntry.path);
-      const rankingValidatorRequiresUniqueCompleteSet = /case\s*'input_ranking'[\s\S]*count\(\$inputValue\)\s*===\s*count\(\$options\)[\s\S]*count\(\$filteredValues\)\s*===\s*count\(array_unique\(\$filteredValues\)\)[\s\S]*\$filteredValues\s*===\s*\$normalizedOptions/.test(helperContent);
-      const rankingValidatorUsesOptionValues = /in_array\s*\(\s*\$fieldType\s*,\s*\[[^\]]*'input_ranking'[^\]]*\]\)[\s\S]*array_column\s*\(\s*self::flattenAdvancedOptions\(\$formattedOptions\)\s*,\s*'value'/.test(helperContent);
-      const editorAllowsDirectValueEditing = /<el-input[^>]*v-model="option\.value"/.test(advancedOptionsContent)
-        && /confirmBulkEdit\(\)[\s\S]*values\.push\(\{[\s\S]*value:\s*value/.test(advancedOptionsContent);
-      const editorHasUniqueValueGuard = /duplicate|unique|already exists|must be unique|uniqBy|new\s+Set\s*\(/i.test(advancedOptionsContent);
-
-      if (rankingValidatorRequiresUniqueCompleteSet && rankingValidatorUsesOptionValues && editorAllowsDirectValueEditing && !editorHasUniqueValueGuard) {
-        pushFinding(findings, {
-          severity: 'important',
-          confidence: 'high',
-          file: helperEntry.path,
-          line: findLineNumber(helperContent, /case\s*'input_ranking'/),
-          title: 'Ranking config can save duplicate option values that the validator later rejects',
-          evidence: 'The ranking validator now requires a complete unique set of option values, but the advanced options editor still allows direct value edits and bulk-imported value pairs without any visible duplicate-value guard.',
-          impact: 'Builders can save a ranking field configuration that looks valid in the editor, but submissions for that field will later fail validation because duplicate option values can never satisfy the unique complete-set check.',
-          explanation: 'This is a Fluent Forms save-time contract mismatch. The runtime validator treats ranking option values as a unique identity set, so the field editor must enforce that same uniqueness constraint when option values are entered or bulk imported.',
-          verification: 'Create a ranking field with duplicate option values through the builder or bulk editor and confirm the configuration is rejected before save, rather than allowing a field that later rejects normal submissions.',
-          fixDirection: 'Add ranking-specific duplicate-value validation in the advanced options editor or save path so ranking option values stay unique before the Helper.php validator runs.'
-        });
-      }
     }
   }
 
-  if (productProfile.repoLabel === 'fluentformpro') {
-    if (hasCropChange && repoSearch(cwd, 'Cropper|cropperjs', changedPathList) && !repoSearch(cwd, 'cropper\\.min\\.(js|css)|fluentform-cropperjs', [
-      'fluentformpro.php',
-      'public/libs/cropperjs/cropper.min.js',
-      'public/libs/cropperjs/cropper.min.css'
-    ])) {
+  if (hasPaymentProcessorChange && !getChangedTestFiles(fileEntries).length) {
+    const paymentEntry = findChangedEntry(fileEntries, (filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath));
+    if (paymentEntry) {
       pushFinding(findings, {
         severity: 'important',
         confidence: 'medium',
-        file: findChangedEntry(fileEntries, (filePath) => /Uploader|FeaturedImage|crop/i.test(filePath))?.path || 'fluentformpro.php',
+        file: paymentEntry.path,
         line: 1,
-        title: 'Crop UI changes do not show a matching bundled asset/bootstrap path',
-        evidence: 'The changed Pro uploader flow references Cropper-based behavior, but the repo does not show the expected packaged cropper asset files or registration handles.',
-        impact: 'A working crop flow in component code still fails at runtime if the packaged JS/CSS bundle is missing or never enqueued on the rendered field path.',
-        explanation: 'Fluent Forms Pro relies on bundled public assets and explicit registration in fluentformpro.php. If a crop-capable uploader path changes without those packaged assets or handles lining up, the UI can render but never initialize for users.',
-        verification: 'Confirm public/libs/cropperjs assets exist in the packaged path and that fluentformpro.php registers/enqueues them for every affected upload renderer.',
-        fixDirection: 'Add the packaged cropper assets or update the registration/bootstrap path to the real built asset location.'
+        title: 'Payment processor change needs workflow-specific verification coverage',
+        evidence: 'A payment gateway or processor file changed, but the diff does not include matching automated verification files or a nearby workflow-specific test path.',
+        impact: 'Gateway processors sit directly on real checkout acceptance paths. Regressions here often appear only after callbacks, redirect confirmations, or reconciliation flows.',
+        explanation: 'Payment handlers are contract-heavy. The same code can look locally correct and still break mismatch handling, totals, recurring flags, or persisted payment state once real gateway payloads reach the system.',
+        verification: 'Verify the changed processor against the exact gateway payload shapes it handles, including mismatch, callback/redirect, and persisted total behavior.',
+        fixDirection: 'Add workflow-specific payment verification or document the exact gateway scenarios covered before PR.'
       });
-    }
-
-    if (hasCropChange && changedPathList.some((filePath) => /UploaderSettings|input_image|crop/i.test(filePath)) && !changedPathList.some((filePath) => /FeaturedImage/i.test(filePath))) {
-      pushOutsideDiffFinding(outsideDiffFindings, {
-        severity: 'medium',
-        file: 'src/Components/Post/Components/FeaturedImage.php',
-        line: 1,
-        title: 'Shared crop/upload changes may not be wired through featured_image',
-        explanation: 'Fluent Forms Pro has multiple image-upload entry points. A crop-flow improvement that only touches input_image-side settings or bootstrapping can leave featured_image on the old path, creating inconsistent runtime behavior between two user-visible image components.',
-        verification: 'Check whether featured_image receives the same crop settings export and crop-capable uploader bootstrap as input_image after this change.',
-        fixDirection: 'Route featured_image through the same settings export and uploader bootstrap path, or document why it intentionally differs.'
-      });
-    }
-
-    if (hasPaymentProcessorChange && !getChangedTestFiles(fileEntries).length) {
-      const paymentEntry = findChangedEntry(fileEntries, (filePath) => /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath));
-      if (paymentEntry) {
-        pushFinding(findings, {
-          severity: 'important',
-          confidence: 'medium',
-          file: paymentEntry.path,
-          line: 1,
-          title: 'Payment processor change needs product-specific verification coverage',
-          evidence: 'A Fluent Forms Pro payment gateway file changed, but the diff does not include matching automated verification files or a product-specific test path.',
-          impact: 'Gateway processors sit directly on real checkout acceptance paths. Product-specific regressions here tend to show up only after live callbacks, redirect confirmations, or refund/reconciliation flows.',
-          explanation: 'For Fluent Forms Pro, generic code review is not enough on payment processors. The same code can pass a local read and still break strict mismatch handling, coupon-adjusted totals, recurring flags, or paid-total recalculation in real gateway payloads.',
-          verification: 'Verify the changed processor against the exact gateway payload shapes used by Fluent Forms Pro, including mismatch, redirect/callback, and persisted total behavior.',
-          fixDirection: 'Add product-specific payment verification or document the exact gateway scenarios covered before PR.'
-        });
-      }
-    }
-
-    const inventoryRendererEntry = findChangedEntry(fileEntries, (filePath) => /InventoryFieldsRenderer\.php$/i.test(filePath));
-    if (inventoryRendererEntry) {
-      const content = getCurrentContentForContext(reviewContext, inventoryRendererEntry.path);
-      if (/\$field\[['"]settings\.[^'"]+['"]\s*(?:\.\s*\$[A-Za-z_][A-Za-z0-9_]*)?\]\s*=/.test(content) && /(Arr|ArrayHelper)::get\s*\([^)]*['"]settings\./.test(content)) {
-        pushFinding(findings, {
-          severity: 'important',
-          confidence: 'high',
-          file: inventoryRendererEntry.path,
-          line: findLineNumber(content, /\$field\[['"]settings\.[^'"]+['"]\s*(?:\.\s*\$[A-Za-z_][A-Za-z0-9_]*)?\]\s*=/),
-          title: 'Adjusted option payload is written back to the wrong settings path',
-          evidence: 'The inventory renderer writes the transformed option collection under a literal settings.* key while neighboring reads still use helper path lookup semantics.',
-          impact: 'Grouped or transformed option data can be lost after adjustment, which breaks downstream inventory rendering and validation even when the transformation logic itself is correct.',
-          explanation: 'This is a Fluent Forms Pro contract issue: the option collection is read through nested settings paths across inventory consumers, so the write-back path must preserve that same structure.',
-          verification: 'Confirm the adjusted option collection is stored inside the nested settings array path read by inventory validation, list formatting, and render consumers.',
-          fixDirection: 'Write the adjusted options into the real nested settings array instead of a literal dotted-key path.'
-        });
-      }
-    }
-
-    const entryViewEntry = findChangedEntry(fileEntries, (filePath) => /StepFormEntries\/Components\/Entry\.vue$/i.test(filePath));
-    if (entryViewEntry) {
-      const content = getCurrentContentForContext(reviewContext, entryViewEntry.path);
-      const loopsAdvancedOptions = /each\s*\(\s*advancedOptions/.test(content);
-      const directOptionMapping = /options\[[^\]]*optionItem\.value[^\]]*\]\s*=/.test(content) || /optionItem\.label/.test(content);
-      const hasGroupedPayloadGuard = /flattenAdvancedOptions|isMappableOption|optionItem\s*&&\s*typeof\s+optionItem\s*===\s*['"]object['"]|Object\.prototype\.hasOwnProperty\.call\(optionItem,\s*['"]value['"]\)/.test(content);
-
-      if (loopsAdvancedOptions && directOptionMapping && !hasGroupedPayloadGuard) {
-        pushFinding(findings, {
-          severity: 'important',
-          confidence: 'medium',
-          file: entryViewEntry.path,
-          line: findLineNumber(content, /each\s*\(\s*advancedOptions/),
-          title: 'Advanced option mapping does not guard grouped payload variants',
-          evidence: 'The changed entry renderer maps advanced_options directly into a value->label lookup without flattening or validating grouped option payload members first.',
-          impact: 'Entry rendering can break when grouped options introduce container nodes or payload variants that do not match the simple value/label shape expected by the old mapping logic.',
-          explanation: 'This is the same regression class that appears when grouped options are supported in one consumer but another consumer still assumes a flat collection of directly mappable options.',
-          verification: 'Test entry rendering with grouped advanced_options payloads and confirm option collection flattening or shape guards run before value/label mapping.',
-          fixDirection: 'Flatten grouped advanced_options or guard payload members before building the rendered option map.'
-        });
-      }
     }
   }
 
-  if (productProfile.repoLabel === 'fluent-conversational-js') {
+  const entryViewEntry = findChangedEntry(fileEntries, (filePath) => /Entry\.vue$/i.test(filePath));
+  if (entryViewEntry) {
+    const content = getCurrentContentForContext(reviewContext, entryViewEntry.path);
+    const loopsAdvancedOptions = /each\s*\(\s*advancedOptions/.test(content);
+    const directOptionMapping = /options\[[^\]]*optionItem\.value[^\]]*\]\s*=/.test(content) || /optionItem\.label/.test(content);
+    const hasGroupedPayloadGuard = /flattenAdvancedOptions|isMappableOption|optionItem\s*&&\s*typeof\s+optionItem\s*===\s*['"]object['"]|Object\.prototype\.hasOwnProperty\.call\(optionItem,\s*['"]value['"]\)/.test(content);
+
+    if (loopsAdvancedOptions && directOptionMapping && !hasGroupedPayloadGuard) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'medium',
+        file: entryViewEntry.path,
+        line: findLineNumber(content, /each\s*\(\s*advancedOptions/),
+        title: 'Advanced option mapping does not guard grouped payload variants',
+        evidence: 'The changed renderer maps advanced_options directly into a value->label lookup without flattening or validating grouped option payload members first.',
+        impact: 'Entry rendering can break when grouped options introduce container nodes or payload variants that do not match the simple value/label shape expected by the old mapping logic.',
+        explanation: 'This is a generic consumer/producer mismatch. Once grouped options are supported in one layer, every consumer that builds a flat label map needs either flattening or an explicit payload-shape guard.',
+        verification: 'Test rendering with grouped advanced_options payloads and confirm option collection flattening or shape guards run before value/label mapping.',
+        fixDirection: 'Flatten grouped advanced_options or guard payload members before building the rendered option map.'
+      });
+    }
+  }
+
+  if (profileTags.has('conversational-ui')) {
     const fileTypeEntry = findChangedEntry(fileEntries, (filePath) => /FileType\.vue$/i.test(filePath));
     if (fileTypeEntry) {
       const content = getCurrentContentForContext(reviewContext, fileTypeEntry.path);
@@ -1828,7 +1597,7 @@ function buildProductSpecificFindings(options, reviewContext) {
           title: 'Crop modal image-load callback may outlive cleanup state',
           evidence: 'The changed conversational file-upload flow creates Cropper inside image.onload while also tracking modal cleanup state, but the onload callback does not show an early return when cleanup already happened.',
           impact: 'Users who close the crop dialog before the image finishes loading can still trigger late cropper creation against detached DOM, which causes flaky crop sessions or leaked instances on slower devices.',
-          explanation: 'This is a product-specific race in the conversational uploader because there is no PHP fallback or second render pass to hide it. If the modal closes first and the image finishes later, the late callback still executes unless it checks the cleanup flag before creating Cropper.',
+          explanation: 'This is a generic async cleanup race. If the modal closes first and the image finishes later, the late callback still executes unless it checks the cleanup flag before creating Cropper or another heavy UI instance.',
           verification: 'Close the crop dialog quickly on a large image or slow device and confirm no cropper instance is created after teardown.',
           fixDirection: 'Guard the image.onload callback with the cleanup flag before creating Cropper and return early after teardown.'
         });
@@ -1857,7 +1626,7 @@ function buildProductSpecificFindings(options, reviewContext) {
           title: 'Ranking grid can become unusable on small screens',
           evidence: 'The ranking question supports grid display with 2-6 columns through --ff-conv-ranking-columns, but the SCSS does not show a max-width mobile override that collapses .ff_conv_ranking--grid to 1 or 2 columns.',
           impact: 'On narrow viewports, 3-6 columns produce cramped cards and controls, which reduces tap accuracy and makes the conversational ranking question difficult to use on phones.',
-          explanation: 'This is a user-facing responsive regression rather than a generic CSS preference. Conversational questions are primarily completed on mobile screens, so a new interactive card grid needs an explicit small-screen layout fallback even if the desktop layout is correct.',
+          explanation: 'This is a user-facing responsive regression rather than a generic CSS preference. Interactive card grids need an explicit small-screen layout fallback even if the desktop layout is correct.',
           verification: 'Render the ranking question on a narrow mobile viewport and confirm grid mode collapses to a safe 1-column or 2-column layout regardless of the configured desktop column count.',
           fixDirection: 'Add a mobile breakpoint override for .ff_conv_ranking--grid so small screens use at most 1 or 2 columns.'
         });
@@ -1879,8 +1648,8 @@ function buildProductSpecificFindings(options, reviewContext) {
           line: findLineNumber(rankingTypeContent, /buildItems\s*\(\)\s*\{/),
           title: 'Quadratic ordering build for ranking options',
           evidence: 'buildItems() performs repeated linear scans across answers and options through availableOptions.find(...) and usedValues.includes(...), then scans availableOptions again with usedValues.includes(...), making initialization quadratic as the option set grows.',
-          impact: 'Large ranking option sets can noticeably slow mount or rehydration when the question is activated, which is especially visible in a frontend-only conversational flow.',
-          explanation: 'This is a real performance bug rather than a style preference. The ranking initializer rebuilds ordered items from two collections, but each answer match and used-value check walks arrays repeatedly. That scales poorly compared with pre-indexing options and using a Set for membership checks.',
+          impact: 'Large option sets can noticeably slow mount or rehydration when the interaction is activated.',
+          explanation: 'This is a real performance bug rather than a style preference. The initializer rebuilds ordered items from two collections, but each answer match and used-value check walks arrays repeatedly. That scales poorly compared with pre-indexing options and using a Set for membership checks.',
           verification: 'Test ranking question activation and rehydration with larger option sets and confirm initialization stays responsive without repeated linear scans over the same arrays.',
           fixDirection: 'Pre-index options by value and use a Set for used values so matching and membership checks stay O(1) during buildItems().'
         });
@@ -1946,7 +1715,7 @@ function buildProductSpecificFindings(options, reviewContext) {
     }
   }
 
-  if (productProfile.repoLabel === 'fluentforms-pdf') {
+  if (profileTags.has('pdf-output') && (changedPathList.some((filePath) => /template|invoice|report|pdf/i.test(filePath)) || changedPathList.some((filePath) => /pdf|download|attachment|generator/i.test(filePath)))) {
     const changedTemplateFiles = changedPathList.filter((filePath) => /template|invoice|report|pdf/i.test(filePath));
     const changedGenerationFiles = changedPathList.filter((filePath) => /pdf|download|attachment|generator/i.test(filePath));
 
@@ -1978,7 +1747,7 @@ function buildProductSpecificFindings(options, reviewContext) {
     }
   }
 
-  if (productProfile.repoLabel === 'multilingual-forms-fluent-forms-wpml') {
+  if (profileTags.has('translation-sync') && changedPathList.some((filePath) => /wpml|translation|package|string|language/i.test(filePath))) {
     const changedTranslationFiles = changedPathList.filter((filePath) => /wpml|translation|package|string|language/i.test(filePath));
 
     if (changedTranslationFiles.length && !repoSearch(cwd, 'package|register_strings|translate|icl_', changedTranslationFiles)) {
@@ -1997,7 +1766,7 @@ function buildProductSpecificFindings(options, reviewContext) {
     }
   }
 
-  if (productProfile.repoLabel === 'fluentform-signature') {
+  if (profileTags.has('signature-pad') && changedPathList.some((filePath) => /signature|pad|canvas/i.test(filePath))) {
     const changedSignatureFiles = changedPathList.filter((filePath) => /signature|pad|canvas/i.test(filePath));
 
     if (changedSignatureFiles.length && !getChangedTestFiles(fileEntries).length) {
@@ -2016,123 +1785,21 @@ function buildProductSpecificFindings(options, reviewContext) {
     }
   }
 
-  if (productProfile.repoLabel === 'fluent-player' || productProfile.repoLabel === 'fluent-player-pro') {
+  if (profileTags.has('player-runtime') && changedPathList.some((filePath) => /player|subtitle|chapter|playlist|shortcode|block|analytics|drm/i.test(filePath))) {
     const changedPlayerFiles = changedPathList.filter((filePath) => /player|subtitle|chapter|playlist|shortcode|block|analytics|drm/i.test(filePath));
-    const isProRepo = productProfile.repoLabel === 'fluent-player-pro';
 
     if (changedPlayerFiles.length && !getChangedTestFiles(fileEntries).length) {
       pushFinding(findings, {
-        severity: isProRepo ? 'important' : 'medium',
+        severity: 'medium',
         confidence: 'medium',
         file: changedPlayerFiles[0],
         line: 1,
-        title: `${productProfile.name} config change needs frontend playback verification`,
+        title: `${productProfile ? productProfile.name : 'Player'} config change needs frontend playback verification`,
         evidence: 'The diff changes player-facing config or runtime files without matching verification coverage.',
         impact: 'Player regressions usually surface only in the browser: wrong source config, missing subtitles/chapters, failed initialization, or broken pro overlays/analytics after save.',
-        explanation: 'These repos are heavily config-contract driven. A mismatch between saved settings, shortcode/block attributes, and the frontend player bootstrap can leave the admin side looking correct while playback breaks for users.',
+        explanation: 'Player flows are heavily config-contract driven. A mismatch between saved settings, shortcode/block attributes, and the frontend bootstrap can leave the admin side looking correct while playback breaks for users.',
         verification: 'Verify the changed player config on a real rendered player, including initialization, source loading, and any touched subtitle/chapter/analytics/protection path.',
-        fixDirection: 'Add product-specific playback verification or document the exact rendered-player scenarios checked before PR.'
-      });
-    }
-
-    if (isProRepo) {
-      const subtitleControllerEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleController\.php$/i.test(filePath));
-      if (subtitleControllerEntry) {
-        const content = getCurrentContentForContext(reviewContext, subtitleControllerEntry.path);
-
-        if (/makeSubtitleDedupKey\s*\(/.test(content) && /array_map\s*\(\s*\[\$this,\s*['"]makeSubtitleDedupKey['"]\s*\],\s*\$subtitles\s*\)/.test(content)) {
-          const incomingDedupArrayMissingTrackId = /makeSubtitleDedupKey\s*\(\s*\[\s*[\s\S]*['"]url['"]\s*=>[\s\S]*['"]language['"]\s*=>[\s\S]*['"]label['"]\s*=>[\s\S]*\]\s*\)/.test(content)
-            && !/makeSubtitleDedupKey\s*\(\s*\[[\s\S]*['"]trackId['"]\s*=>|makeSubtitleDedupKey\s*\(\s*\[[\s\S]*['"]track_id['"]\s*=>/.test(content);
-
-          if (incomingDedupArrayMissingTrackId) {
-            pushFinding(findings, {
-              severity: 'important',
-              confidence: 'medium',
-              file: subtitleControllerEntry.path,
-              line: findLineNumber(content, /makeSubtitleDedupKey\s*\(\s*\[/),
-              title: 'Dedup key construction does not preserve remote track identity',
-              evidence: 'The controller computes existing subtitle keys through makeSubtitleDedupKey(), but the incoming import dedup array does not pass track_id/trackId even though the helper prioritizes that identity.',
-              impact: 'The same remote caption track can be re-imported because existing and incoming subtitle keys are computed from different identity fields.',
-              explanation: 'This is a data-contract mismatch rather than a syntax error. The dedup helper has one canonical identity order, but the import path only provides a fallback subset of fields, so already-imported remote tracks may not collide with their existing saved entry.',
-              verification: 'Confirm the import dedup path passes the same canonical identifier fields that existing saved subtitles use, especially track_id for remote caption imports.',
-              fixDirection: 'Build incoming dedup keys from the same canonical identity fields as existing subtitles, including track_id/trackId when available.'
-            });
-          }
-        }
-
-        const persistsExternalMetadata = /Arr::get\(\$track,\s*['"]language['"]|Arr::get\(\$track,\s*['"]label['"]|Arr::get\(\$track,\s*['"]track_id['"]/.test(content)
-          && /update_post_meta\s*\([^)]*settings/.test(content);
-        const hasRemoteMetadataSanitizer = /sanitize_text_field\s*\(|sanitize_file_name\s*\(/.test(content);
-
-        if (persistsExternalMetadata && !hasRemoteMetadataSanitizer) {
-          pushFinding(findings, {
-            severity: 'important',
-            confidence: 'medium',
-            file: subtitleControllerEntry.path,
-            line: findLineNumber(content, /Arr::get\(\$track,\s*['"](track_id|language|label)['"]/),
-            title: 'External subtitle metadata is persisted without visible sanitization',
-            evidence: 'The import flow reads remote track label/language/track identifiers and persists subtitle settings, but no sanitize_text_field()/sanitize_file_name() calls were detected in the controller path.',
-            impact: 'Untrusted external service metadata can become stored or reflected UI content if it reaches post meta and later API responses without normalization.',
-            explanation: 'Remote service data is still untrusted input. In subtitle import flows, label, language, track IDs, and filenames should be normalized in the service or controller layer before persistence so downstream renderers are not forced to assume they are safe.',
-            verification: 'Confirm remote track metadata is sanitized at normalization time before subtitle settings are saved or returned in responses.',
-            fixDirection: 'Sanitize remote subtitle metadata before persistence, keeping binary/text track content validation separate from label and identifier normalization.'
-          });
-        }
-      }
-
-      const subtitleServiceEntry = findChangedEntry(fileEntries, (filePath) => /SubtitleService\.php$/i.test(filePath));
-      if (subtitleServiceEntry) {
-        const content = getCurrentContentForContext(reviewContext, subtitleServiceEntry.path);
-        const remoteDecodeWithoutLimit = /wp_remote_(get|post)\s*\([\s\S]*json_decode\s*\(\s*\$body\s*,\s*true\s*\)/.test(content)
-          && !/limit_response_size|strlen\s*\(\s*\$body\s*\)|MAX_[A-Z0-9_]*BYTES/.test(content);
-
-        if (remoteDecodeWithoutLimit) {
-          pushFinding(findings, {
-            severity: 'important',
-            confidence: 'high',
-            file: subtitleServiceEntry.path,
-            line: findLineNumber(content, /json_decode\s*\(\s*\$body\s*,\s*true\s*\)/),
-            title: 'Subtitle-service response is decoded before a visible payload-size guard',
-            evidence: 'The subtitle service call reads the full response body and json_decodes it without showing an HTTP-layer response-size cap.',
-            impact: 'Large multi-track subtitle responses can trigger memory spikes or timeouts before any per-track MAX_SUBTITLE_BYTES validation runs.',
-            explanation: 'Per-track validation is not enough when the entire remote JSON body has already been materialized and decoded. The request can fail on memory long before the later subtitle-content guard rejects oversize tracks.',
-            verification: 'Confirm subtitle-service HTTP calls use limit_response_size or another hard byte cap before the response body is decoded.',
-            fixDirection: 'Add a response-size guard before json_decode and keep large subtitle imports on a bounded processing path.'
-          });
-        }
-      }
-
-      const actionsEntry = findChangedEntry(fileEntries, (filePath) => /app\/Hooks\/actions\.php$/i.test(filePath));
-      if (actionsEntry) {
-        const content = getCurrentContentForContext(reviewContext, actionsEntry.path);
-        const saveHookRemoteWork = /after_save_media/.test(content) && /(wp_remote_|Storyboard|storyboard|downloadRemoteTracks|generate)/.test(content) && !/wp_schedule_single_event|queue[A-Z]|dispatch|as_enqueue_async_action|schedule/i.test(content);
-
-        if (saveHookRemoteWork) {
-          pushFinding(findings, {
-            severity: 'important',
-            confidence: 'medium',
-            file: actionsEntry.path,
-            line: findLineNumber(content, /after_save_media/),
-            title: 'Remote generation work is running synchronously on the media-save path',
-            evidence: 'The changed save hook wires storyboard, subtitle, or other remote generation work directly into after_save_media without an obvious async queue or scheduler handoff.',
-            impact: 'Media save requests can become slow or stall under remote latency because network and attachment work are running on the synchronous save path.',
-            explanation: 'This is a classic player/admin hot-path regression. Even correct remote generation logic becomes risky when it is attached directly to a save hook, because user-facing admin requests inherit the timeout and memory profile of the remote work.',
-            verification: 'Confirm remote storyboard or subtitle generation is deferred to a queue/scheduled event, or otherwise bounded so media saves do not block on the external call.',
-            fixDirection: 'Move remote generation off the synchronous save hook or gate it behind a background job / queued follow-up flow.'
-          });
-        }
-      }
-    }
-
-    if (isProRepo && changedPlayerFiles.length && !changedPathList.some((filePath) => /shared|common|base|bootstrap/i.test(filePath))) {
-      pushOutsideDiffFinding(outsideDiffFindings, {
-        severity: 'medium',
-        file: 'shared player bootstrap',
-        line: 1,
-        title: 'Pro player change may need a shared free/pro config compatibility check',
-        explanation: 'Fluent Player Pro often extends a shared frontend player contract. A Pro-only change can be locally correct but still diverge from the base config shape expected by the shared bootstrap path.',
-        verification: 'Check the same config keys against the shared/base player bootstrap to confirm the Pro extension still composes cleanly with the core player config.',
-        fixDirection: 'Validate the changed Pro config against the shared player bootstrap and align any diverging config keys or defaults.'
+        fixDirection: 'Add rendered-player verification or document the exact playback scenarios checked before PR.'
       });
     }
 
@@ -2152,8 +1819,8 @@ function buildProductSpecificFindings(options, reviewContext) {
     }
   }
 
-  if (productProfile.repoLabel && !findings.length && !outsideDiffFindings.length) {
-    notes.push(`Applied ${productProfile.name} product-specific review rules: ${productProfile.regressionChecks.join('; ')}.`);
+  if (productProfile && productProfile.regressionChecks.length && !findings.length && !outsideDiffFindings.length) {
+    notes.push(`Applied ${productProfile.name} review focus areas: ${productProfile.regressionChecks.join('; ')}.`);
   }
 
   return { findings, outsideDiffFindings, notes };
@@ -2162,7 +1829,7 @@ function buildProductSpecificFindings(options, reviewContext) {
 function analyzeFile(context) {
   const findings = [];
   const { filePath, currentContent, baseContent, changedLines, mode, highRiskPaths, productProfile } = context;
-  const repoLabel = productProfile ? productProfile.repoLabel : '';
+  const expectedTextDomain = productProfile && productProfile.textDomain ? productProfile.textDomain : '';
   const isPhpFile = filePath.endsWith('.php');
   const isScriptFile = /\.(js|jsx|ts|tsx|vue)$/i.test(filePath);
   const isFrontendFile = isFrontendTemplateFile(filePath);
@@ -2320,20 +1987,23 @@ function analyzeFile(context) {
     });
   }
 
-  if (repoLabel === 'fluentformpro') {
-    const wrongTextDomain = changedLines.find((entry) => /(__|_e|_x|esc_html__|esc_attr__)\s*\([^)]*['"]fluentform['"]/.test(entry.text));
+  if (expectedTextDomain) {
+    const wrongTextDomain = changedLines.find((entry) => {
+      const match = entry.text.match(/(__|_e|_x|esc_html__|esc_attr__)\s*\([^)]*['"]([a-z0-9_-]+)['"]\s*\)/i);
+      return match && match[2] !== expectedTextDomain;
+    });
     if (isPhpFile && wrongTextDomain) {
       pushFinding(findings, {
         severity: 'important',
         confidence: 'high',
         file: filePath,
         line: wrongTextDomain.line,
-        title: 'Pro code is using the free-plugin text domain',
-        evidence: 'The changed translation call uses the fluentform text domain inside Fluent Forms Pro code.',
-        impact: 'This breaks translation isolation between free and Pro packages and can cause strings to miss the intended Pro translation catalog.',
-        explanation: 'Fluent Forms Pro has its own text domain contract. Reusing the free-plugin domain in Pro code is easy to miss in review because the string still renders correctly in development, but it violates the i18n boundary the product relies on.',
-        verification: 'Check that every new translation call in Pro code uses the fluentformpro text domain consistently.',
-        fixDirection: 'Change the translation call to use the fluentformpro text domain.'
+        title: 'Translation call is using the wrong text domain for this repository',
+        evidence: `The changed translation call uses a different text domain than the repository profile expects (${expectedTextDomain}).`,
+        impact: 'This breaks translation isolation and can cause strings to miss the intended translation catalog even when they render correctly in development.',
+        explanation: 'Text-domain mismatches are easy to miss because the string still appears locally, but the package-level translation boundary depends on consistent domains across all new translation calls.',
+        verification: `Check that every new translation call in this repository uses the expected ${expectedTextDomain} text domain consistently.`,
+        fixDirection: `Change the translation call to use the ${expectedTextDomain} text domain.`
       });
     }
   }
@@ -2491,6 +2161,53 @@ function analyzeFile(context) {
         explanation: 'This is a common Vue editor regression: copying prop-derived state into local mutable arrays on mount is fine only if the component also resynchronizes when the source props change. Entry and settings editors often receive async-loaded data after first render.',
         verification: 'Reload or update the editor with new value and field option data after initial render and confirm the local ordered list rebuilds to reflect the latest props.',
         fixDirection: 'Add watchers or a computed-driven synchronization path so buildItems() reruns when value or the relevant field option source changes.'
+      });
+    }
+  }
+
+  if (isFrontendFile) {
+    const changedText = changedLines.map((entry) => entry.text).join('\n');
+    const vHtmlBindings = [];
+    const vHtmlRegex = /v-html\s*=\s*["']([^"']+)["']/g;
+    let vHtmlMatch;
+    while ((vHtmlMatch = vHtmlRegex.exec(currentContent)) !== null) {
+      vHtmlBindings.push(vHtmlMatch[1]);
+    }
+
+    const unsafePreviewBinding = vHtmlBindings.find((binding) => {
+      const methodName = String(binding).replace(/\(.*$/, '').trim();
+      if (!methodName) {
+        return false;
+      }
+
+      const touchesPreviewComposition = changedText.includes('v-html')
+        || changedText.includes(methodName)
+        || /fieldLabel|preview-field|preview-value|getRankingConditionPreview|rule\.value|return\s+`/.test(changedText);
+      if (!touchesPreviewComposition) {
+        return false;
+      }
+
+      const methodPattern = new RegExp(`${methodName}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?return\\s+\`[\\s\\S]*?\\$\\{[^}]+\\}[\\s\\S]*?\``, 'm');
+      if (!methodPattern.test(currentContent)) {
+        return false;
+      }
+
+      const dynamicPreviewPattern = new RegExp(`${methodName}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?(fieldLabel|\\.label\\b|\\bvalue\\b)[\\s\\S]*?<[^>]+>[\\s\\S]*?\\$\\{`, 'm');
+      return dynamicPreviewPattern.test(currentContent);
+    });
+
+    if (unsafePreviewBinding) {
+      pushFinding(findings, {
+        severity: 'important',
+        confidence: 'high',
+        file: filePath,
+        line: findLineNumber(currentContent, /v-html\s*=/),
+        title: 'Unsanitized HTML rendering in group preview',
+        evidence: `The changed component renders preview markup with v-html through ${unsafePreviewBinding}, and the bound preview method composes HTML from dynamic label/value data before injecting it into the DOM.`,
+        impact: 'If field labels or rule values contain HTML-like payloads, the admin preview can render unsafe or executable markup instead of inert text.',
+        explanation: 'This is a real admin-side XSS risk, not a styling concern. Vue escapes normal interpolations by default, but v-html bypasses that protection entirely. Once the preview method concatenates dynamic label or value strings into HTML, the safety depends on every segment already being escaped correctly.',
+        verification: 'Populate the preview with labels or values containing HTML-like payloads and confirm the admin UI renders them as text rather than interpreted markup.',
+        fixDirection: 'Stop using v-html for dynamic preview strings, or escape every dynamic segment before composing HTML and injecting it.'
       });
     }
   }
@@ -5059,7 +4776,7 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
   const isExplicit = options.files.includes(filePath);
   const isWorktreeChange = entry.status.trim() && entry.status !== '??';
   const isTest = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.(test|spec)\./i.test(filePath);
-  const productWeight = reviewContext.productProfile && reviewContext.productProfile.repoLabel === 'fluentformpro' && /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)
+  const productWeight = /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)
     ? 40
     : 0;
 
@@ -5296,11 +5013,7 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
   productReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
   notes.push(...productReview.notes);
 
-  if (
-    reviewContext.productProfile &&
-    reviewContext.productProfile.repoLabel === 'fluentformpro' &&
-    findings.some((finding) => finding.title === 'Payment processor change needs product-specific verification coverage')
-  ) {
+  if (findings.some((finding) => /needs .*verification coverage/i.test(finding.title))) {
     const genericIndex = findings.findIndex((finding) => finding.title === 'High-risk changes landed without matching test changes');
     if (genericIndex !== -1) {
       findings.splice(genericIndex, 1);
@@ -5331,7 +5044,7 @@ function createReviewContext(options, cwd) {
   const diffIndex = indexUnifiedDiff(diffText);
   const repoRoot = getRepoRoot(cwd);
   const repoLabel = getRepoLabel(cwd);
-  const productProfile = buildCustomProductProfile(repoLabel, options.productProfile) || getProductProfile(repoLabel);
+  const productProfile = buildCustomProductProfile(repoLabel, options.productProfile);
 
   return {
     cwd,
