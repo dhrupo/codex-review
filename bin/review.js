@@ -13,21 +13,18 @@ function printHelp() {
 
   Usage:
     codex-review
-    codex-review --workflow debugger
-    codex-review --workflow plugin-audit
-    codex-review --mode accessibility --engine codex
 
   Options:
     --base <ref>           Base ref to diff against
     --head <ref>           Head ref to diff against (default: HEAD)
     --staged               Review staged changes only
     --files <a,b,c>        Review only specific files
-    --workflow <name>      Workflow preset: debugger or plugin-audit
+    --workflow <name>      Advanced workflow preset: debugger or plugin-audit
     --mode <name>          Review mode: full, security, performance, compatibility, accessibility
     --engine <name>        Review engine: auto, codex, heuristic
     --model <name>         Codex model override for engine=auto or codex
-    --thorough             Increase Codex deep-review scope
-    --review-depth <name>  Review depth: balanced or thorough
+    --thorough             Explicitly force thorough review depth
+    --review-depth <name>  Review depth: balanced or thorough (default: thorough)
     --semgrep              Force-enable Semgrep if the CLI is installed
     --no-semgrep           Disable the Semgrep stage
     --semgrep-config <id>  Semgrep config to run alongside Codex (default: auto)
@@ -48,22 +45,20 @@ function printHelp() {
                            Optional Playwright storage state JSON for authenticated scans
     --reviewdog-report <path>
                            Write merged findings as reviewdog rdjson
-    --format <name>        Output format: text, markdown, github, json, rdjson
+    --format <name>        Output format: pr-review, text, markdown, github, json, rdjson
     --report <path>        Write the rendered report to a file
     --max-findings <n>     Limit the number of findings in the output
     --fail-on <severity>   Exit non-zero for low, medium, important, or critical findings
     -h, --help             Show help
     -v, --version          Show version
 
-  Canonical commands:
+  Default behavior:
     codex-review
-      standard local pre-PR review for the current repo
+      deep local pre-PR review with the PR-review format, Codex when available, and all enabled static/runtime stages
+
+  Advanced optional workflows:
     codex-review --workflow debugger
-      finder/verifier style bug sweep that writes debugger-report.md
     codex-review --workflow plugin-audit
-      broader audit pass that writes plugin-audit.md
-    codex-review --mode accessibility --engine codex
-      review plus rendered accessibility scan when repo-local URLs are configured
 `);
 }
 

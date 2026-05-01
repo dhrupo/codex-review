@@ -18,8 +18,35 @@ product_profile:
 focus_areas:
   - security
   - payments
+  - lifecycle
+  - performance
   - regression
   - compatibility
+critical_paths:
+  - route or ajax entry -> capability or nonce -> sanitizer -> persistence -> reload -> render
+  - admin editor change -> save -> sanitize -> load -> frontend bootstrap or runtime
+review_signals:
+  lifecycle:
+    - mounted, onClose, reset, teardown, reopen, async completion
+  performance:
+    - dragover, pointermove, repeated find/includes, duplicate fetches, repeated DOM queries
+  persistence:
+    - editor value -> sanitizer -> stored schema -> runtime consumer
+  security:
+    - wp_ajax_nopriv_, REST mutation, webhook callback, destructive attachment or media action
+  accessibility:
+    - icon-only controls, focus-visible replacement, disabled state, mobile breakpoints
+context_files:
+  - app/Services/Form/Updater.php
+  - app/Modules/Form/Form.php
+context_rules:
+  - when:
+      - resources/assets/admin/**
+      - resources/assets/public/**
+    include:
+      - app/Services/Form/Updater.php
+      - app/Helpers/Helper.php
+    reason: UI changes often depend on unchanged save-time sanitizers and runtime consumers.
 paths:
   ignore:
     - public/mix-manifest.json
@@ -36,13 +63,30 @@ notes:
   - Payment path changes should include verification for strict and non-strict flows.
   - Webhook changes should be reviewed with verification and replay risks in mind.
   - Settings or meta shape changes should be checked for backward compatibility.
+edge_cases:
+  lifecycle:
+    - Recheck setup, reset, success, teardown, and reopen flows when stateful UI helpers or async callbacks change.
+    - Trace save -> sanitize -> load -> render -> submit when settings, validators, or schema keys change.
+  performance:
+    - Recheck hot paths for repeated find/includes scans, duplicate fetches, repeated DOM queries, and full-list class resets.
+    - Estimate worst-case behavior on realistic data sizes instead of assuming the changed loop or mapping is small.
+  persistence:
+    - Recheck any editor-accepted value against save-time sanitizers, validators, reload paths, and runtime consumers.
+  security:
+    - Recheck public endpoints, webhooks, remote-IO, and destructive actions for nonce, capability, resource ownership, and bounded payload handling.
+  accessibility:
+    - Recheck icon-only controls, focus-visible behavior, disabled state, mobile layouts, and screen-reader names in rendered UI.
 accessibility:
   urls: []
   wait_for:
   timeout_ms: 30000
   storage_state:
 codex:
-  timeout_ms: 900000
+  focus_paths:
+    - app/Http/**
+    - app/Services/**
+    - resources/assets/**
+    - src/**
 semgrep:
   enabled: true
   config: auto

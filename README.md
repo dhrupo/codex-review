@@ -133,21 +133,22 @@ For a shorter setup checklist, see [SETUP.md](./SETUP.md).
 Go into the target repository and run:
 
 ```bash
-codex-review --base origin/dev --engine codex --thorough
+codex-review
 ```
 
 Example:
 
 ```bash
 cd /path/to/fluentformpro
-codex-review --base origin/dev --engine codex --thorough
+codex-review
 ```
 
 Recommended default for most WPManageNinja repos:
 
 - base: `origin/dev`
 - engine: `codex`
-- depth: `--thorough`
+- depth: `thorough`
+- format: `pr-review`
 
 ## Recommended WPManageNinja Workflow
 
@@ -157,25 +158,20 @@ Use this before asking for review or opening a PR.
 2. Run:
 
 ```bash
-codex-review --base origin/dev --engine codex --thorough
+codex-review
 ```
 
 3. Fix the findings.
 4. Commit your changes.
-5. Run the same command again.
-6. Read the recheck section:
-   - cleared findings
-   - still-present findings
-   - newly introduced findings
+5. Run the same command again after the fix commit.
+6. Read the follow-up review. It should only leave the remaining blockers or mark the diff safe to merge.
 7. When the report is clean enough, push and open/update the PR.
 
 This mirrors the same workflow you already use with PR bots, but locally before the PR.
 
-## Common Commands
+## Default Command
 
-## Canonical Commands
-
-Use these first. Everything else is override detail.
+Use this first. Everything else is override detail.
 
 Standard local pre-PR review:
 
@@ -183,15 +179,17 @@ Standard local pre-PR review:
 codex-review
 ```
 
-Debugger-style bug sweep:
+This now defaults to:
+
+- thorough review depth
+- PR-review output shape
+- Codex when available, with heuristic fallback if needed
+- Semgrep, PHPStan, ESLint, and rendered accessibility stages when enabled/configured
+
+Advanced workflows are still available, but they are optional:
 
 ```bash
 codex-review --workflow debugger
-```
-
-Plugin-audit-style deep review:
-
-```bash
 codex-review --workflow plugin-audit
 ```
 
@@ -202,12 +200,6 @@ What those workflow presets do:
 - `--workflow plugin-audit`
   runs a broader five-workstream audit plus verification pass and writes `plugin-audit.md` by default
 - both presets switch to markdown output and thorough review depth unless you explicitly override them
-
-Rendered accessibility review using repo-local defaults:
-
-```bash
-codex-review --mode accessibility --engine codex
-```
 
 ## More Examples
 
@@ -380,7 +372,11 @@ accessibility:
   storage_state: .playwright/auth.json
 
 codex:
-  timeout_ms: 900000
+  focus_paths:
+    - app/Http/**
+    - app/Services/**
+    - resources/assets/**
+    - src/**
 
 semgrep:
   enabled: true
@@ -453,16 +449,16 @@ How it works:
 - when `engine=codex`, it sends the selected diff/context to the installed Codex CLI with isolated `codex exec --ignore-user-config --ignore-rules --ephemeral`
 - it then applies its own workflow bucketing, confidence scoring, and markdown/github/text rendering on top of the returned model output
 - when rendered accessibility URLs are configured, the Playwright + axe scan runs in parallel with the Codex, Semgrep, PHPStan, and ESLint subprocesses instead of waiting for them to finish first
-- the default Codex subprocess timeout is `900000ms` (15 minutes); if it times out, the tool then falls back to the full heuristic review and records that fallback in the report notes
+- Codex has no default timeout; it can run as long as needed unless you explicitly set `codex.timeout_ms` in `.codex/reviewer.yml`
 - the default Semgrep timeout is `120000ms`; if Semgrep is unavailable, times out, or fails, the review still completes and records that in the notes instead of aborting the whole run
 - the default PHPStan and ESLint timeouts are `120000ms`; if either tool is unavailable, times out, or fails, the review still completes and records that in the notes instead of aborting the whole run
-- `--thorough` increases the scoped Codex review set, but it does not guarantee a Codex-backed final result if the model step times out
+- `--thorough` increases the scoped Codex review set; if you explicitly set `codex.timeout_ms`, a timeout fallback can still happen and will be recorded in the notes
 - interactive terminal runs print a short stderr progress line before the Codex step so long reviews do not look hung
 - `--workflow debugger` auto-switches to the debugger preset and writes `debugger-report.md`
 - `--workflow plugin-audit` auto-switches to the deeper audit preset and writes `plugin-audit.md`
 - the debugger workflow emulates `Finder -> Verifier -> Feedback` sequentially in one local run when no literal sub-agents are used
 - the plugin-audit workflow emulates the five audit workstreams plus a final verification pass sequentially in one local run
-- heuristic and Codex review use only the local `.codex/reviewer.yml` profile plus `focus_areas`, `paths.high_risk`, and `notes`
+- heuristic and Codex review use only the local `.codex/reviewer.yml` profile plus fields such as `focus_areas`, `paths.high_risk`, `critical_paths`, `context_files`, `context_rules`, `review_signals`, `notes`, and `edge_cases`
 - rendered accessibility scanning runs only when `accessibility.urls` are configured in `.codex/reviewer.yml` or when `--a11y-url` / `--a11y-urls` are passed explicitly
 - `--reviewdog-report <path>` writes the merged final findings as reviewdog `rdjson`, so another CI step can post the combined Codex + Semgrep + heuristic review instead of only one engine
 
@@ -493,7 +489,7 @@ For most WPManageNinja repos, the main useful defaults are:
 - `engine: codex`
 - `review_depth: thorough`
 
-You can define a repo-specific product profile there. This is the only calibration path for repo-specific behavior. `codex-review` no longer ships built-in plugin profiles.
+You can define a repo-specific product profile there. This is the primary calibration path for repo-specific behavior. `codex-review` no longer ships built-in plugin profiles, and repo-local config is the intended place to deepen plugin-specific review.
 
 Useful `product_profile` fields:
 
@@ -501,6 +497,28 @@ Useful `product_profile` fields:
 - `text_domain`: expected WordPress text domain for i18n checks
 - `tags`: opt-in domain heuristics such as `conversational-ui`, `player-runtime`, `pdf-output`, `translation-sync`, or `signature-pad`
 - `focus` / `regression_checks`: report context and review emphasis
+
+Useful repo-local instruction fields outside `product_profile`:
+
+- `focus_areas`: broad review priorities
+- `notes`: concise repo reminders
+- `critical_paths`: exact workflow chains that must be traced end-to-end
+- `review_signals`: concrete lifecycle handlers, hot paths, persistence boundaries, security boundaries, and accessibility watchpoints that deserve extra scrutiny
+- `context_files`: unchanged companion files that must be included in review context, such as save sanitizers, validators, shared bootstrap files, or renderer consumers
+- `context_rules`: conditional companion-file expansion rules so a changed path can automatically pull in validators, sanitizers, bootstrap files, or shared consumers
+- `codex.focus_paths`: repo-local path patterns that get extra priority when Codex chooses which changed files to review deeply
+- `edge_cases.lifecycle`: exact lifecycle regressions to trace
+- `edge_cases.performance`: exact hot-path and scaling risks to re-check
+- `edge_cases.persistence`: editor/save/load/render/submit contract mismatches
+- `edge_cases.security`: remote-IO, public endpoint, webhook, and destructive-action failure modes
+- `edge_cases.accessibility`: focus, naming, disabled-state, and responsive UI failure modes
+
+Prefer concrete edge cases over broad reminders. Good examples:
+
+- `Any new state-sync helper must be rechecked on reset, success, teardown, and reopen.`
+- `Any reordered list builder must be checked for repeated find/includes scans on larger option sets.`
+- `Any save-time schema change must be traced through sanitize, load, render, and submit paths.`
+- `Any webhook or remote callback change must be rechecked for replay, ownership/resource binding, and bounded payload handling.`
 
 Example for a repo like `fluent-cart`:
 
@@ -525,6 +543,14 @@ focus_areas:
   - payments
   - checkout
   - persistence
+  - lifecycle
+  - performance
+critical_paths:
+  - checkout form state -> validation -> total recalculation -> order persistence -> payment confirmation
+  - payment callback -> mismatch handling -> persisted order status -> customer-visible confirmation
+context_files:
+  - app/Services/CheckoutService.php
+  - app/Models/Order.php
 paths:
   high_risk:
     - src/Payments/**
@@ -533,6 +559,17 @@ paths:
     - app/Http/**
 notes:
   - Checkout and payment changes should be verified with coupon, tax, and retry scenarios.
+edge_cases:
+  lifecycle:
+    - Recheck checkout state after retry, callback completion, manual order-status updates, and page reload.
+    - Trace coupon and total fields through save, recalculation, persisted order load, and final payment confirmation.
+  performance:
+    - Recheck cart and checkout totals for repeated query or recomputation work inside item loops.
+    - Recheck callback and reconciliation paths for duplicate remote calls or unbounded retry loops.
+  persistence:
+    - Recheck coupon, tax, and totals data against editor, persistence, admin reload, and final payment-state consumers.
+  security:
+    - Recheck callbacks, webhooks, and order actions for nonce/signature validation, replay handling, and resource ownership.
 ```
 
 Example for a repo like `fluent-crm`:
@@ -558,6 +595,14 @@ focus_areas:
   - automation
   - background-jobs
   - persistence
+  - lifecycle
+  - performance
+critical_paths:
+  - trigger -> queue -> worker -> persistence -> UI status refresh
+  - contact field change -> save -> segment rebuild -> automation execution -> rendered admin state
+context_files:
+  - app/Services/AutomationService.php
+  - app/Models/Contact.php
 paths:
   high_risk:
     - app/Services/**
@@ -566,6 +611,17 @@ paths:
     - app/Hooks/**
 notes:
   - Automation changes should be reviewed for duplicate processing and scheduler/idempotency risks.
+edge_cases:
+  lifecycle:
+    - Recheck automation entry, retry, pause, resume, and duplicate-trigger flows after any workflow-state change.
+    - Trace contact-field or segment updates through save, queue, worker execution, and rendered UI refresh paths.
+  performance:
+    - Recheck segment and campaign changes for repeated filtering, N+1 queries, and per-contact remote calls.
+    - Recheck scheduler and worker loops for duplicate processing or repeated expensive lookups.
+  persistence:
+    - Recheck saved automation, segment, and contact-state changes against worker reload and rendered admin-state consumers.
+  security:
+    - Recheck webhook, inbound action, and worker-trigger flows for signature, capability, and replay protections.
 ```
 
 That lets each WPManageNinja team tune review priorities in their own repo without waiting for a codex-review release.
@@ -591,26 +647,26 @@ For WPManageNinja product repos, `origin/dev` is usually correct.
 - `heuristic`
   local checks only
 
-Recommended team default:
-
-```bash
-codex-review --base origin/dev --engine codex --thorough
-```
-
 ## Output Formats
 
-Text output is the normal default.
+PR-review output is the normal default. It is optimized to read like a concise GitHub PR review:
+
+- short summary
+- a few “good” key changes
+- only the confirmed remaining findings
+- confidence score
+- merge stance
 
 Markdown output is useful for sharing:
 
 ```bash
-codex-review --base origin/dev --engine codex --format markdown --report codex-review.md
+codex-review --format markdown --report codex-review.md
 ```
 
 JSON output is useful for automation or experiments:
 
 ```bash
-codex-review --base origin/dev --format json
+codex-review --format json
 ```
 
 ## Team Recommendation

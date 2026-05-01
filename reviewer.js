@@ -8,7 +8,7 @@ const { execFileSync, spawn } = require('child_process');
 const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
-const DEFAULT_CODEX_TIMEOUT_MS = 900000;
+const DEFAULT_CODEX_TIMEOUT_MS = null;
 const DEFAULT_SEMGREP_TIMEOUT_MS = 120000;
 const DEFAULT_PHPSTAN_TIMEOUT_MS = 120000;
 const DEFAULT_ESLINT_TIMEOUT_MS = 120000;
@@ -64,13 +64,32 @@ const DEFAULT_CONFIG = {
   model: null,
   maxFindings: DEFAULT_MAX_FINDINGS,
   codexTimeoutMs: DEFAULT_CODEX_TIMEOUT_MS,
+  codexFocusPaths: [],
   base: null,
-  reviewDepth: 'balanced',
+  reviewDepth: 'thorough',
   productProfile: null,
   focusAreas: [],
   ignorePaths: [],
   highRiskPaths: [],
   notes: [],
+  criticalPaths: [],
+  contextFiles: [],
+  contextRules: [],
+  reviewSignals: {
+    lifecycle: [],
+    performance: [],
+    persistence: [],
+    security: [],
+    accessibility: []
+  },
+  edgeCases: {
+    general: [],
+    lifecycle: [],
+    performance: [],
+    persistence: [],
+    security: [],
+    accessibility: []
+  },
   semgrepEnabled: true,
   semgrepConfig: 'auto',
   semgrepTimeoutMs: DEFAULT_SEMGREP_TIMEOUT_MS,
@@ -403,13 +422,13 @@ function parseArgs(argv) {
     files: [],
     workflow: null,
     mode: 'full',
-    format: 'text',
+    format: 'pr-review',
     report: null,
     maxFindings: DEFAULT_MAX_FINDINGS,
     failOn: null,
     engine: 'auto',
     model: null,
-    reviewDepth: 'balanced',
+    reviewDepth: 'thorough',
     semgrepEnabled: true,
     semgrepConfig: DEFAULT_CONFIG.semgrepConfig,
     semgrepTimeoutMs: DEFAULT_CONFIG.semgrepTimeoutMs,
@@ -858,6 +877,95 @@ function normalizeInteger(value, fallback) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function normalizePatternArray(value) {
+  return normalizeStringArray(value).map((item) => item.replace(/\\/g, '/'));
+}
+
+function normalizeContextRules(value) {
+  if (!isArray(value)) {
+    return [];
+  }
+
+  return value.map((rule) => {
+    if (!rule || typeof rule !== 'object') {
+      return null;
+    }
+
+    const when = normalizePatternArray(rule.when || rule.match || rule.paths || rule.if_changed || rule.ifChanged);
+    const include = normalizeStringArray(rule.include || rule.context || rule.context_files || rule.contextFiles);
+    const reason = typeof rule.reason === 'string' ? rule.reason.trim() : '';
+
+    if (!when.length || !include.length) {
+      return null;
+    }
+
+    return {
+      when,
+      include,
+      reason: reason || null
+    };
+  }).filter(Boolean);
+}
+
+function normalizeReviewSignals(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    lifecycle: normalizeStringArray(source.lifecycle),
+    performance: normalizeStringArray(source.performance),
+    persistence: normalizeStringArray(source.persistence),
+    security: normalizeStringArray(source.security),
+    accessibility: normalizeStringArray(source.accessibility)
+  };
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+}
+
+function globToRegExp(pattern) {
+  const normalized = String(pattern || '').trim().replace(/\\/g, '/');
+  if (!normalized) {
+    return null;
+  }
+
+  let expression = '';
+  for (let index = 0; index < normalized.length; index += 1) {
+    const char = normalized[index];
+    const next = normalized[index + 1];
+    if (char === '*' && next === '*') {
+      expression += '.*';
+      index += 1;
+      continue;
+    }
+    if (char === '*') {
+      expression += '[^/]*';
+      continue;
+    }
+    expression += escapeRegExp(char);
+  }
+
+  return new RegExp(`^${expression}$`, 'i');
+}
+
+function pathMatchesPattern(filePath, pattern) {
+  const normalizedPath = String(filePath || '').replace(/\\/g, '/');
+  const normalizedPattern = String(pattern || '').trim().replace(/\\/g, '/');
+  if (!normalizedPath || !normalizedPattern) {
+    return false;
+  }
+
+  if (!normalizedPattern.includes('*')) {
+    return normalizedPath === normalizedPattern || normalizedPath.startsWith(normalizedPattern.replace(/\/$/, '') + '/');
+  }
+
+  const matcher = globToRegExp(normalizedPattern);
+  return matcher ? matcher.test(normalizedPath) : false;
+}
+
+function pathMatchesAnyPattern(filePath, patterns) {
+  return normalizePatternArray(patterns).some((pattern) => pathMatchesPattern(filePath, pattern));
+}
+
 function normalizeBoolean(value, fallback) {
   if (typeof value === 'boolean') {
     return value;
@@ -908,6 +1016,9 @@ function loadRepoConfig(cwd) {
         (parsed.codex && (parsed.codex.timeout_ms || parsed.codex.timeoutMs)) || parsed.codex_timeout || parsed.codexTimeout,
         DEFAULT_CONFIG.codexTimeoutMs
       ),
+      codexFocusPaths: normalizePatternArray(
+        (parsed.codex && (parsed.codex.focus_paths || parsed.codex.focusPaths)) || parsed.codex_focus_paths || parsed.codexFocusPaths
+      ),
       semgrepEnabled: normalizeBoolean(
         (parsed.semgrep && (parsed.semgrep.enabled)) || parsed.semgrep_enabled || parsed.semgrepEnabled,
         DEFAULT_CONFIG.semgrepEnabled
@@ -951,6 +1062,36 @@ function loadRepoConfig(cwd) {
       ignorePaths: normalizeStringArray((parsed.paths && parsed.paths.ignore) || parsed.ignore_paths || parsed.ignorePaths),
       highRiskPaths: normalizeStringArray((parsed.paths && parsed.paths.high_risk) || parsed.high_risk_paths || parsed.highRiskPaths),
       notes: normalizeStringArray(parsed.notes),
+      criticalPaths: normalizeStringArray(parsed.critical_paths || parsed.criticalPaths),
+      contextFiles: normalizeStringArray(parsed.context_files || parsed.contextFiles),
+      contextRules: normalizeContextRules(parsed.context_rules || parsed.contextRules),
+      reviewSignals: normalizeReviewSignals(parsed.review_signals || parsed.reviewSignals),
+      edgeCases: {
+        general: normalizeStringArray(
+          (parsed.edge_cases && ((parsed.edge_cases.general) || (parsed.edge_cases.shared))) ||
+          (parsed.edgeCases && ((parsed.edgeCases.general) || (parsed.edgeCases.shared)))
+        ),
+        lifecycle: normalizeStringArray(
+          (parsed.edge_cases && parsed.edge_cases.lifecycle) ||
+          (parsed.edgeCases && parsed.edgeCases.lifecycle)
+        ),
+        performance: normalizeStringArray(
+          (parsed.edge_cases && parsed.edge_cases.performance) ||
+          (parsed.edgeCases && parsed.edgeCases.performance)
+        ),
+        persistence: normalizeStringArray(
+          (parsed.edge_cases && parsed.edge_cases.persistence) ||
+          (parsed.edgeCases && parsed.edgeCases.persistence)
+        ),
+        security: normalizeStringArray(
+          (parsed.edge_cases && parsed.edge_cases.security) ||
+          (parsed.edgeCases && parsed.edgeCases.security)
+        ),
+        accessibility: normalizeStringArray(
+          (parsed.edge_cases && parsed.edge_cases.accessibility) ||
+          (parsed.edgeCases && parsed.edgeCases.accessibility)
+        )
+      },
       a11yUrls: normalizeStringArray((parsed.accessibility && parsed.accessibility.urls) || parsed.a11y_urls || parsed.a11yUrls),
       a11yWaitFor: typeof ((parsed.accessibility && parsed.accessibility.wait_for) || (parsed.accessibility && parsed.accessibility.waitFor) || parsed.a11y_wait_for || parsed.a11yWaitFor) === 'string'
         ? ((parsed.accessibility && parsed.accessibility.wait_for) || (parsed.accessibility && parsed.accessibility.waitFor) || parsed.a11y_wait_for || parsed.a11yWaitFor)
@@ -981,7 +1122,8 @@ function resolveOptions(rawOptions, repoConfig) {
   options.focusAreas = repoConfig.focusAreas;
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
-  options.codexTimeoutMs = repoConfig.codexTimeoutMs || DEFAULT_CONFIG.codexTimeoutMs;
+  options.codexTimeoutMs = repoConfig.codexTimeoutMs;
+  options.codexFocusPaths = repoConfig.codexFocusPaths || DEFAULT_CONFIG.codexFocusPaths;
   options.semgrepEnabled = rawOptions._explicit.semgrepEnabled ? rawOptions.semgrepEnabled : repoConfig.semgrepEnabled;
   options.semgrepConfig = rawOptions._explicit.semgrepConfig ? rawOptions.semgrepConfig : repoConfig.semgrepConfig;
   options.semgrepTimeoutMs = rawOptions._explicit.semgrepTimeoutMs ? rawOptions.semgrepTimeoutMs : repoConfig.semgrepTimeoutMs;
@@ -993,6 +1135,11 @@ function resolveOptions(rawOptions, repoConfig) {
   options.eslintTimeoutMs = rawOptions._explicit.eslintTimeoutMs ? rawOptions.eslintTimeoutMs : repoConfig.eslintTimeoutMs;
   options.reviewdogReport = rawOptions._explicit.reviewdogReport ? rawOptions.reviewdogReport : repoConfig.reviewdogReport;
   options.configNotes = repoConfig.notes;
+  options.criticalPaths = repoConfig.criticalPaths || DEFAULT_CONFIG.criticalPaths;
+  options.contextFiles = repoConfig.contextFiles || DEFAULT_CONFIG.contextFiles;
+  options.contextRules = repoConfig.contextRules || DEFAULT_CONFIG.contextRules;
+  options.reviewSignals = repoConfig.reviewSignals || DEFAULT_CONFIG.reviewSignals;
+  options.edgeCases = repoConfig.edgeCases || DEFAULT_CONFIG.edgeCases;
   options.a11yUrls = rawOptions._explicit.a11yUrls ? rawOptions.a11yUrls : repoConfig.a11yUrls;
   options.a11yWaitFor = rawOptions._explicit.a11yWaitFor ? rawOptions.a11yWaitFor : repoConfig.a11yWaitFor;
   options.a11yTimeout = rawOptions._explicit.a11yTimeout ? rawOptions.a11yTimeout : repoConfig.a11yTimeout;
@@ -1002,7 +1149,7 @@ function resolveOptions(rawOptions, repoConfig) {
 }
 
 function shouldIgnore(filePath, ignorePaths) {
-  return ignorePaths.some((ignore) => filePath === ignore.slice(0, -1) || filePath.startsWith(ignore));
+  return pathMatchesAnyPattern(filePath, ignorePaths);
 }
 
 function truncateText(text, limit) {
@@ -1423,8 +1570,7 @@ function buildTargetedContextExcerpt(content, filePath, changedLines, maxChars) 
 }
 
 function isHighRiskPath(filePath, highRiskPaths) {
-  const normalized = filePath.toLowerCase();
-  return highRiskPaths.some((segment) => normalized.includes(segment));
+  return pathMatchesAnyPattern(String(filePath || '').toLowerCase(), highRiskPaths);
 }
 
 function getChangedTestFiles(fileEntries) {
@@ -2597,6 +2743,7 @@ function saveReviewState(repoRoot, report) {
   const state = {
     repoRoot,
     repoLabel: report.repoLabel,
+    workflow: report.workflow || null,
     baseRef: report.baseRef,
     mode: report.mode,
     reviewDepth: report.reviewDepth,
@@ -2779,6 +2926,17 @@ function buildRecheckState(previousState, findings, reviewedCommit, report) {
     return null;
   }
 
+  const comparable = (
+    (previousState.workflow || null) === (report.workflow || null) &&
+    previousState.baseRef === report.baseRef &&
+    previousState.mode === report.mode &&
+    previousState.reviewDepth === report.reviewDepth
+  );
+
+  if (!comparable) {
+    return null;
+  }
+
   const previousMap = new Map(previousState.findings.map((finding) => [finding.fingerprint, finding]));
   const currentMap = new Map(findings.map((finding) => [finding.fingerprint, finding]));
   const cleared = previousState.findings.filter((finding) => !currentMap.has(finding.fingerprint));
@@ -2852,6 +3010,36 @@ function buildNarrativeSummary(report) {
   }
 
   return `${leading.join('; ')}.`;
+}
+
+function buildPrReviewSummary(report) {
+  const blockerCount = countBlockerFindings(report.findings);
+
+  if (report.recheck) {
+    if (!report.findings.length) {
+      return 'The follow-up changes address the previously confirmed blockers. The reviewed diff is ready to merge.';
+    }
+
+    if (blockerCount) {
+      const resolved = report.recheck.cleared.length;
+      const opening = resolved
+        ? `The follow-up changes resolved ${resolved} previously confirmed issue(s), but merge-blocking issues still remain.`
+        : 'The follow-up changes improve the implementation, but merge-blocking issues still remain.';
+      return opening;
+    }
+
+    return 'The follow-up changes clear the merge blockers, but there are still non-blocking issues worth addressing.';
+  }
+
+  if (!report.findings.length) {
+    return 'The implementation looks good. No confirmed issues were found in the reviewed changes.';
+  }
+
+  if (blockerCount) {
+    return 'The implementation is close, but there are merge-blocking issues to resolve before this PR is ready.';
+  }
+
+  return 'The implementation is in good shape overall, but there are still issues worth resolving before merge.';
 }
 
 function getReportTitle(report) {
@@ -3788,6 +3976,52 @@ function renderMarkdown(report) {
   return lines.join('\n');
 }
 
+function renderPrReview(report) {
+  const counts = buildFindingSummary(report.findings);
+  const blockerCount = countBlockerFindings(report.findings);
+  const allDisplayFindings = getFindingDisplayEntries(report.findings);
+  const displayFindings = blockerCount
+    ? allDisplayFindings.filter((finding) => finding.severity === 'critical' || finding.severity === 'important')
+    : allDisplayFindings.slice(0, 2);
+  const lines = [
+    '### Summary',
+    '',
+    buildPrReviewSummary(report)
+  ];
+
+  if (report.keyChanges.length) {
+    lines.push('', 'Key changes:');
+    report.keyChanges.slice(0, 3).forEach((item) => lines.push(`  * ${item}`));
+  }
+
+  lines.push('', '### Findings', '');
+
+  if (!displayFindings.length) {
+    lines.push('Safe to merge.');
+  } else if (blockerCount) {
+    lines.push('Needs changes before merge.');
+  } else {
+    lines.push('No confirmed merge blockers remain, but there are still issues worth resolving.');
+  }
+
+  if (displayFindings.length) {
+    lines.push('');
+    displayFindings.forEach((finding) => {
+      lines.push(`  * ${finding.title} (\`${finding.file}:${finding.line}\`)`);
+    });
+  }
+
+  lines.push('', `### Confidence Score: ${report.confidenceScore}/5`, '');
+  lines.push(`  * Merge stance: \`${report.verdict.replace('_', ' ')}\`${blockerCount ? ` with ${blockerCount} confirmed blocker-level finding(s).` : ' with no confirmed blocker-level findings.'}`);
+  lines.push(`  * Verification confirmed ${counts.critical} Critical and ${counts.important} Important finding(s) in the changed files.${report.keyChanges.length ? ` ${report.keyChanges[0]}` : ''}`);
+
+  if (report.reviewedCommit) {
+    lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
+  }
+
+  return lines.join('\n');
+}
+
 function renderGitHub(report) {
   const counts = buildFindingSummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
@@ -4664,8 +4898,27 @@ async function runRenderedAccessibilityScanAsync(options, cwd) {
   }
 }
 
-function collectFileContexts(reviewContext, fileEntries, highRiskPaths) {
-  return fileEntries.map((entry) => {
+function collectFileContexts(reviewContext, fileEntries, highRiskPaths, extraFiles = []) {
+  const seenPaths = new Set();
+  const contextEntries = [];
+
+  fileEntries.forEach((entry) => {
+    if (!entry || !entry.path || seenPaths.has(entry.path)) {
+      return;
+    }
+    seenPaths.add(entry.path);
+    contextEntries.push(entry);
+  });
+
+  extraFiles.forEach((filePath) => {
+    if (!filePath || seenPaths.has(filePath)) {
+      return;
+    }
+    seenPaths.add(filePath);
+    contextEntries.push({ path: filePath, status: '  ' });
+  });
+
+  return contextEntries.map((entry) => {
     const filePath = entry.path;
     const changedLines = getChangedLinesForContext(reviewContext, filePath);
     const baseContent = getBaseContentForContext(reviewContext, filePath);
@@ -4703,6 +4956,8 @@ function buildPrompt(payload) {
     'You are performing a local pre-PR code review for a WordPress-oriented repository.',
     'Review only the supplied local diff and file context.',
     'Prioritize real bugs, security issues, compatibility risks, accessibility issues in changed user-facing markup or interactions, data integrity problems, and missing verification around risky changes.',
+    'Focus heavily on lifecycle regressions and performance regressions when the diff changes stateful UI, async flows, persistence round-trips, or hot interaction paths.',
+    'Review in passes: (1) map changed workflows and entry points, (2) trace lifecycle and persistence round-trips, (3) check performance and hot paths, (4) check auth/security and destructive actions, (5) check accessibility and user-facing regressions.',
     'Do not emit style-only feedback.',
     'Do not speculate without evidence from the provided diff or file contents.',
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
@@ -4712,9 +4967,13 @@ function buildPrompt(payload) {
     'When a frontend diff introduces interactive grid, card, or multi-column choice layouts, check mobile breakpoints and narrow-viewport usability before approving.',
     'When a Vue admin/editor component derives local mutable state from props, check whether prop updates after mount will resynchronize that state before approving.',
     'When a changed mounted/load path performs async status updates or resource loads, trace each branch and check for duplicate fetches before approving.',
+    'When a change adds or modifies setup/initialize/mounted/onload/onOpen/onClose/reset/save/success handlers, trace the full lifecycle: first load, async completion, retry, reset, teardown, reopen, and prop/data refresh.',
     'When a frontend initializer rebuilds ordered lists from answers and options, check for repeated find/includes scans that can make mount or rehydration quadratic as option counts grow.',
     'When drag/drop UI is added, inspect dragover and pointer-move hot paths for repeated full-list DOM queries or class resets that can cause interaction jank.',
     'When drag/drop reorder logic adjusts target indexes after removing the source item, test adjacent forward moves explicitly so the immediate-next drop case does not collapse into a no-op.',
+    'When a change touches persistence or validation contracts, trace save -> sanitize -> load -> render -> submit paths and look for values that can be accepted in the editor but later rejected or dropped.',
+    'When a change introduces loops, mapping, sorting, filtering, repeated lookups, remote fetches, or DOM queries, estimate worst-case scaling on real data sizes instead of assuming the current diff is small.',
+    'Use repo-local review_signals as concrete prompts for which lifecycle handlers, hot paths, persistence boundaries, security boundaries, and accessibility checks deserve extra scrutiny.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
     '',
@@ -4739,6 +4998,18 @@ function buildPrompt(payload) {
     '',
     'Priority focus areas:',
     JSON.stringify(payload.focusAreas, null, 2),
+    '',
+    'Critical paths to trace:',
+    JSON.stringify(payload.criticalPaths || [], null, 2),
+    '',
+    'Repository review signals:',
+    JSON.stringify(payload.reviewSignals || {}, null, 2),
+    '',
+    'Matched repository context rules:',
+    JSON.stringify(payload.matchedContextRules || [], null, 2),
+    '',
+    'Repo edge cases:',
+    JSON.stringify(payload.edgeCases || null, null, 2),
     '',
     'Repo instructions:',
     JSON.stringify(payload.instructions, null, 2),
@@ -4773,6 +5044,7 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
   const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
   const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
   const isHighRisk = isHighRiskPath(filePath, options.highRiskPaths);
+  const isCodexFocusPath = pathMatchesAnyPattern(filePath, options.codexFocusPaths || []);
   const isExplicit = options.files.includes(filePath);
   const isWorktreeChange = entry.status.trim() && entry.status !== '??';
   const isTest = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.(test|spec)\./i.test(filePath);
@@ -4798,6 +5070,10 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
     score += 150;
   }
 
+  if (isCodexFocusPath) {
+    score += 180;
+  }
+
   if (isWorktreeChange) {
     score += 80;
   }
@@ -4810,6 +5086,41 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
   score += productWeight;
 
   return score;
+}
+
+function getMatchedContextRules(fileEntries, contextRules) {
+  if (!contextRules || !contextRules.length) {
+    return [];
+  }
+
+  const changedPaths = fileEntries.map((entry) => entry.path).filter(Boolean);
+  return contextRules.map((rule) => {
+    const matchedFiles = changedPaths.filter((filePath) => pathMatchesAnyPattern(filePath, rule.when));
+    if (!matchedFiles.length) {
+      return null;
+    }
+
+    return {
+      when: rule.when,
+      include: rule.include,
+      reason: rule.reason || null,
+      matchedFiles
+    };
+  }).filter(Boolean);
+}
+
+function resolveExtraContextFiles(reviewContext, options) {
+  const matchedRules = getMatchedContextRules(reviewContext.fileEntries, options.contextRules || []);
+  const files = new Set(options.contextFiles || []);
+
+  matchedRules.forEach((rule) => {
+    rule.include.forEach((filePath) => files.add(filePath));
+  });
+
+  return {
+    files: Array.from(files),
+    matchedRules
+  };
 }
 
 function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
@@ -4870,7 +5181,7 @@ function runCodexReview(payload, options, cwd) {
       cwd,
       input: prompt,
       maxBuffer: 32 * 1024 * 1024,
-      timeout: options.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS
+      timeout: options.codexTimeoutMs || undefined
     });
 
     const parsed = JSON.parse(safeReadFile(outputPath));
@@ -4926,7 +5237,7 @@ async function runCodexReviewAsync(payload, options, cwd) {
       cwd,
       input: prompt,
       maxBuffer: 32 * 1024 * 1024,
-      timeout: options.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS
+      timeout: options.codexTimeoutMs || undefined
     });
 
     const parsed = JSON.parse(safeReadFile(outputPath));
@@ -5138,6 +5449,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     report.rendered = JSON.stringify(report, null, 2);
   } else if (options.format === 'rdjson') {
     report.rendered = report.reviewdogRendered;
+  } else if (options.format === 'pr-review') {
+    report.rendered = renderPrReview(report);
   } else if (options.format === 'github') {
     report.rendered = renderGitHub(report);
   } else if (options.format === 'markdown') {
@@ -5179,6 +5492,7 @@ async function createReviewReport(options, cwd = process.cwd()) {
   const reviewContext = createReviewContext(resolvedOptions, cwd);
   const scope = summarizeScope(reviewContext.fileEntries, reviewContext.instructions);
   const baseNotes = [];
+  const extraContext = resolveExtraContextFiles(reviewContext, resolvedOptions);
   const shouldRunRuntimeA11y = Boolean(resolvedOptions.a11yUrls && resolvedOptions.a11yUrls.length);
 
   if (loadedConfig.configPath) {
@@ -5186,6 +5500,43 @@ async function createReviewReport(options, cwd = process.cwd()) {
   }
 
   baseNotes.push(...resolvedOptions.configNotes);
+  if (resolvedOptions.edgeCases) {
+    const edgeCaseCounts = [
+      resolvedOptions.edgeCases.general && resolvedOptions.edgeCases.general.length ? `${resolvedOptions.edgeCases.general.length} general` : null,
+      resolvedOptions.edgeCases.lifecycle && resolvedOptions.edgeCases.lifecycle.length ? `${resolvedOptions.edgeCases.lifecycle.length} lifecycle` : null,
+      resolvedOptions.edgeCases.performance && resolvedOptions.edgeCases.performance.length ? `${resolvedOptions.edgeCases.performance.length} performance` : null,
+      resolvedOptions.edgeCases.persistence && resolvedOptions.edgeCases.persistence.length ? `${resolvedOptions.edgeCases.persistence.length} persistence` : null,
+      resolvedOptions.edgeCases.security && resolvedOptions.edgeCases.security.length ? `${resolvedOptions.edgeCases.security.length} security` : null,
+      resolvedOptions.edgeCases.accessibility && resolvedOptions.edgeCases.accessibility.length ? `${resolvedOptions.edgeCases.accessibility.length} accessibility` : null
+    ].filter(Boolean);
+    if (edgeCaseCounts.length) {
+      baseNotes.push(`Loaded repo edge cases: ${edgeCaseCounts.join(', ')}.`);
+    }
+  }
+  if (resolvedOptions.criticalPaths && resolvedOptions.criticalPaths.length) {
+    baseNotes.push(`Loaded ${resolvedOptions.criticalPaths.length} critical path(s) to trace.`);
+  }
+  if (resolvedOptions.contextFiles && resolvedOptions.contextFiles.length) {
+    baseNotes.push(`Loaded ${resolvedOptions.contextFiles.length} repo context file(s) for companion tracing.`);
+  }
+  if (resolvedOptions.contextRules && resolvedOptions.contextRules.length) {
+    baseNotes.push(`Loaded ${resolvedOptions.contextRules.length} repo context rule(s) for conditional companion tracing.`);
+  }
+  if (extraContext.matchedRules && extraContext.matchedRules.length) {
+    baseNotes.push(`Matched ${extraContext.matchedRules.length} context rule(s) for this diff and expanded companion context accordingly.`);
+  }
+  if (resolvedOptions.reviewSignals) {
+    const signalCounts = [
+      resolvedOptions.reviewSignals.lifecycle && resolvedOptions.reviewSignals.lifecycle.length ? `${resolvedOptions.reviewSignals.lifecycle.length} lifecycle` : null,
+      resolvedOptions.reviewSignals.performance && resolvedOptions.reviewSignals.performance.length ? `${resolvedOptions.reviewSignals.performance.length} performance` : null,
+      resolvedOptions.reviewSignals.persistence && resolvedOptions.reviewSignals.persistence.length ? `${resolvedOptions.reviewSignals.persistence.length} persistence` : null,
+      resolvedOptions.reviewSignals.security && resolvedOptions.reviewSignals.security.length ? `${resolvedOptions.reviewSignals.security.length} security` : null,
+      resolvedOptions.reviewSignals.accessibility && resolvedOptions.reviewSignals.accessibility.length ? `${resolvedOptions.reviewSignals.accessibility.length} accessibility` : null
+    ].filter(Boolean);
+    if (signalCounts.length) {
+      baseNotes.push(`Loaded review signals: ${signalCounts.join(', ')}.`);
+    }
+  }
 
   if (!scope.reviewedFiles.length && !shouldRunRuntimeA11y) {
     return buildFinalReport(resolvedOptions, reviewContext, applyWorkflowPostProcessing(resolvedOptions, reviewContext, {
@@ -5297,6 +5648,10 @@ async function createReviewReport(options, cwd = process.cwd()) {
       baseRef: reviewContext.baseRef || '--staged',
       productProfile: reviewContext.productProfile,
       focusAreas: resolvedOptions.focusAreas,
+      criticalPaths: resolvedOptions.criticalPaths,
+      reviewSignals: resolvedOptions.reviewSignals,
+      matchedContextRules: extraContext.matchedRules,
+      edgeCases: resolvedOptions.edgeCases,
       instructions: reviewContext.instructions,
       heuristicHotspots: heuristicSeed.findings.slice(0, 8).map((finding) => ({
         severity: finding.severity,
@@ -5311,7 +5666,7 @@ async function createReviewReport(options, cwd = process.cwd()) {
       },
       workflow: resolvedOptions.workflow,
       diffText: truncateText(selectedDiff, 30000),
-      fileContexts: collectFileContexts(reviewContext, selectedEntries, resolvedOptions.highRiskPaths)
+      fileContexts: collectFileContexts(reviewContext, selectedEntries, resolvedOptions.highRiskPaths, extraContext.files)
     };
 
     try {
@@ -5365,14 +5720,14 @@ async function createReviewReport(options, cwd = process.cwd()) {
       );
     } catch (error) {
       if (isCodexTimeoutError(error)) {
-        const timeoutLabel = formatDurationMs(resolvedOptions.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS);
+        const timeoutLabel = formatDurationMs(resolvedOptions.codexTimeoutMs);
         logProgress(`codex-review: Codex timed out after ${timeoutLabel}. Falling back to heuristic review.`);
         notes.push(`Codex review timed out after ${timeoutLabel}, so the report used heuristic fallback.`);
         const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
         fallbackResult.stageSummaries = [{
           name: 'codex',
           status: 'timed_out',
-          durationMs: resolvedOptions.codexTimeoutMs || DEFAULT_CODEX_TIMEOUT_MS,
+          durationMs: resolvedOptions.codexTimeoutMs,
           findings: 0
         }];
         return buildFinalReport(
