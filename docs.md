@@ -65,7 +65,7 @@ codex-review --engine heuristic
 
 - `5/5`: very narrow clean diff, safe to merge
 - `4/5`: clean review, safe to merge
-- `3/5`: issues remain
+- `3/5`: not safe to merge; changes still need review fixes
 - `2/5`: major issues
 
 ## Default Output

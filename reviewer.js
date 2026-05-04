@@ -109,6 +109,25 @@ const CODEX_FILE_LIMITS = {
   balanced: 12,
   thorough: 24
 };
+const CODEX_BATCH_SIZE = {
+  balanced: 2,
+  thorough: 2
+};
+const CODEX_DEEP_CONCURRENCY = 2;
+const CODEX_CONTEXT_BUDGETS = {
+  overview: {
+    baseChars: 1200,
+    currentChars: 2000,
+    extraBaseChars: 800,
+    extraCurrentChars: 1200
+  },
+  deep: {
+    baseChars: 3000,
+    currentChars: 5000,
+    extraBaseChars: 1500,
+    extraCurrentChars: 2500
+  }
+};
 const COMMAND_EXISTS_CACHE = new Map();
 const REVIEW_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
@@ -251,6 +270,7 @@ async function runCommandAsync(command, args, options = {}) {
     let stderrSize = 0;
     let finished = false;
     let timeoutId = null;
+    let heartbeatId = null;
 
     function finish(error, stdout = '') {
       if (finished) {
@@ -260,6 +280,9 @@ async function runCommandAsync(command, args, options = {}) {
       finished = true;
       if (timeoutId) {
         clearTimeout(timeoutId);
+      }
+      if (heartbeatId) {
+        clearInterval(heartbeatId);
       }
 
       if (error) {
@@ -322,6 +345,15 @@ async function runCommandAsync(command, args, options = {}) {
       timeoutId = setTimeout(() => {
         child.kill('SIGTERM');
       }, options.timeout);
+    }
+
+    if (options.progressLabel && process.stderr && process.stderr.isTTY && process.env.CODEX_REVIEW_SILENT !== '1') {
+      const heartbeatMs = Math.max(15000, options.heartbeatMs || 30000);
+      const startedAt = Date.now();
+      heartbeatId = setInterval(() => {
+        const elapsed = formatDurationMs(Date.now() - startedAt);
+        process.stderr.write(`codex-review: still running ${options.progressLabel} (${elapsed})...\n`);
+      }, heartbeatMs);
     }
 
     if (options.input) {
@@ -2702,6 +2734,54 @@ function getStatePath(repoRoot) {
   return path.join(getStateDirectory(), `${key}.json`);
 }
 
+function getCacheDirectory() {
+  return path.join(os.homedir(), '.codex', 'codex-review', 'cache');
+}
+
+function getCachePath(cacheKey) {
+  return path.join(getCacheDirectory(), `${cacheKey}.json`);
+}
+
+function stableSerialize(value) {
+  if (value === null || value === undefined) {
+    return 'null';
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerialize(item)).join(',')}]`;
+  }
+
+  if (typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableSerialize(value[key])}`).join(',')}}`;
+  }
+
+  return JSON.stringify(value);
+}
+
+function sha1(value) {
+  return crypto.createHash('sha1').update(String(value || '')).digest('hex');
+}
+
+function loadCacheEntry(cacheKey) {
+  const cachePath = getCachePath(cacheKey);
+
+  if (!fileExists(cachePath)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(safeReadFile(cachePath));
+  } catch (error) {
+    return null;
+  }
+}
+
+function saveCacheEntry(cacheKey, payload) {
+  const cacheDir = getCacheDirectory();
+  fs.mkdirSync(cacheDir, { recursive: true });
+  writeJsonFile(getCachePath(cacheKey), payload);
+}
+
 function normalizeFingerprintPart(value) {
   return String(value || '')
     .toLowerCase()
@@ -2771,15 +2851,39 @@ function saveReviewState(repoRoot, report) {
 }
 
 function buildConfidenceLabel(score) {
-  if (score >= 4) {
-    return 'high';
+  if (score >= 5) {
+    return 'very high';
+  }
+
+  if (score === 4) {
+    return 'merge-ready';
   }
 
   if (score === 3) {
-    return 'moderate';
+    return 'not merge-ready';
   }
 
   return 'low';
+}
+
+function isSafeToMerge(report) {
+  return Boolean(report && report.confidenceScore >= 4 && !report.findings.length);
+}
+
+function deriveVerdictFromScore(report) {
+  if (!report) {
+    return 'COMMENT';
+  }
+
+  if (isSafeToMerge(report)) {
+    return 'APPROVE';
+  }
+
+  if (report.findings && report.findings.length) {
+    return 'REQUEST_CHANGES';
+  }
+
+  return report.verdict || 'COMMENT';
 }
 
 function buildFindingSummary(findings) {
@@ -2983,7 +3087,7 @@ function buildNarrativeSummary(report) {
     }
 
     if (report.findings.length) {
-      const remainingLabel = report.verdict === 'REQUEST_CHANGES' ? 'blocking finding(s) remain' : 'finding(s) remain';
+      const remainingLabel = report.verdict === 'REQUEST_CHANGES' ? 'merge-blocking finding(s) remain' : 'finding(s) remain';
       parts.push(`${report.findings.length} ${remainingLabel}`);
     } else {
       parts.push('blocking findings cleared');
@@ -3020,7 +3124,7 @@ function buildPrReviewSummary(report) {
       return 'The follow-up changes address the previously confirmed blockers. The reviewed diff is ready to merge.';
     }
 
-    if (blockerCount) {
+    if (report.confidenceScore <= 3 || blockerCount) {
       const resolved = report.recheck.cleared.length;
       const opening = resolved
         ? `The follow-up changes resolved ${resolved} previously confirmed issue(s), but merge-blocking issues still remain.`
@@ -3035,7 +3139,7 @@ function buildPrReviewSummary(report) {
     return 'The implementation looks good. No confirmed issues were found in the reviewed changes.';
   }
 
-  if (blockerCount) {
+  if (report.confidenceScore <= 3 || blockerCount) {
     return 'The implementation is close, but there are merge-blocking issues to resolve before this PR is ready.';
   }
 
@@ -3572,7 +3676,7 @@ function renderDebuggerMarkdown(report) {
     '',
     `- Merge stance: \`${report.verdict}\``,
     `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
-    `- Safe to merge: ${report.confidenceScore >= 4 && !report.findings.length ? 'yes' : 'no'}`,
+    `- Safe to merge: ${isSafeToMerge(report) ? 'yes' : 'no'}`,
     '',
     '| Severity | Count |',
     '| --- | ---: |',
@@ -3705,7 +3809,7 @@ function renderPluginAuditMarkdown(report) {
     '',
     `- Merge stance: \`${report.verdict}\``,
     `- Confidence Score: \`${report.confidenceScore}/5\` (${buildConfidenceLabel(report.confidenceScore)})`,
-    `- Safe to merge: ${report.confidenceScore >= 4 && !report.findings.length ? 'yes' : 'no'}`,
+    `- Safe to merge: ${isSafeToMerge(report) ? 'yes' : 'no'}`,
     '',
     '| Severity | Count |',
     '| --- | ---: |',
@@ -3996,9 +4100,9 @@ function renderPrReview(report) {
 
   lines.push('', '### Findings', '');
 
-  if (!displayFindings.length) {
+  if (isSafeToMerge(report)) {
     lines.push('Safe to merge.');
-  } else if (blockerCount) {
+  } else if (report.confidenceScore <= 3 || blockerCount) {
     lines.push('Needs changes before merge.');
   } else {
     lines.push('No confirmed merge blockers remain, but there are still issues worth resolving.');
@@ -4012,7 +4116,7 @@ function renderPrReview(report) {
   }
 
   lines.push('', `### Confidence Score: ${report.confidenceScore}/5`, '');
-  lines.push(`  * Merge stance: \`${report.verdict.replace('_', ' ')}\`${blockerCount ? ` with ${blockerCount} confirmed blocker-level finding(s).` : ' with no confirmed blocker-level findings.'}`);
+  lines.push(`  * Merge stance: \`${report.verdict.replace('_', ' ')}\`${(report.confidenceScore <= 3 || blockerCount) ? ' because the current review is not safe to merge.' : (isSafeToMerge(report) ? ' and the current review is safe to merge.' : ' with no confirmed blocker-level findings.')}`);
   lines.push(`  * Verification confirmed ${counts.critical} Critical and ${counts.important} Important finding(s) in the changed files.${report.keyChanges.length ? ` ${report.keyChanges[0]}` : ''}`);
 
   if (report.reviewedCommit) {
@@ -4104,7 +4208,7 @@ function renderGitHub(report) {
 
   lines.push(`<h3>Confidence Score: ${report.confidenceScore}/5</h3>`);
   lines.push('<ul>');
-  lines.push(`<li>Merge stance: <code>${report.verdict}</code>${blockerCount ? ` with ${blockerCount} confirmed blocker-level finding(s).` : ' with no confirmed blocker-level findings.'}</li>`);
+  lines.push(`<li>Merge stance: <code>${report.verdict}</code>${(report.confidenceScore <= 3 || blockerCount) ? ' because the current review is not safe to merge.' : (isSafeToMerge(report) ? ' and the current review is safe to merge.' : ' with no confirmed blocker-level findings.')}</li>`);
   lines.push(`<li>Verification confirmed ${counts.critical} Critical, ${counts.important} Important, ${counts.medium} Medium, and ${counts.low} Low finding(s) in the changed files.</li>`);
   lines.push('</ul>');
 
@@ -4898,16 +5002,24 @@ async function runRenderedAccessibilityScanAsync(options, cwd) {
   }
 }
 
-function collectFileContexts(reviewContext, fileEntries, highRiskPaths, extraFiles = []) {
+function collectFileContexts(reviewContext, fileEntries, highRiskPaths, extraFiles = [], excerptOptions = {}) {
   const seenPaths = new Set();
   const contextEntries = [];
+  const includeContent = excerptOptions.includeContent !== false;
+  const baseChars = Number.isFinite(excerptOptions.baseChars) ? excerptOptions.baseChars : 8000;
+  const currentChars = Number.isFinite(excerptOptions.currentChars) ? excerptOptions.currentChars : 12000;
+  const extraBaseChars = Number.isFinite(excerptOptions.extraBaseChars) ? excerptOptions.extraBaseChars : baseChars;
+  const extraCurrentChars = Number.isFinite(excerptOptions.extraCurrentChars) ? excerptOptions.extraCurrentChars : currentChars;
 
   fileEntries.forEach((entry) => {
     if (!entry || !entry.path || seenPaths.has(entry.path)) {
       return;
     }
     seenPaths.add(entry.path);
-    contextEntries.push(entry);
+    contextEntries.push({
+      ...entry,
+      isExtraContext: false
+    });
   });
 
   extraFiles.forEach((filePath) => {
@@ -4915,19 +5027,21 @@ function collectFileContexts(reviewContext, fileEntries, highRiskPaths, extraFil
       return;
     }
     seenPaths.add(filePath);
-    contextEntries.push({ path: filePath, status: '  ' });
+    contextEntries.push({ path: filePath, status: '  ', isExtraContext: true });
   });
 
   return contextEntries.map((entry) => {
     const filePath = entry.path;
     const changedLines = getChangedLinesForContext(reviewContext, filePath);
-    const baseContent = getBaseContentForContext(reviewContext, filePath);
-    const currentContent = getCurrentContentForContext(reviewContext, filePath);
+    const baseContent = includeContent ? getBaseContentForContext(reviewContext, filePath) : '';
+    const currentContent = includeContent ? getCurrentContentForContext(reviewContext, filePath) : '';
+    const entryBaseChars = entry.isExtraContext ? extraBaseChars : baseChars;
+    const entryCurrentChars = entry.isExtraContext ? extraCurrentChars : currentChars;
     return {
       path: filePath,
       highRisk: isHighRiskPath(filePath, highRiskPaths),
-      base: buildTargetedContextExcerpt(baseContent, filePath, changedLines, 8000),
-      current: buildTargetedContextExcerpt(currentContent, filePath, changedLines, 12000),
+      base: includeContent ? buildTargetedContextExcerpt(baseContent, filePath, changedLines, entryBaseChars) : '',
+      current: includeContent ? buildTargetedContextExcerpt(currentContent, filePath, changedLines, entryCurrentChars) : '',
       changedLines: changedLines.slice(0, 80)
     };
   });
@@ -4976,6 +5090,7 @@ function buildPrompt(payload) {
     'Use repo-local review_signals as concrete prompts for which lifecycle handlers, hot paths, persistence boundaries, security boundaries, and accessibility checks deserve extra scrutiny.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
+    'Keep the pass focused. Do not restate issues from other files unless they are required to explain the current workflow or contract risk.',
     '',
     'Severity rules:',
     '- critical: confirmed security issue, destructive data corruption, or severe payment flaw',
@@ -4992,6 +5107,8 @@ function buildPrompt(payload) {
     ...(workflowInstructions.length ? [''] : []),
     `Review mode: ${payload.mode}`,
     `Base ref: ${payload.baseRef}`,
+    `Review pass: ${payload.passLabel || 'full review'}`,
+    `Pass focus: ${payload.passFocus || 'general'}`,
     '',
     'Product profile:',
     JSON.stringify(payload.productProfile || null, null, 2),
@@ -5123,6 +5240,221 @@ function resolveExtraContextFiles(reviewContext, options) {
   };
 }
 
+function chunkArray(items, size) {
+  if (!Array.isArray(items) || !items.length) {
+    return [];
+  }
+
+  const chunkSize = Math.max(1, size || 1);
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(items.slice(index, index + chunkSize));
+  }
+
+  return chunks;
+}
+
+function getCodexBatchSize(reviewDepth, changedFileCount) {
+  if (changedFileCount <= 6) {
+    return 1;
+  }
+
+  return reviewDepth === 'thorough' ? CODEX_BATCH_SIZE.thorough : CODEX_BATCH_SIZE.balanced;
+}
+
+function getCodexDeepFileLimit(reviewDepth, changedFileCount) {
+  if (changedFileCount <= 3) {
+    return changedFileCount;
+  }
+
+  return reviewDepth === 'thorough' ? 3 : 2;
+}
+
+function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions) {
+  if (!entry || !entry.path) {
+    return false;
+  }
+
+  const filePath = entry.path;
+  const changedLines = getChangedLinesForContext(reviewContext, filePath).length;
+  const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
+  const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
+
+  if (resolvedOptions.files.includes(filePath)) {
+    return true;
+  }
+
+  if (hasHotspot || hasOutsideDiffFollowup || isHighRiskPath(filePath, resolvedOptions.highRiskPaths)) {
+    return true;
+  }
+
+  if (isStyleFile(filePath)) {
+    return hasHotspot;
+  }
+
+  return changedLines >= 8;
+}
+
+function getDeepCodexCandidateScore(entry, reviewContext, heuristicSeed, resolvedOptions) {
+  if (!entry || !entry.path) {
+    return -1;
+  }
+
+  const filePath = entry.path;
+  const changedLines = getChangedLinesForContext(reviewContext, filePath).length;
+  const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
+  const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
+  const isHighRisk = isHighRiskPath(filePath, resolvedOptions.highRiskPaths);
+  let score = changedLines;
+
+  if (hasHotspot) {
+    score += 400;
+  }
+
+  if (hasOutsideDiffFollowup) {
+    score += 150;
+  }
+
+  if (isHighRisk) {
+    score += 120;
+  }
+
+  if (isStyleFile(filePath)) {
+    score -= 80;
+  }
+
+  return score;
+}
+
+function getBatchContextFiles(batchEntries, options, matchedRules, includeGlobalContextFiles) {
+  const batchPaths = new Set(batchEntries.map((entry) => entry.path));
+  const files = new Set(includeGlobalContextFiles ? (options.contextFiles || []) : []);
+
+  (matchedRules || []).forEach((rule) => {
+    if (!(rule.matchedFiles || []).some((filePath) => batchPaths.has(filePath))) {
+      return;
+    }
+
+    (rule.include || []).forEach((filePath) => files.add(filePath));
+  });
+
+  return Array.from(files);
+}
+
+function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entries, diffText, extraFiles, matchedRules, excerptOptions, passLabel, passFocus) {
+  return {
+    mode: resolvedOptions.mode,
+    baseRef: reviewContext.baseRef || '--staged',
+    productProfile: reviewContext.productProfile,
+    focusAreas: resolvedOptions.focusAreas,
+    criticalPaths: resolvedOptions.criticalPaths,
+    reviewSignals: resolvedOptions.reviewSignals,
+    matchedContextRules: matchedRules,
+    edgeCases: resolvedOptions.edgeCases,
+    instructions: reviewContext.instructions,
+    heuristicHotspots: heuristicSeed.findings
+      .filter((finding) => entries.some((entry) => entry.path === finding.file))
+      .slice(0, 8)
+      .map((finding) => ({
+        severity: finding.severity,
+        file: finding.file,
+        line: finding.line,
+        title: finding.title
+      })),
+    diffStats: {
+      files: reviewContext.fileEntries.length,
+      codexScopedFiles: entries.length,
+      testsChanged: getChangedTestFiles(reviewContext.fileEntries).length
+    },
+    workflow: resolvedOptions.workflow,
+    passLabel,
+    passFocus,
+    diffText,
+    fileContexts: collectFileContexts(reviewContext, entries, resolvedOptions.highRiskPaths, extraFiles, excerptOptions)
+  };
+}
+
+function buildCodexPassCacheKey(prompt, options, cwd) {
+  return sha1(stableSerialize({
+    version: 1,
+    cwd: path.resolve(cwd),
+    model: options.model || null,
+    prompt,
+    schema: REVIEW_SCHEMA
+  }));
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  const values = new Array(items.length);
+  const limit = Math.max(1, concurrency || 1);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      values[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return values;
+}
+
+function mergeCodexResultSets(results, notes) {
+  const findings = [];
+  const outsideDiffFindings = [];
+  const keyChanges = [];
+  const stageSummaries = [];
+  let totalDurationMs = 0;
+
+  (results || []).forEach((result) => {
+    (result.findings || []).forEach((finding) => pushFinding(findings, finding));
+    (result.outsideDiffFindings || []).forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
+    (result.keyChanges || []).forEach((change) => {
+      if (!change || keyChanges.includes(change)) {
+        return;
+      }
+      keyChanges.push(change);
+    });
+
+    (result.stageSummaries || []).forEach((stage) => {
+      stageSummaries.push(stage);
+      totalDurationMs += stage.durationMs || 0;
+    });
+  });
+
+  const rankedFindings = rankFindings(findings);
+  const verdict = buildVerdict(rankedFindings);
+  const confidenceScore = buildConfidence(rankedFindings);
+  const mergedNotes = (notes || []).slice();
+
+  if (results.length > 1) {
+    mergedNotes.push(`Codex review ran in ${results.length} pass(es) to keep each analysis scope focused and responsive.`);
+  }
+
+  return {
+    engine: 'codex',
+    fallbackUsed: false,
+    notes: mergedNotes,
+    verdict,
+    confidenceScore,
+    summary: null,
+    keyChanges: keyChanges.slice(0, 2),
+    findings: rankedFindings,
+    outsideDiffFindings,
+    stageSummaries: stageSummaries.length ? [{
+      name: 'codex',
+      status: 'completed',
+      durationMs: totalDurationMs,
+      findings: rankedFindings.length,
+      passes: results.length
+    }] : []
+  };
+}
+
 function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
   const limit = options.reviewDepth === 'thorough' ? CODEX_FILE_LIMITS.thorough : CODEX_FILE_LIMITS.balanced;
   return reviewContext.fileEntries
@@ -5206,6 +5538,18 @@ async function runCodexReviewAsync(payload, options, cwd) {
   const schemaPath = path.join(tempDir, 'schema.json');
   const outputPath = path.join(tempDir, 'output.json');
   const prompt = buildPrompt(payload);
+  const cacheKey = buildCodexPassCacheKey(prompt, options, cwd);
+  const cachedEntry = loadCacheEntry(cacheKey);
+
+  if (cachedEntry && cachedEntry.result) {
+    if (options.codexProgressLabel) {
+      logProgress(`codex-review: using cached result for ${options.codexProgressLabel}.`);
+    }
+    return {
+      ...cachedEntry.result,
+      cacheHit: true
+    };
+  }
 
   writeJsonFile(schemaPath, REVIEW_SCHEMA);
 
@@ -5237,11 +5581,13 @@ async function runCodexReviewAsync(payload, options, cwd) {
       cwd,
       input: prompt,
       maxBuffer: 32 * 1024 * 1024,
-      timeout: options.codexTimeoutMs || undefined
+      timeout: options.codexTimeoutMs || undefined,
+      progressLabel: options.codexProgressLabel || null,
+      heartbeatMs: options.codexHeartbeatMs || 30000
     });
 
     const parsed = JSON.parse(safeReadFile(outputPath));
-    return {
+    const result = {
       engine: 'codex',
       fallbackUsed: false,
       notes: [],
@@ -5252,9 +5598,136 @@ async function runCodexReviewAsync(payload, options, cwd) {
       findings: (parsed.findings || []).map(normalizeCodexFinding),
       outsideDiffFindings: (parsed.outside_diff_findings || []).map(normalizeOutsideDiffFinding)
     };
+    saveCacheEntry(cacheKey, {
+      savedAt: new Date().toISOString(),
+      result
+    });
+    return {
+      ...result,
+      cacheHit: false
+    };
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolvedOptions, extraContext, selectedEntries, notes, cwd) {
+  const changedEntries = selectedEntries.slice().sort((left, right) => left.path.localeCompare(right.path));
+  const deepCandidates = selectedEntries
+    .filter((entry) => shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions))
+    .sort((left, right) => {
+      const scoreDiff = getDeepCodexCandidateScore(right, reviewContext, heuristicSeed, resolvedOptions)
+        - getDeepCodexCandidateScore(left, reviewContext, heuristicSeed, resolvedOptions);
+      if (scoreDiff !== 0) {
+        return scoreDiff;
+      }
+      return left.path.localeCompare(right.path);
+    });
+  const deepEntries = deepCandidates
+    .slice(0, getCodexDeepFileLimit(resolvedOptions.reviewDepth, changedEntries.length))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const deepBatchSize = getCodexBatchSize(resolvedOptions.reviewDepth, deepEntries.length);
+  const deepBatches = chunkArray(deepEntries, deepBatchSize);
+  const totalPasses = deepBatches.length + 1;
+  const passResults = [];
+  let cachedPassCount = 0;
+
+  if (deepEntries.length < changedEntries.length) {
+    notes.push(`Deep Codex passes focused on ${deepEntries.length} highest-signal file(s); the overview pass still covered all ${changedEntries.length} scoped file(s).`);
+  }
+
+  const overviewPayload = buildCodexPayload(
+    reviewContext,
+    resolvedOptions,
+    heuristicSeed,
+    changedEntries,
+    truncateText(getScopedDiffFromIndex(reviewContext.diffIndex, changedEntries.map((entry) => entry.path)), 22000),
+    [],
+    extraContext.matchedRules,
+    {
+      ...CODEX_CONTEXT_BUDGETS.overview,
+      includeContent: false
+    },
+    'overview',
+    'Cross-file workflow, persistence, lifecycle, and blocker-level contract analysis across the full diff.'
+  );
+
+  logProgress(`codex-review: Codex pass 1/${totalPasses} overview across ${changedEntries.length} file(s)...`);
+  {
+    const startedAt = Date.now();
+    const overviewResult = await runCodexReviewAsync(overviewPayload, {
+      ...resolvedOptions,
+      codexProgressLabel: `Codex overview pass 1/${totalPasses}`
+    }, cwd);
+    if (overviewResult.cacheHit) {
+      cachedPassCount += 1;
+    }
+    overviewResult.stageSummaries = [{
+      name: 'codex_overview',
+      status: overviewResult.cacheHit ? 'cached' : 'completed',
+      durationMs: Date.now() - startedAt,
+      findings: (overviewResult.findings || []).length
+    }];
+    passResults.push(overviewResult);
+  }
+
+  if (deepBatches.length) {
+    deepBatches.forEach((batchEntries, index) => {
+      logProgress(`codex-review: Codex pass ${index + 2}/${totalPasses} deep review for ${batchEntries.length} file(s)...`);
+    });
+
+    const deepResults = await mapWithConcurrency(
+      deepBatches.map((batchEntries, index) => ({ batchEntries, index })),
+      CODEX_DEEP_CONCURRENCY,
+      async ({ batchEntries, index }) => {
+        const batchFiles = batchEntries.map((entry) => entry.path);
+        const batchPayload = buildCodexPayload(
+          reviewContext,
+          resolvedOptions,
+          heuristicSeed,
+          batchEntries,
+          truncateText(getScopedDiffFromIndex(reviewContext.diffIndex, batchFiles), 14000),
+          getBatchContextFiles(batchEntries, resolvedOptions, extraContext.matchedRules, false),
+          extraContext.matchedRules.filter((rule) => (rule.matchedFiles || []).some((filePath) => batchFiles.includes(filePath))),
+          CODEX_CONTEXT_BUDGETS.deep,
+          `deep batch ${index + 1}`,
+          `Deep localized analysis of ${batchFiles.join(', ')} with lifecycle, performance, accessibility, and persistence tracing.`
+        );
+
+        const startedAt = Date.now();
+        const batchResult = await runCodexReviewAsync(batchPayload, {
+          ...resolvedOptions,
+          codexProgressLabel: `Codex deep pass ${index + 2}/${totalPasses}`
+        }, cwd);
+        if (batchResult.cacheHit) {
+          cachedPassCount += 1;
+        }
+        batchResult.stageSummaries = [{
+          name: 'codex_deep',
+          status: batchResult.cacheHit ? 'cached' : 'completed',
+          durationMs: Date.now() - startedAt,
+          findings: (batchResult.findings || []).length,
+          files: batchFiles
+        }];
+        return {
+          index,
+          result: batchResult
+        };
+      }
+    );
+
+    deepResults
+      .sort((left, right) => left.index - right.index)
+      .forEach((item) => {
+        passResults.push(item.result);
+      });
+  }
+
+  if (cachedPassCount) {
+    notes.push(`Reused ${cachedPassCount} cached Codex pass result(s) for identical prompt scopes.`);
+  }
+
+  return mergeCodexResultSets(passResults, notes);
 }
 
 function isCodexTimeoutError(error) {
@@ -5440,6 +5913,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     codexReviewedFilesCount: report.scope.codexReviewedFiles ? report.scope.codexReviewedFiles.length : 0,
     highRiskTouched: fileEntries.some((entry) => isHighRiskPath(entry.path, options.highRiskPaths))
   });
+  report.verdict = deriveVerdictFromScore(report);
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit, report);
 
@@ -5635,54 +6109,26 @@ async function createReviewReport(options, cwd = process.cwd()) {
     }
 
     const selectedEntries = selectCodexFileEntries(reviewContext, heuristicSeed, resolvedOptions);
-    const selectedDiff = getScopedDiffFromIndex(reviewContext.diffIndex, selectedEntries.map((entry) => entry.path));
 
     if (selectedEntries.length < reviewContext.fileEntries.length) {
       notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for ${resolvedOptions.reviewDepth} review depth.`);
     }
 
-    logProgress(`codex-review: running isolated Codex review over ${selectedEntries.length} file(s)...`);
-
-    const payload = {
-      mode: resolvedOptions.mode,
-      baseRef: reviewContext.baseRef || '--staged',
-      productProfile: reviewContext.productProfile,
-      focusAreas: resolvedOptions.focusAreas,
-      criticalPaths: resolvedOptions.criticalPaths,
-      reviewSignals: resolvedOptions.reviewSignals,
-      matchedContextRules: extraContext.matchedRules,
-      edgeCases: resolvedOptions.edgeCases,
-      instructions: reviewContext.instructions,
-      heuristicHotspots: heuristicSeed.findings.slice(0, 8).map((finding) => ({
-        severity: finding.severity,
-        file: finding.file,
-        line: finding.line,
-        title: finding.title
-      })),
-      diffStats: {
-        files: reviewContext.fileEntries.length,
-        codexScopedFiles: selectedEntries.length,
-        testsChanged: getChangedTestFiles(reviewContext.fileEntries).length
-      },
-      workflow: resolvedOptions.workflow,
-      diffText: truncateText(selectedDiff, 30000),
-      fileContexts: collectFileContexts(reviewContext, selectedEntries, resolvedOptions.highRiskPaths, extraContext.files)
-    };
+    logProgress(`codex-review: running multi-pass Codex review over ${selectedEntries.length} scoped file(s)...`);
 
     try {
       const [codexOutcome, runtimeOutcome, semgrepOutcome, phpstanOutcome, eslintOutcome] = await Promise.all([
         toSettledPromise((async () => {
-          const startedAt = Date.now();
-          const result = await runCodexReviewAsync(payload, resolvedOptions, cwd);
-          return {
-            ...result,
-            stageSummaries: [{
-              name: 'codex',
-              status: 'completed',
-              durationMs: Date.now() - startedAt,
-              findings: (result.findings || []).length
-            }]
-          };
+          const result = await runCodexMultiPassReviewAsync(
+            reviewContext,
+            heuristicSeed,
+            resolvedOptions,
+            extraContext,
+            selectedEntries,
+            notes,
+            cwd
+          );
+          return result;
         })()),
         runtimeScanPromise,
         semgrepPromise,
@@ -5698,7 +6144,6 @@ async function createReviewReport(options, cwd = process.cwd()) {
       const semgrepResult = unwrapSettledResult(semgrepOutcome, 'Semgrep scan failed');
       const phpstanResult = unwrapSettledResult(phpstanOutcome, 'PHPStan scan failed');
       const eslintResult = unwrapSettledResult(eslintOutcome, 'ESLint scan failed');
-      codexResult.notes = notes.slice();
       codexResult.codexReviewedFiles = selectedEntries.map((entry) => entry.path);
       return buildFinalReport(
         resolvedOptions,

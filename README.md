@@ -50,7 +50,7 @@ The second run is meant to behave like a re-review after fix commits: only the r
 ## Score Meaning
 
 - `5/5` or `4/5`: safe to merge
-- `3/5`: issues remain
+- `3/5`: not safe to merge; changes still need review fixes
 - `2/5`: major issues
 
 ## Output Shape
