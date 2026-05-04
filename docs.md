@@ -30,6 +30,14 @@ Default behavior:
 - heuristic fallback when Codex is unavailable or fails
 - extra static/runtime stages when available and enabled
 
+Internal runtime behavior:
+
+- `codex-review` is the only command most users need
+- the Codex stage runs as a small overview pass plus a few focused deep passes
+- deep Codex passes can run concurrently after the overview pass
+- long Codex passes print heartbeat progress to stderr
+- identical reruns can reuse cached Codex pass results
+
 ## Installation
 
 ```bash
@@ -79,6 +87,13 @@ The normal output is intentionally PR-like:
 - merge stance
 
 This is the intended day-to-day format.
+
+## Performance Notes
+
+- the slowest step is usually the Codex overview pass, not local git or YAML processing
+- reruns are often much faster because cached Codex pass results can be reused
+- only `4/5` and `5/5` are safe to merge
+- a `3/5` review is intentionally treated as not merge-ready
 
 ## Useful Commands
 

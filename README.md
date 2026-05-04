@@ -21,6 +21,13 @@ That is the normal command now. It defaults to:
 - heuristic fallback when Codex is unavailable or fails
 - Semgrep, PHPStan, ESLint, and rendered accessibility checks when enabled/configured
 
+Internal behavior:
+
+- `codex-review` is still one command
+- Codex review now runs in smaller internal passes instead of one monolithic prompt
+- long Codex passes print heartbeat progress so they do not look hung
+- identical reruns can reuse cached Codex pass results and return much faster
+
 ## Install
 
 ```bash
