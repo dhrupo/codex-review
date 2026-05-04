@@ -347,7 +347,7 @@ async function runCommandAsync(command, args, options = {}) {
       }, options.timeout);
     }
 
-    if (options.progressLabel && process.stderr && process.stderr.isTTY && process.env.CODEX_REVIEW_SILENT !== '1') {
+    if (options.progressLabel && process.stderr && process.env.CODEX_REVIEW_SILENT !== '1') {
       const heartbeatMs = Math.max(15000, options.heartbeatMs || 30000);
       const startedAt = Date.now();
       heartbeatId = setInterval(() => {
@@ -4909,7 +4909,7 @@ function moduleExists(moduleName) {
 }
 
 function logProgress(message) {
-  if (!process.stderr || !process.stderr.isTTY || process.env.CODEX_REVIEW_SILENT === '1') {
+  if (!process.stderr || process.env.CODEX_REVIEW_SILENT === '1') {
     return;
   }
 
