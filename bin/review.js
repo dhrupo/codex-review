@@ -13,52 +13,25 @@ function printHelp() {
 
   Usage:
     codex-review
+    codex-review > pr-review.md
 
-  Options:
-    --base <ref>           Base ref to diff against
-    --head <ref>           Head ref to diff against (default: HEAD)
-    --staged               Review staged changes only
-    --files <a,b,c>        Review only specific files
-    --workflow <name>      Advanced workflow preset: debugger or plugin-audit
-    --mode <name>          Review mode: full, security, performance, compatibility, accessibility
-    --engine <name>        Review engine: auto, codex, heuristic
-    --model <name>         Codex model override for engine=auto or codex
-    --thorough             Explicitly force thorough review depth
-    --review-depth <name>  Review depth: balanced or thorough (default: thorough)
-    --semgrep              Force-enable Semgrep if the CLI is installed
-    --no-semgrep           Disable the Semgrep stage
-    --semgrep-config <id>  Semgrep config to run alongside Codex (default: auto)
-    --semgrep-timeout <ms> Timeout for the Semgrep scan
-    --phpstan              Force-enable PHPStan if vendor/bin or global phpstan exists
-    --no-phpstan           Disable the PHPStan stage
-    --phpstan-config <id>  PHPStan config file path (default: auto)
-    --phpstan-timeout <ms> Timeout for the PHPStan scan
-    --eslint               Force-enable ESLint if node_modules/.bin or global eslint exists
-    --no-eslint            Disable the ESLint stage
-    --eslint-config <id>   ESLint config file path (default: auto)
-    --eslint-timeout <ms>  Timeout for the ESLint scan
-    --a11y-url <url>       Scan one rendered URL with Playwright + axe (repeatable)
-    --a11y-urls <a,b>      Scan multiple rendered URLs with Playwright + axe
-    --a11y-wait-for <sel>  Wait for a selector before running the accessibility scan
-    --a11y-timeout <ms>    Timeout for page load and selector waits during a11y scan
-    --a11y-storage-state <path>
-                           Optional Playwright storage state JSON for authenticated scans
-    --reviewdog-report <path>
-                           Write merged findings as reviewdog rdjson
-    --format <name>        Output format: pr-review, text, markdown, github, json, rdjson
-    --report <path>        Write the rendered report to a file
-    --max-findings <n>     Limit the number of findings in the output
-    --fail-on <severity>   Exit non-zero for low, medium, important, or critical findings
-    -h, --help             Show help
-    -v, --version          Show version
+  Normal use:
+    codex-review               Print the PR-review to the terminal
+    codex-review > pr-review.md
+                               Save the same PR-review output to a file
 
-  Default behavior:
-    codex-review
-      deep local pre-PR review with the PR-review format, Codex when available, and all enabled static/runtime stages
+  Common flags:
+    --base <ref>              Base ref to diff against
+    --engine <name>           Review engine: auto, codex, heuristic
+    --fail-on <severity>      Exit non-zero for low, medium, important, or critical findings
+    -h, --help                Show help
+    -v, --version             Show version
 
-  Advanced optional workflows:
-    codex-review --workflow debugger
-    codex-review --workflow plugin-audit
+  Notes:
+    Default output format is pr-review.
+    Advanced flags still exist, but the normal workflow should stay on the two commands above.
+    If you prefer built-in file writing over shell redirection, --report <path> is still available.
+    Repo-specific defaults belong in .codex/reviewer.yml.
 `);
 }
 

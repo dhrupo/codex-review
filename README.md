@@ -2,31 +2,32 @@
 
 Local pre-PR reviewer for WPManageNinja WordPress plugin repositories.
 
-`codex-review` is a custom wrapper around local heuristics, Codex CLI, and optional static/runtime checks. It is designed to behave like a concise PR review before you open or update the PR.
+`codex-review` is a local reviewer that prints a concise PR-style review before you open or update a pull request.
 
 Full documentation: [docs.md](./docs.md)  
 Setup guide: [SETUP.md](./SETUP.md)
 
-## What To Run
+## Normal Use
 
 ```bash
 codex-review
 ```
 
-That is the normal command now. It defaults to:
+If you want the same review saved to a file:
 
-- thorough review depth
-- PR-review style output
-- Codex review when available
-- heuristic fallback when Codex is unavailable or fails
-- Semgrep, PHPStan, ESLint, and rendered accessibility checks when enabled/configured
+```bash
+codex-review > pr-review.md
+```
 
-Internal behavior:
+That is the intended day-to-day workflow.
 
-- `codex-review` is still one command
-- Codex review now runs in smaller internal passes instead of one monolithic prompt
-- long Codex passes print heartbeat progress so they do not look hung
-- identical reruns can reuse cached Codex pass results and return much faster
+By default, `codex-review` aims to:
+
+- review the current diff against the repo base branch
+- print PR-review style output to stdout
+- use Codex when available
+- fall back safely when Codex is unavailable
+- use `code-review-graph` for file impact and scoping when installed
 
 ## Install
 
@@ -43,16 +44,21 @@ Then from any supported repo:
 codex-review
 ```
 
+Optional but recommended:
+
+```bash
+pip install code-review-graph
+```
+
 ## Daily Workflow
 
 1. Make your code changes.
 2. Run `codex-review`.
 3. Fix the findings.
 4. Commit.
-5. Run `codex-review` again.
-6. Read the follow-up review.
+5. Run `codex-review` again or save it with `codex-review > pr-review.md`.
 
-The second run is meant to behave like a re-review after fix commits: only the remaining blockers should stay visible, or the diff should be marked safe to merge.
+The follow-up run is meant to behave like a re-review: remaining blockers stay visible, cleared findings drop out, and clean diffs should read as safe to merge.
 
 ## Score Meaning
 
@@ -81,6 +87,7 @@ Start from:
 Repo-local config is where you tune:
 
 - base branch
+- code-review-graph usage and timeout
 - accessibility URLs
 - high-risk paths
 - critical paths
@@ -100,8 +107,8 @@ Typical WPManageNinja repos include:
 - `fluent-player`
 - `fluent-player-pro`
 
-## Advanced Use
+## Notes
 
-Most users should stop at `codex-review`.
-
-If you need the full reference, examples, config guide, output details, advanced workflows, and architecture notes, use [docs.md](./docs.md).
+- Most users should stop at `codex-review`.
+- Saving to Markdown does not need a separate flag; shell redirection is the simplest pattern.
+- If you need compact notes on config, fallback behavior, or advanced modes, use [docs.md](./docs.md).

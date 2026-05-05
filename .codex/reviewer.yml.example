@@ -87,6 +87,9 @@ codex:
     - app/Services/**
     - resources/assets/**
     - src/**
+code_review_graph:
+  enabled: true
+  timeout_ms: 120000
 semgrep:
   enabled: true
   config: auto

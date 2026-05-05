@@ -6,37 +6,44 @@ Back to the short entry point: [README.md](./README.md)
 
 `codex-review` is a local pre-PR reviewer for WPManageNinja WordPress plugin repositories.
 
-It is a custom local reviewer maintained in this repo. It is not an official Codex review library.
+It is maintained in this repo and is meant to read like a concise PR review, not a raw linter dump.
 
-It combines:
-
-- heuristic review for fast local checks
-- Codex CLI-backed review for deeper reasoning
-- optional Semgrep, PHPStan, and ESLint stages
-- optional Playwright + axe rendered accessibility checks
-- re-review state so a later run after fix commits behaves like a follow-up review
-
-## Default Command
+## Two Normal Commands
 
 ```bash
 codex-review
 ```
 
-Default behavior:
+```bash
+codex-review > pr-review.md
+```
 
-- thorough review depth
-- PR-review output format
-- Codex review when available
-- heuristic fallback when Codex is unavailable or fails
-- extra static/runtime stages when available and enabled
+Use the first command when you want the review in the terminal. Use the second when you want the same output captured in a Markdown file.
 
-Internal runtime behavior:
+That is the main workflow. The docs below only explain how that command behaves and where to tweak it when needed.
 
-- `codex-review` is the only command most users need
-- the Codex stage runs as a small overview pass plus a few focused deep passes
-- deep Codex passes can run concurrently after the overview pass
-- long Codex passes print heartbeat progress to stderr
-- identical reruns can reuse cached Codex pass results
+## What The Default Run Does
+
+By default, `codex-review` tries to:
+
+- review the current diff against the configured base branch
+- print PR-review style output to stdout
+- use Codex for deeper review when available
+- use `code-review-graph` for impact scoping when installed
+- fall back to local review logic when Codex is unavailable or fails
+- include extra configured checks when the repo enables them
+
+Internally, the tool may still use multiple passes and optional helper stages, but you should not need extra commands for normal use.
+
+## Output Shape
+
+The normal output is intentionally short:
+
+- `Summary`
+- `Key changes`
+- `Findings`
+- `Confidence Score`
+- merge stance
 
 ## Installation
 
@@ -47,18 +54,13 @@ npm install
 npm link
 ```
 
-Confirm:
+Recommended:
 
 ```bash
-codex-review --help
-codex --help
+pip install code-review-graph
 ```
 
-If Codex CLI is unavailable, you can still use:
-
-```bash
-codex-review --engine heuristic
-```
+`code-review-graph` is optional, but it improves changed-file scoping and file-level impact context.
 
 ## Recommended Workflow
 
@@ -67,7 +69,9 @@ codex-review --engine heuristic
 3. Fix the findings.
 4. Commit the fix.
 5. Run `codex-review` again.
-6. Expect the second run to show only remaining blockers or mark the diff safe to merge.
+6. If you need to share or keep the result, run `codex-review > pr-review.md`.
+
+The follow-up run is intended to behave like a re-review, not a brand-new review.
 
 ## Score Meaning
 
@@ -75,71 +79,6 @@ codex-review --engine heuristic
 - `4/5`: clean review, safe to merge
 - `3/5`: not safe to merge; changes still need review fixes
 - `2/5`: major issues
-
-## Default Output
-
-The normal output is intentionally PR-like:
-
-- `Summary`
-- `Key changes`
-- `Findings`
-- `Confidence Score`
-- merge stance
-
-This is the intended day-to-day format.
-
-## Performance Notes
-
-- the slowest step is usually the Codex overview pass, not local git or YAML processing
-- reruns are often much faster because cached Codex pass results can be reused
-- only `4/5` and `5/5` are safe to merge
-- a `3/5` review is intentionally treated as not merge-ready
-
-## Useful Commands
-
-Base review against a specific branch:
-
-```bash
-codex-review --base origin/dev
-```
-
-Heuristic-only review:
-
-```bash
-codex-review --engine heuristic
-```
-
-Markdown report:
-
-```bash
-codex-review --format markdown --report codex-review.md
-```
-
-JSON report:
-
-```bash
-codex-review --format json
-```
-
-Review staged changes only:
-
-```bash
-codex-review --staged
-```
-
-Review only specific files:
-
-```bash
-codex-review --files app/Http/Routes/api.php,app/Services/Form/Updater.php
-```
-
-Rendered accessibility scan:
-
-```bash
-codex-review --mode accessibility \
-  --a11y-url https://forms.test/wp-admin/admin.php?page=fluent_forms \
-  --a11y-storage-state .playwright/auth.json
-```
 
 ## Repo Config
 
@@ -156,149 +95,44 @@ mkdir -p .codex
 cp /path/to/codex-review/.codex/reviewer.yml.example .codex/reviewer.yml
 ```
 
-Important config areas:
+Useful config areas:
 
 - `base`
-- `engine`
-- `review_depth`
-- `focus_areas`
-- `critical_paths`
-- `review_signals`
-- `context_files`
-- `context_rules`
-- `paths.high_risk`
-- `edge_cases`
+- `code_review_graph`
 - `accessibility`
-- `codex.focus_paths`
 
 Example:
 
 ```yaml
 base: origin/dev
-engine: codex
-review_depth: thorough
 
-focus_areas:
-  - lifecycle
-  - performance
-  - persistence
-  - accessibility
-
-critical_paths:
-  - route or ajax entry -> capability or nonce -> sanitizer -> persistence -> reload -> render
-  - admin editor change -> save -> sanitize -> load -> frontend bootstrap or runtime
-
-review_signals:
-  lifecycle:
-    - mounted, reset, teardown, reopen, async completion
-  performance:
-    - repeated find/includes, duplicate fetches, repeated DOM queries
-
-context_files:
-  - app/Services/Form/Updater.php
-  - app/Helpers/Helper.php
-
-context_rules:
-  - when:
-      - resources/assets/**
-    include:
-      - app/Services/Form/Updater.php
-      - app/Helpers/Helper.php
-    reason: UI changes often depend on unchanged sanitizers and validators.
-
-paths:
-  high_risk:
-    - app/Http/**
-    - app/Services/**
-    - resources/assets/**
-
-edge_cases:
-  lifecycle:
-    - Recheck setup, reset, success, teardown, and reopen paths when stateful UI helpers change.
-  performance:
-    - Recheck hot paths for repeated find/includes scans, duplicate fetches, repeated DOM queries, and full-list class resets.
+code_review_graph:
+  enabled: true
+  timeout_ms: 120000
 
 accessibility:
   urls:
     - https://forms.test/wp-admin/admin.php?page=fluent_forms
   timeout_ms: 30000
-
-codex:
-  focus_paths:
-    - app/Http/**
-    - app/Services/**
-    - resources/assets/**
 ```
 
-## How The Pipeline Works
+## Compact Advanced Notes
 
-- repo-local config is loaded from `.codex/reviewer.yml`
-- local git diff is computed once
-- a heuristic seed runs first
-- Codex deep review scope is selected from the changed files
-- Semgrep, PHPStan, ESLint, and rendered accessibility can run alongside the main review
-- final findings are merged into one report
-- previous local review state is used for follow-up comparison
-
-## Timeout Behavior
-
-Codex has no default timeout now.
-
-If you want one, set it explicitly:
-
-```yaml
-codex:
-  timeout_ms: 900000
-```
-
-Semgrep, PHPStan, ESLint, and accessibility stages still support their own timeouts through config.
-
-## Advanced Workflows
-
-These still exist, but they are optional:
-
-Debugger workflow:
-
-```bash
-codex-review --workflow debugger
-```
-
-Plugin-audit workflow:
-
-```bash
-codex-review --workflow plugin-audit
-```
-
-Use them when you want longer structured reports instead of the default PR-review format.
-
-## Engine Modes
-
-- `auto`: prefer Codex, fall back when needed
-- `codex`: require Codex
-- `heuristic`: local checks only
-
-## Output Formats
-
-- `pr-review`: default concise PR-style format
-- `text`
-- `markdown`
-- `github`
-- `json`
-- `rdjson`
+- If Codex CLI is unavailable, `codex-review` can still fall back to heuristic review.
+- If you want to force local-only review, `--engine heuristic` is the main escape hatch.
+- If you want to change the base branch, set `base` in `.codex/reviewer.yml` or pass `--base`.
+- If you need machine-readable output, `--format json` exists, but it is not the normal day-to-day mode.
+- If you need to disable graph scoping for troubleshooting, use `--no-graph`.
 
 ## Re-Review State
 
-State is stored locally in:
+Local state is stored in:
 
 ```bash
 ~/.codex/codex-review/state/
 ```
 
-This is used so a later run can report:
-
-- cleared findings
-- remaining findings
-- newly introduced findings
+This lets later runs compare what was cleared, what remains, and what is newly introduced.
 
 The comparison is only used for compatible runs, so unrelated workflow/scope changes do not get mixed into follow-up reviews.
 

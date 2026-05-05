@@ -9,6 +9,7 @@ const yaml = require('js-yaml');
 
 const DEFAULT_MAX_FINDINGS = 15;
 const DEFAULT_CODEX_TIMEOUT_MS = null;
+const DEFAULT_GRAPH_TIMEOUT_MS = 120000;
 const DEFAULT_SEMGREP_TIMEOUT_MS = 120000;
 const DEFAULT_PHPSTAN_TIMEOUT_MS = 120000;
 const DEFAULT_ESLINT_TIMEOUT_MS = 120000;
@@ -67,6 +68,8 @@ const DEFAULT_CONFIG = {
   codexFocusPaths: [],
   base: null,
   reviewDepth: 'thorough',
+  graphEnabled: true,
+  graphTimeoutMs: DEFAULT_GRAPH_TIMEOUT_MS,
   productProfile: null,
   focusAreas: [],
   ignorePaths: [],
@@ -461,6 +464,8 @@ function parseArgs(argv) {
     engine: 'auto',
     model: null,
     reviewDepth: 'thorough',
+    graphEnabled: true,
+    graphTimeoutMs: DEFAULT_GRAPH_TIMEOUT_MS,
     semgrepEnabled: true,
     semgrepConfig: DEFAULT_CONFIG.semgrepConfig,
     semgrepTimeoutMs: DEFAULT_CONFIG.semgrepTimeoutMs,
@@ -658,6 +663,31 @@ function parseArgs(argv) {
     if (arg.startsWith('--review-depth=')) {
       options.reviewDepth = arg.slice('--review-depth='.length);
       options._explicit.reviewDepth = true;
+      continue;
+    }
+
+    if (arg === '--graph') {
+      options.graphEnabled = true;
+      options._explicit.graphEnabled = true;
+      continue;
+    }
+
+    if (arg === '--no-graph') {
+      options.graphEnabled = false;
+      options._explicit.graphEnabled = true;
+      continue;
+    }
+
+    if (arg === '--graph-timeout' && argv[i + 1]) {
+      options.graphTimeoutMs = normalizeInteger(argv[i + 1], DEFAULT_GRAPH_TIMEOUT_MS);
+      options._explicit.graphTimeoutMs = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--graph-timeout=')) {
+      options.graphTimeoutMs = normalizeInteger(arg.slice('--graph-timeout='.length), DEFAULT_GRAPH_TIMEOUT_MS);
+      options._explicit.graphTimeoutMs = true;
       continue;
     }
 
@@ -1044,6 +1074,22 @@ function loadRepoConfig(cwd) {
       model: typeof parsed.model === 'string' ? parsed.model : DEFAULT_CONFIG.model,
       reviewDepth: typeof (parsed.review_depth || parsed.reviewDepth) === 'string' ? (parsed.review_depth || parsed.reviewDepth) : DEFAULT_CONFIG.reviewDepth,
       maxFindings: Math.max(1, parseInt(parsed.max_findings || parsed.maxFindings, 10) || DEFAULT_CONFIG.maxFindings),
+      graphEnabled: normalizeBoolean(
+        (parsed.code_review_graph && parsed.code_review_graph.enabled) ||
+        (parsed.codeReviewGraph && parsed.codeReviewGraph.enabled) ||
+        (parsed.graph && parsed.graph.enabled) ||
+        parsed.graph_enabled ||
+        parsed.graphEnabled,
+        DEFAULT_CONFIG.graphEnabled
+      ),
+      graphTimeoutMs: normalizeInteger(
+        (parsed.code_review_graph && (parsed.code_review_graph.timeout_ms || parsed.code_review_graph.timeoutMs)) ||
+        (parsed.codeReviewGraph && (parsed.codeReviewGraph.timeout_ms || parsed.codeReviewGraph.timeoutMs)) ||
+        (parsed.graph && (parsed.graph.timeout_ms || parsed.graph.timeoutMs)) ||
+        parsed.graph_timeout ||
+        parsed.graphTimeout,
+        DEFAULT_CONFIG.graphTimeoutMs
+      ),
       codexTimeoutMs: normalizeInteger(
         (parsed.codex && (parsed.codex.timeout_ms || parsed.codex.timeoutMs)) || parsed.codex_timeout || parsed.codexTimeout,
         DEFAULT_CONFIG.codexTimeoutMs
@@ -1154,6 +1200,8 @@ function resolveOptions(rawOptions, repoConfig) {
   options.focusAreas = repoConfig.focusAreas;
   options.ignorePaths = Array.from(new Set([...DEFAULT_IGNORES, ...repoConfig.ignorePaths]));
   options.highRiskPaths = Array.from(new Set([...HIGH_RISK_PATHS, ...repoConfig.highRiskPaths])).map((item) => item.toLowerCase());
+  options.graphEnabled = rawOptions._explicit.graphEnabled ? rawOptions.graphEnabled : repoConfig.graphEnabled;
+  options.graphTimeoutMs = rawOptions._explicit.graphTimeoutMs ? rawOptions.graphTimeoutMs : repoConfig.graphTimeoutMs;
   options.codexTimeoutMs = repoConfig.codexTimeoutMs;
   options.codexFocusPaths = repoConfig.codexFocusPaths || DEFAULT_CONFIG.codexFocusPaths;
   options.semgrepEnabled = rawOptions._explicit.semgrepEnabled ? rawOptions.semgrepEnabled : repoConfig.semgrepEnabled;
@@ -1214,6 +1262,260 @@ function getRepoInstructions(cwd, repoConfigPath) {
   }
 
   return instructions;
+}
+
+function pythonModuleExists(moduleName, pythonCommand = 'python3') {
+  try {
+    runCommand(pythonCommand, ['-c', `import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(${JSON.stringify(moduleName)}) else 1)`]);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+function resolveCodeReviewGraphRunner() {
+  if (commandExists('code-review-graph')) {
+    return {
+      command: 'code-review-graph',
+      prefixArgs: [],
+      label: 'code-review-graph'
+    };
+  }
+
+  if (commandExists('python3') && pythonModuleExists('code_review_graph.cli')) {
+    return {
+      command: 'python3',
+      prefixArgs: ['-m', 'code_review_graph.cli'],
+      label: 'python3 -m code_review_graph.cli'
+    };
+  }
+
+  return null;
+}
+
+function normalizeRepoRelativePath(filePath, cwd) {
+  if (!filePath) {
+    return '';
+  }
+
+  const normalizedPath = String(filePath).replace(/\\/g, '/');
+  if (!path.isAbsolute(normalizedPath)) {
+    return normalizedPath.replace(/^\.\//, '');
+  }
+
+  const relativePath = path.relative(cwd, normalizedPath).replace(/\\/g, '/');
+  if (!relativePath || relativePath.startsWith('..')) {
+    return normalizedPath;
+  }
+
+  return relativePath;
+}
+
+function normalizeCodeReviewGraphAnalysis(rawResult, cwd) {
+  const normalizedChangedFunctions = (rawResult.changed_functions || []).map((item) => ({
+    ...item,
+    filePath: normalizeRepoRelativePath(item.file_path || item.filePath || item.file, cwd)
+  }));
+  const normalizedReviewPriorities = (rawResult.review_priorities || []).map((item) => ({
+    ...item,
+    filePath: normalizeRepoRelativePath(item.file_path || item.filePath || item.file, cwd)
+  }));
+  const normalizedTestGaps = (rawResult.test_gaps || []).map((item) => ({
+    ...item,
+    file: normalizeRepoRelativePath(item.file || item.file_path || item.filePath, cwd)
+  }));
+  const normalizedAffectedFlows = (rawResult.affected_flows || []).map((item) => ({
+    ...item,
+    file: normalizeRepoRelativePath(item.file || item.file_path || item.filePath, cwd)
+  }));
+
+  return {
+    status: rawResult.status || 'ok',
+    summary: typeof rawResult.summary === 'string' ? rawResult.summary.trim() : '',
+    riskScore: Number.isFinite(rawResult.risk_score) ? rawResult.risk_score : 0,
+    changedFunctions: normalizedChangedFunctions,
+    affectedFlows: normalizedAffectedFlows,
+    testGaps: normalizedTestGaps,
+    reviewPriorities: normalizedReviewPriorities
+  };
+}
+
+function buildCodeReviewGraphFileSignals(graphAnalysis) {
+  const signals = new Map();
+
+  function ensureSignal(filePath) {
+    if (!filePath) {
+      return null;
+    }
+
+    if (!signals.has(filePath)) {
+      signals.set(filePath, {
+        maxRisk: 0,
+        priorityCount: 0,
+        testGapCount: 0,
+        changedNodeCount: 0
+      });
+    }
+
+    return signals.get(filePath);
+  }
+
+  (graphAnalysis.reviewPriorities || []).forEach((item) => {
+    const filePath = item.filePath || item.file;
+    const signal = ensureSignal(filePath);
+    if (!signal) {
+      return;
+    }
+
+    signal.priorityCount += 1;
+    signal.maxRisk = Math.max(signal.maxRisk, Number(item.risk_score || item.riskScore || 0));
+  });
+
+  (graphAnalysis.changedFunctions || []).forEach((item) => {
+    const filePath = item.filePath || item.file;
+    const signal = ensureSignal(filePath);
+    if (!signal) {
+      return;
+    }
+
+    signal.changedNodeCount += 1;
+    signal.maxRisk = Math.max(signal.maxRisk, Number(item.risk_score || item.riskScore || 0));
+  });
+
+  (graphAnalysis.testGaps || []).forEach((item) => {
+    const filePath = item.file || item.filePath;
+    const signal = ensureSignal(filePath);
+    if (!signal) {
+      return;
+    }
+
+    signal.testGapCount += 1;
+  });
+
+  return signals;
+}
+
+async function runCodeReviewGraphAnalysisAsync(reviewContext, options, cwd) {
+  if (!options.graphEnabled) {
+    return null;
+  }
+
+  const runner = resolveCodeReviewGraphRunner();
+  if (!runner) {
+    return {
+      available: false,
+      notes: ['code-review-graph integration was enabled, but the CLI/package was not available. Install `code-review-graph` to add blast-radius file impact scoring.'],
+      stage: {
+        name: 'code-review-graph',
+        status: 'unavailable',
+        durationMs: 0,
+        findings: 0
+      }
+    };
+  }
+
+  const startedAt = Date.now();
+  const graphDbPath = path.join(cwd, '.code-review-graph', 'graph.db');
+  const buildArgs = runner.prefixArgs.concat('build');
+  const updateArgs = runner.prefixArgs.concat('update');
+  const detectArgs = runner.prefixArgs.concat('detect-changes');
+
+  if (reviewContext.baseRef) {
+    updateArgs.push('--base', reviewContext.baseRef);
+    detectArgs.push('--base', reviewContext.baseRef);
+  }
+
+  let refreshAction = 'update';
+
+  try {
+    if (!fileExists(graphDbPath)) {
+      refreshAction = 'build';
+      logProgress(`codex-review: building ${runner.label} index...`);
+      await runCommandAsync(runner.command, buildArgs, {
+        cwd,
+        timeout: options.graphTimeoutMs || undefined,
+        maxBuffer: 32 * 1024 * 1024,
+        progressLabel: 'code-review-graph build'
+      });
+    } else {
+      logProgress(`codex-review: updating ${runner.label} index...`);
+      await runCommandAsync(runner.command, updateArgs, {
+        cwd,
+        timeout: options.graphTimeoutMs || undefined,
+        maxBuffer: 32 * 1024 * 1024,
+        progressLabel: 'code-review-graph update'
+      });
+    }
+
+    logProgress(`codex-review: running ${runner.label} change-impact analysis...`);
+    const rawOutput = await runCommandAsync(runner.command, detectArgs, {
+      cwd,
+      timeout: options.graphTimeoutMs || undefined,
+      maxBuffer: 32 * 1024 * 1024,
+      progressLabel: 'code-review-graph detect-changes'
+    });
+    const parsed = JSON.parse(rawOutput || '{}');
+    const analysis = normalizeCodeReviewGraphAnalysis(parsed, cwd);
+    const topPriorityNames = analysis.reviewPriorities.slice(0, 3)
+      .map((item) => item.name || item.qualified_name || item.filePath || item.file)
+      .filter(Boolean);
+    const notes = [
+      buildCodeReviewGraphSummaryNote(analysis, refreshAction)
+    ];
+
+    if (topPriorityNames.length) {
+      notes.push(`code-review-graph top review priorities: ${topPriorityNames.join(', ')}.`);
+    }
+
+    if (analysis.testGaps.length) {
+      notes.push(`code-review-graph reported ${analysis.testGaps.length} changed function/class test gap(s).`);
+    }
+
+    return {
+      available: true,
+      ...analysis,
+      fileSignals: buildCodeReviewGraphFileSignals(analysis),
+      notes,
+      stage: {
+        name: 'code-review-graph',
+        status: 'completed',
+        durationMs: Date.now() - startedAt,
+        findings: 0
+      }
+    };
+  } catch (error) {
+    return {
+      available: false,
+      notes: [`code-review-graph analysis failed, so file impact scoring stayed on the built-in heuristics: ${error.message}`],
+      stage: {
+        name: 'code-review-graph',
+        status: 'failed',
+        durationMs: Date.now() - startedAt,
+        findings: 0
+      }
+    };
+  }
+}
+
+function buildCodeReviewGraphSummaryNote(graphAnalysis, refreshAction) {
+  const summary = (graphAnalysis.summary || '').replace(/\s+/g, ' ').trim();
+  const prefix = refreshAction === 'build'
+    ? 'Built a fresh code-review-graph index and analyzed the current diff.'
+    : 'Updated the existing code-review-graph index and analyzed the current diff.';
+
+  if (!summary) {
+    return prefix;
+  }
+
+  return `${prefix} ${summary}`;
+}
+
+function getCodeReviewGraphFileSignal(graphAnalysis, filePath) {
+  if (!graphAnalysis || !graphAnalysis.fileSignals || !graphAnalysis.fileSignals.size) {
+    return null;
+  }
+
+  return graphAnalysis.fileSignals.get(filePath) || null;
 }
 
 function parseStatusLine(line) {
@@ -2537,6 +2839,47 @@ function analyzeFile(context) {
       fixDirection: 'Add or update tests and manually verify the changed path before opening a PR.'
     });
   }
+
+  return findings;
+}
+
+function collectDeterministicFindings(context) {
+  const findings = [];
+  const { filePath, currentContent } = context;
+
+  if (!currentContent || !/\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)) {
+    return findings;
+  }
+
+  const lines = currentContent.split('\n');
+  const heldReviewBranchLines = findAllLineNumbers(currentContent, /elseif\s*\(\s*\$responseCode\s*==\s*['"]4['"]\s*\)/g);
+
+  heldReviewBranchLines.forEach((lineNumber) => {
+    const startIndex = Math.max(0, lineNumber - 1);
+    const window = lines.slice(startIndex, Math.min(lines.length, startIndex + 28)).join('\n');
+    const keepsPendingStatus = /changeTransactionStatus\s*\(\s*\$transaction->id\s*,\s*['"]pending['"]\s*\)/.test(window)
+      && /changeSubmissionPaymentStatus\s*\(\s*['"]pending['"]\s*\)/.test(window);
+    const completesSubmission = /completePaymentSubmission\s*\(\s*false\s*\)/.test(window)
+      && /setMetaData\s*\(\s*['"]is_form_action_fired['"]\s*,\s*['"]yes['"]\s*\)/.test(window);
+    const isWebhookLifecycle = /webhook/i.test(window);
+
+    if (!keepsPendingStatus || !completesSubmission || !isWebhookLifecycle) {
+      return;
+    }
+
+    pushFinding(findings, {
+      severity: 'important',
+      confidence: 'high',
+      file: filePath,
+      line: lineNumber,
+      title: 'Held-review webhook branch finalizes submission while payment remains pending',
+      evidence: 'The changed responseCode == 4 branch sets both transaction and submission payment status to pending, but still calls completePaymentSubmission(false) and marks is_form_action_fired as yes in the same webhook branch.',
+      impact: 'Downstream submission actions can fire as if payment lifecycle is finalized even though the gateway still reports the payment as held for review.',
+      explanation: 'This is a concrete state-machine mismatch, not a generic payment warning. In Fluent Forms Pro, completePaymentSubmission() can process submission actions and set is_form_action_fired when it has not already fired, so using it on a held-for-review webhook path finalizes lifecycle side effects too early.',
+      verification: 'Trace the held-for-review webhook path and confirm that pending review branches do not complete the submission or mark form actions as fired until a later terminal approval/capture path resolves the payment.',
+      fixDirection: 'Remove submission completion and action-fired side effects from held-for-review webhook branches; keep them only in terminal success paths.'
+    });
+  });
 
   return findings;
 }
@@ -5134,6 +5477,9 @@ function buildPrompt(payload) {
     'Heuristic hotspots:',
     JSON.stringify(payload.heuristicHotspots, null, 2),
     '',
+    'Code-review-graph analysis:',
+    JSON.stringify(payload.codeReviewGraph || null, null, 2),
+    '',
     'Diff stats:',
     JSON.stringify(payload.diffStats, null, 2),
     '',
@@ -5155,7 +5501,7 @@ function isGeneratedOrBinaryPath(filePath) {
   );
 }
 
-function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
+function scoreCodexEntry(entry, reviewContext, heuristicSeed, options, graphAnalysis) {
   const filePath = entry.path;
   const changedLines = getChangedLinesForContext(reviewContext, filePath).length;
   const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
@@ -5165,6 +5511,7 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
   const isExplicit = options.files.includes(filePath);
   const isWorktreeChange = entry.status.trim() && entry.status !== '??';
   const isTest = /(^|\/)(test|tests|__tests__)\//i.test(filePath) || /\.(test|spec)\./i.test(filePath);
+  const graphSignal = getCodeReviewGraphFileSignal(graphAnalysis, filePath);
   const productWeight = /\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)
     ? 40
     : 0;
@@ -5197,6 +5544,13 @@ function scoreCodexEntry(entry, reviewContext, heuristicSeed, options) {
 
   if (isTest) {
     score += 20;
+  }
+
+  if (graphSignal) {
+    score += Math.round(graphSignal.maxRisk * 220);
+    score += graphSignal.priorityCount * 120;
+    score += graphSignal.changedNodeCount * 20;
+    score += graphSignal.testGapCount * 15;
   }
 
   score += Math.min(changedLines, 120);
@@ -5271,7 +5625,7 @@ function getCodexDeepFileLimit(reviewDepth, changedFileCount) {
   return reviewDepth === 'thorough' ? 3 : 2;
 }
 
-function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions) {
+function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis) {
   if (!entry || !entry.path) {
     return false;
   }
@@ -5280,12 +5634,17 @@ function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOpt
   const changedLines = getChangedLinesForContext(reviewContext, filePath).length;
   const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
   const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
+  const graphSignal = getCodeReviewGraphFileSignal(graphAnalysis, filePath);
 
   if (resolvedOptions.files.includes(filePath)) {
     return true;
   }
 
   if (hasHotspot || hasOutsideDiffFollowup || isHighRiskPath(filePath, resolvedOptions.highRiskPaths)) {
+    return true;
+  }
+
+  if (graphSignal && (graphSignal.maxRisk >= 0.45 || graphSignal.priorityCount > 0)) {
     return true;
   }
 
@@ -5296,7 +5655,7 @@ function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOpt
   return changedLines >= 8;
 }
 
-function getDeepCodexCandidateScore(entry, reviewContext, heuristicSeed, resolvedOptions) {
+function getDeepCodexCandidateScore(entry, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis) {
   if (!entry || !entry.path) {
     return -1;
   }
@@ -5306,6 +5665,7 @@ function getDeepCodexCandidateScore(entry, reviewContext, heuristicSeed, resolve
   const hasHotspot = heuristicSeed.findings.some((finding) => finding.file === filePath);
   const hasOutsideDiffFollowup = (heuristicSeed.outsideDiffFindings || []).some((finding) => finding.file === filePath);
   const isHighRisk = isHighRiskPath(filePath, resolvedOptions.highRiskPaths);
+  const graphSignal = getCodeReviewGraphFileSignal(graphAnalysis, filePath);
   let score = changedLines;
 
   if (hasHotspot) {
@@ -5318,6 +5678,12 @@ function getDeepCodexCandidateScore(entry, reviewContext, heuristicSeed, resolve
 
   if (isHighRisk) {
     score += 120;
+  }
+
+  if (graphSignal) {
+    score += Math.round(graphSignal.maxRisk * 180);
+    score += graphSignal.priorityCount * 100;
+    score += graphSignal.testGapCount * 20;
   }
 
   if (isStyleFile(filePath)) {
@@ -5342,7 +5708,7 @@ function getBatchContextFiles(batchEntries, options, matchedRules, includeGlobal
   return Array.from(files);
 }
 
-function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entries, diffText, extraFiles, matchedRules, excerptOptions, passLabel, passFocus) {
+function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entries, diffText, extraFiles, matchedRules, excerptOptions, passLabel, passFocus, graphAnalysis) {
   return {
     mode: resolvedOptions.mode,
     baseRef: reviewContext.baseRef || '--staged',
@@ -5367,6 +5733,24 @@ function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entrie
       codexScopedFiles: entries.length,
       testsChanged: getChangedTestFiles(reviewContext.fileEntries).length
     },
+    codeReviewGraph: graphAnalysis ? {
+      riskScore: graphAnalysis.riskScore,
+      summary: graphAnalysis.summary,
+      topReviewPriorities: (graphAnalysis.reviewPriorities || []).slice(0, 8).map((item) => ({
+        name: item.name || item.qualified_name || '',
+        file: item.filePath || item.file || '',
+        riskScore: item.risk_score || item.riskScore || 0
+      })),
+      testGaps: (graphAnalysis.testGaps || []).slice(0, 8).map((item) => ({
+        name: item.name || item.qualified_name || '',
+        file: item.file || item.filePath || ''
+      })),
+      affectedFlows: (graphAnalysis.affectedFlows || []).slice(0, 6).map((item) => ({
+        name: item.name || item.flow_name || item.id || '',
+        file: item.file || item.filePath || '',
+        criticality: item.criticality || null
+      }))
+    } : null,
     workflow: resolvedOptions.workflow,
     passLabel,
     passFocus,
@@ -5455,13 +5839,13 @@ function mergeCodexResultSets(results, notes) {
   };
 }
 
-function selectCodexFileEntries(reviewContext, heuristicSeed, options) {
+function selectCodexFileEntries(reviewContext, heuristicSeed, options, graphAnalysis) {
   const limit = options.reviewDepth === 'thorough' ? CODEX_FILE_LIMITS.thorough : CODEX_FILE_LIMITS.balanced;
   return reviewContext.fileEntries
     .filter((entry) => !isGeneratedOrBinaryPath(entry.path))
     .map((entry) => ({
       entry,
-      score: scoreCodexEntry(entry, reviewContext, heuristicSeed, options),
+      score: scoreCodexEntry(entry, reviewContext, heuristicSeed, options, graphAnalysis),
       changedLines: getChangedLinesForContext(reviewContext, entry.path).length
     }))
     .sort((left, right) => {
@@ -5611,13 +5995,13 @@ async function runCodexReviewAsync(payload, options, cwd) {
   }
 }
 
-async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolvedOptions, extraContext, selectedEntries, notes, cwd) {
+async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolvedOptions, extraContext, selectedEntries, notes, cwd, graphAnalysis) {
   const changedEntries = selectedEntries.slice().sort((left, right) => left.path.localeCompare(right.path));
   const deepCandidates = selectedEntries
-    .filter((entry) => shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions))
+    .filter((entry) => shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis))
     .sort((left, right) => {
-      const scoreDiff = getDeepCodexCandidateScore(right, reviewContext, heuristicSeed, resolvedOptions)
-        - getDeepCodexCandidateScore(left, reviewContext, heuristicSeed, resolvedOptions);
+      const scoreDiff = getDeepCodexCandidateScore(right, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis)
+        - getDeepCodexCandidateScore(left, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis);
       if (scoreDiff !== 0) {
         return scoreDiff;
       }
@@ -5649,7 +6033,8 @@ async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolv
       includeContent: false
     },
     'overview',
-    'Cross-file workflow, persistence, lifecycle, and blocker-level contract analysis across the full diff.'
+    'Cross-file workflow, persistence, lifecycle, and blocker-level contract analysis across the full diff.',
+    graphAnalysis
   );
 
   logProgress(`codex-review: Codex pass 1/${totalPasses} overview across ${changedEntries.length} file(s)...`);
@@ -5691,7 +6076,8 @@ async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolv
           extraContext.matchedRules.filter((rule) => (rule.matchedFiles || []).some((filePath) => batchFiles.includes(filePath))),
           CODEX_CONTEXT_BUDGETS.deep,
           `deep batch ${index + 1}`,
-          `Deep localized analysis of ${batchFiles.join(', ')} with lifecycle, performance, accessibility, and persistence tracing.`
+          `Deep localized analysis of ${batchFiles.join(', ')} with lifecycle, performance, accessibility, and persistence tracing.`,
+          graphAnalysis
         );
 
         const startedAt = Date.now();
@@ -5753,11 +6139,13 @@ function unwrapSettledResult(outcome, label) {
   throw new Error(`${label}: ${outcome.reason.message}`);
 }
 
-function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuristic', fallbackUsed = false) {
+function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuristic', fallbackUsed = false, graphAnalysis = null) {
   const { baseRef, fileEntries, instructions, diffText } = reviewContext;
   const findings = [];
   const outsideDiffFindings = [];
   const changedTestFiles = getChangedTestFiles(fileEntries);
+  const graphBackedConservativeMode = Boolean(graphAnalysis && graphAnalysis.available);
+  let addedDeterministicFinding = false;
 
   for (const entry of fileEntries) {
     const filePath = entry.path;
@@ -5773,29 +6161,68 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
       highRiskPaths: options.highRiskPaths,
       productProfile: reviewContext.productProfile
     });
+    const deterministicFindings = collectDeterministicFindings({
+      filePath,
+      currentContent,
+      baseContent,
+      changedLines,
+      mode: options.mode,
+      highRiskPaths: options.highRiskPaths,
+      productProfile: reviewContext.productProfile
+    });
 
-    fileFindings.forEach((finding) => pushFinding(findings, finding));
+    deterministicFindings.forEach((finding) => {
+      addedDeterministicFinding = true;
+      pushFinding(findings, finding);
+    });
+
+    if (!graphBackedConservativeMode) {
+      fileFindings.forEach((finding) => pushFinding(findings, finding));
+    }
   }
 
-  if (!changedTestFiles.length && fileEntries.some((entry) => isHighRiskPath(entry.path, options.highRiskPaths)) && options.mode === 'full') {
+  if (graphBackedConservativeMode) {
+    notes.push('Graph-backed conservative heuristic mode suppressed generic pattern findings; only deterministic bug checks, graph-backed verification notes, and external tool findings were kept.');
+  }
+
+  const graphTestGap = graphAnalysis && graphAnalysis.available && graphAnalysis.testGaps && graphAnalysis.testGaps.length
+    ? graphAnalysis.testGaps[0]
+    : null;
+  const shouldAddCoverageNote = !changedTestFiles.length
+    && fileEntries.some((entry) => isHighRiskPath(entry.path, options.highRiskPaths))
+    && options.mode === 'full'
+    && (!graphBackedConservativeMode || graphTestGap);
+
+  if (shouldAddCoverageNote) {
+    const graphTestGap = graphAnalysis && graphAnalysis.available && graphAnalysis.testGaps && graphAnalysis.testGaps.length
+      ? graphAnalysis.testGaps[0]
+      : null;
     pushFinding(findings, {
       severity: 'medium',
       confidence: 'low',
-      file: fileEntries.find((entry) => isHighRiskPath(entry.path, options.highRiskPaths)).path,
-      line: 1,
+      file: (graphTestGap && (graphTestGap.file || graphTestGap.filePath)) || fileEntries.find((entry) => isHighRiskPath(entry.path, options.highRiskPaths)).path,
+      line: (graphTestGap && graphTestGap.line_start) || 1,
       title: 'High-risk changes landed without matching test changes',
-      evidence: 'The current diff touches high-risk paths but does not include test file changes.',
+      evidence: graphTestGap
+        ? `code-review-graph marked ${graphTestGap.name || graphTestGap.qualified_name || 'a changed function/class'} as a test gap, and the current diff still does not include test file changes.`
+        : 'The current diff touches high-risk paths but does not include test file changes.',
       impact: 'Risky changes are harder to trust before PR review when no targeted verification moves with them.',
-      explanation: 'This does not prove the code is wrong, but it does mean a risky path changed without any nearby automated verification. In payment, auth, routing, or persistence code, that usually increases the chance of shipping a silent regression.',
+      explanation: graphTestGap
+        ? 'This is still a process/risk note rather than a product bug, but the graph-backed test-gap signal makes the missing coverage more concrete than a generic no-tests-changed warning.'
+        : 'This does not prove the code is wrong, but it does mean a risky path changed without any nearby automated verification. In payment, auth, routing, or persistence code, that usually increases the chance of shipping a silent regression.',
       verification: 'Add targeted tests or document the exact manual scenarios that were verified before opening the PR.',
       fixDirection: 'Add targeted tests or document the manual verification steps before opening the PR.'
     });
   }
 
-  const productReview = buildProductSpecificFindings(options, reviewContext);
-  productReview.findings.forEach((finding) => pushFinding(findings, finding));
-  productReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
-  notes.push(...productReview.notes);
+  if (!graphBackedConservativeMode) {
+    const productReview = buildProductSpecificFindings(options, reviewContext);
+    productReview.findings.forEach((finding) => pushFinding(findings, finding));
+    productReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
+    notes.push(...productReview.notes);
+  } else if (!addedDeterministicFinding && graphTestGap) {
+    notes.push(`Graph-backed heuristic review did not confirm any deterministic code bug beyond the test-gap signal for ${graphTestGap.name || graphTestGap.qualified_name || graphTestGap.file}.`);
+  }
 
   if (findings.some((finding) => /needs .*verification coverage/i.test(finding.title))) {
     const genericIndex = findings.findIndex((finding) => finding.title === 'High-risk changes landed without matching test changes');
@@ -5893,6 +6320,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     scope,
     findings: rankedFindings,
     outsideDiffFindings: reviewResult.outsideDiffFindings || [],
+    codeReviewGraph: reviewResult.codeReviewGraph || null,
     runtimeAccessibility: reviewResult.runtimeAccessibility || null,
     stageSummaries: reviewResult.stageSummaries || [],
     diffStats: {
@@ -5936,6 +6364,24 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   report.exitCode = shouldFail(report, options.failOn) ? 2 : 0;
   saveReviewState(repoRoot, report);
   return report;
+}
+
+function appendCodeReviewGraphMetadata(reviewResult, graphAnalysis) {
+  if (!graphAnalysis) {
+    return reviewResult;
+  }
+
+  return {
+    ...reviewResult,
+    codeReviewGraph: graphAnalysis.available ? {
+      riskScore: graphAnalysis.riskScore,
+      summary: graphAnalysis.summary,
+      reviewPriorities: graphAnalysis.reviewPriorities || [],
+      testGaps: graphAnalysis.testGaps || [],
+      affectedFlows: graphAnalysis.affectedFlows || []
+    } : null,
+    stageSummaries: (reviewResult.stageSummaries || []).concat(graphAnalysis.stage ? [graphAnalysis.stage] : [])
+  };
 }
 
 function appendRuntimeAccessibility(reviewResult, runtimeScan) {
@@ -6013,15 +6459,19 @@ async function createReviewReport(options, cwd = process.cwd()) {
   }
 
   if (!scope.reviewedFiles.length && !shouldRunRuntimeA11y) {
-    return buildFinalReport(resolvedOptions, reviewContext, applyWorkflowPostProcessing(resolvedOptions, reviewContext, {
-      engine: resolvedOptions.engine === 'codex' ? 'codex' : 'heuristic',
-      fallbackUsed: false,
-      notes: baseNotes,
-      verdict: 'APPROVE',
-      confidenceScore: 4,
-      summary: 'No local changes were found for review.',
-      findings: []
-    }));
+    return buildFinalReport(
+      resolvedOptions,
+      reviewContext,
+      applyWorkflowPostProcessing(resolvedOptions, reviewContext, {
+        engine: resolvedOptions.engine === 'codex' ? 'codex' : 'heuristic',
+        fallbackUsed: false,
+        notes: baseNotes,
+        verdict: 'APPROVE',
+        confidenceScore: 4,
+        summary: 'No local changes were found for review.',
+        findings: []
+      })
+    );
   }
 
   if (!scope.reviewedFiles.length && shouldRunRuntimeA11y) {
@@ -6048,7 +6498,16 @@ async function createReviewReport(options, cwd = process.cwd()) {
       };
     })()));
 
-    return buildFinalReport(resolvedOptions, reviewContext, runtimeOnlyResult);
+    return buildFinalReport(
+      resolvedOptions,
+      reviewContext,
+      runtimeOnlyResult
+    );
+  }
+
+  const graphAnalysis = await runCodeReviewGraphAnalysisAsync(reviewContext, resolvedOptions, cwd);
+  if (graphAnalysis && graphAnalysis.notes && graphAnalysis.notes.length) {
+    baseNotes.push(...graphAnalysis.notes);
   }
 
   const runtimeScanPromise = shouldRunRuntimeA11y
@@ -6075,7 +6534,7 @@ async function createReviewReport(options, cwd = process.cwd()) {
   const eslintPromise = resolvedOptions.eslintEnabled
     ? toSettledPromise(runEslintReviewAsync(reviewContext, resolvedOptions, cwd))
     : Promise.resolve({ status: 'fulfilled', value: null });
-  const heuristicSeed = runHeuristicReview(resolvedOptions, reviewContext, baseNotes.slice(), 'heuristic', false);
+  const heuristicSeed = runHeuristicReview(resolvedOptions, reviewContext, baseNotes.slice(), 'heuristic', false, graphAnalysis);
   const shouldUseCodex = resolvedOptions.engine === 'codex' || resolvedOptions.engine === 'auto';
 
   if (shouldUseCodex) {
@@ -6087,28 +6546,31 @@ async function createReviewReport(options, cwd = process.cwd()) {
       }
 
       notes.push('Codex CLI was not available, so the report used heuristic review only.');
-      const heuristicResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'heuristic', true);
+      const heuristicResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'heuristic', true, graphAnalysis);
       return buildFinalReport(
         resolvedOptions,
         reviewContext,
-        applyWorkflowPostProcessing(
-          resolvedOptions,
-          reviewContext,
-          appendRuntimeAccessibility(
-            appendStageFindings(
+        appendCodeReviewGraphMetadata(
+          applyWorkflowPostProcessing(
+            resolvedOptions,
+            reviewContext,
+            appendRuntimeAccessibility(
               appendStageFindings(
-                appendStageFindings(heuristicResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
-                unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+                appendStageFindings(
+                  appendStageFindings(heuristicResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+                  unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+                ),
+                unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
               ),
-              unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
-            ),
-            unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
-          )
+              unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+            )
+          ),
+          graphAnalysis
         )
       );
     }
 
-    const selectedEntries = selectCodexFileEntries(reviewContext, heuristicSeed, resolvedOptions);
+    const selectedEntries = selectCodexFileEntries(reviewContext, heuristicSeed, resolvedOptions, graphAnalysis);
 
     if (selectedEntries.length < reviewContext.fileEntries.length) {
       notes.push(`Codex scope narrowed to ${selectedEntries.length} of ${reviewContext.fileEntries.length} changed files for ${resolvedOptions.reviewDepth} review depth.`);
@@ -6126,7 +6588,8 @@ async function createReviewReport(options, cwd = process.cwd()) {
             extraContext,
             selectedEntries,
             notes,
-            cwd
+            cwd,
+            graphAnalysis
           );
           return result;
         })()),
@@ -6148,19 +6611,22 @@ async function createReviewReport(options, cwd = process.cwd()) {
       return buildFinalReport(
         resolvedOptions,
         reviewContext,
-        applyWorkflowPostProcessing(
-          resolvedOptions,
-          reviewContext,
-          appendRuntimeAccessibility(
-            appendStageFindings(
+        appendCodeReviewGraphMetadata(
+          applyWorkflowPostProcessing(
+            resolvedOptions,
+            reviewContext,
+            appendRuntimeAccessibility(
               appendStageFindings(
-                appendStageFindings(codexResult, semgrepResult),
-                phpstanResult
+                appendStageFindings(
+                  appendStageFindings(codexResult, semgrepResult),
+                  phpstanResult
+                ),
+                eslintResult
               ),
-              eslintResult
-            ),
-            runtimeScan
-          )
+              runtimeScan
+            )
+          ),
+          graphAnalysis
         )
       );
     } catch (error) {
@@ -6168,7 +6634,7 @@ async function createReviewReport(options, cwd = process.cwd()) {
         const timeoutLabel = formatDurationMs(resolvedOptions.codexTimeoutMs);
         logProgress(`codex-review: Codex timed out after ${timeoutLabel}. Falling back to heuristic review.`);
         notes.push(`Codex review timed out after ${timeoutLabel}, so the report used heuristic fallback.`);
-        const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
+        const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true, graphAnalysis);
         fallbackResult.stageSummaries = [{
           name: 'codex',
           status: 'timed_out',
@@ -6178,6 +6644,42 @@ async function createReviewReport(options, cwd = process.cwd()) {
         return buildFinalReport(
           resolvedOptions,
           reviewContext,
+          appendCodeReviewGraphMetadata(
+            applyWorkflowPostProcessing(
+              resolvedOptions,
+              reviewContext,
+              appendRuntimeAccessibility(
+                appendStageFindings(
+                  appendStageFindings(
+                    appendStageFindings(fallbackResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+                    unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+                  ),
+                  unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
+                ),
+                unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+              )
+            ),
+            graphAnalysis
+          )
+        );
+      }
+
+      if (resolvedOptions.engine === 'codex') {
+        throw new Error(`Codex review failed: ${error.message}`);
+      }
+
+      notes.push(`Codex review failed, so the report used heuristic fallback: ${error.message}`);
+      const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true, graphAnalysis);
+      fallbackResult.stageSummaries = [{
+        name: 'codex',
+        status: 'failed',
+        durationMs: 0,
+        findings: 0
+      }];
+      return buildFinalReport(
+        resolvedOptions,
+        reviewContext,
+        appendCodeReviewGraphMetadata(
           applyWorkflowPostProcessing(
             resolvedOptions,
             reviewContext,
@@ -6191,38 +6693,8 @@ async function createReviewReport(options, cwd = process.cwd()) {
               ),
               unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
             )
-          )
-        );
-      }
-
-      if (resolvedOptions.engine === 'codex') {
-        throw new Error(`Codex review failed: ${error.message}`);
-      }
-
-      notes.push(`Codex review failed, so the report used heuristic fallback: ${error.message}`);
-      const fallbackResult = runHeuristicReview(resolvedOptions, reviewContext, notes, 'codex', true);
-      fallbackResult.stageSummaries = [{
-        name: 'codex',
-        status: 'failed',
-        durationMs: 0,
-        findings: 0
-      }];
-      return buildFinalReport(
-        resolvedOptions,
-        reviewContext,
-        applyWorkflowPostProcessing(
-          resolvedOptions,
-          reviewContext,
-          appendRuntimeAccessibility(
-            appendStageFindings(
-              appendStageFindings(
-                appendStageFindings(fallbackResult, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
-                unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
-              ),
-              unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
-            ),
-            unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
-          )
+          ),
+          graphAnalysis
         )
       );
     }
@@ -6231,19 +6703,22 @@ async function createReviewReport(options, cwd = process.cwd()) {
   return buildFinalReport(
     resolvedOptions,
     reviewContext,
-    applyWorkflowPostProcessing(
-      resolvedOptions,
-      reviewContext,
-      appendRuntimeAccessibility(
-        appendStageFindings(
+    appendCodeReviewGraphMetadata(
+      applyWorkflowPostProcessing(
+        resolvedOptions,
+        reviewContext,
+        appendRuntimeAccessibility(
           appendStageFindings(
-            appendStageFindings(heuristicSeed, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
-            unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+            appendStageFindings(
+              appendStageFindings(heuristicSeed, unwrapSettledResult(await semgrepPromise, 'Semgrep scan failed')),
+              unwrapSettledResult(await phpstanPromise, 'PHPStan scan failed')
+            ),
+            unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
           ),
-          unwrapSettledResult(await eslintPromise, 'ESLint scan failed')
-        ),
-        unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
-      )
+          unwrapSettledResult(await runtimeScanPromise, 'Rendered accessibility scan failed')
+        )
+      ),
+      graphAnalysis
     )
   );
 }
