@@ -1273,6 +1273,37 @@ function pythonModuleExists(moduleName, pythonCommand = 'python3') {
   }
 }
 
+function getCommandPath(command) {
+  try {
+    return runCommand('sh', ['-c', `command -v ${JSON.stringify(command)}`]).trim() || null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function resolveShebangPythonExecutable(scriptPath) {
+  if (!scriptPath || !fileExists(scriptPath)) {
+    return null;
+  }
+
+  try {
+    const firstLine = safeReadFile(scriptPath).split('\n')[0] || '';
+    const match = firstLine.match(/^#!\s*(\S+)/);
+    if (!match) {
+      return null;
+    }
+
+    const executable = match[1];
+    if (!/python/i.test(executable)) {
+      return null;
+    }
+
+    return fileExists(executable) ? executable : null;
+  } catch (error) {
+    return null;
+  }
+}
+
 function resolveCodeReviewGraphRunner() {
   if (commandExists('code-review-graph')) {
     return {
@@ -1287,6 +1318,29 @@ function resolveCodeReviewGraphRunner() {
       command: 'python3',
       prefixArgs: ['-m', 'code_review_graph.cli'],
       label: 'python3 -m code_review_graph.cli'
+    };
+  }
+
+  return null;
+}
+
+function resolveCodeReviewGraphPythonRunner(cliRunner = null) {
+  if (commandExists('python3') && pythonModuleExists('code_review_graph.cli', 'python3')) {
+    return {
+      command: 'python3',
+      label: 'python3'
+    };
+  }
+
+  const cliPath = cliRunner && cliRunner.command === 'code-review-graph'
+    ? getCommandPath('code-review-graph')
+    : getCommandPath('code-review-graph');
+  const shebangPython = resolveShebangPythonExecutable(cliPath);
+
+  if (shebangPython && pythonModuleExists('code_review_graph.cli', shebangPython)) {
+    return {
+      command: shebangPython,
+      label: shebangPython
     };
   }
 
@@ -1395,6 +1449,154 @@ function buildCodeReviewGraphFileSignals(graphAnalysis) {
   return signals;
 }
 
+function normalizeCodeReviewGraphEnrichment(rawResult, cwd) {
+  const reviewContext = rawResult.review_context || {};
+  const reviewContextData = reviewContext.context || {};
+  const affectedFlowsResult = rawResult.affected_flows || {};
+  const architectureOverview = rawResult.architecture_overview || {};
+
+  return {
+    reviewContextSummary: typeof reviewContext.summary === 'string' ? reviewContext.summary.trim() : '',
+    reviewGuidance: typeof reviewContextData.review_guidance === 'string' ? reviewContextData.review_guidance.trim() : '',
+    impactedFiles: (reviewContextData.impacted_files || []).map((item) => normalizeRepoRelativePath(item, cwd)).filter(Boolean),
+    affectedFlowsFromContext: (affectedFlowsResult.affected_flows || []).map((item) => ({
+      ...item,
+      file: normalizeRepoRelativePath(item.file || item.file_path || item.filePath, cwd)
+    })),
+    affectedFlowsSummary: typeof affectedFlowsResult.summary === 'string' ? affectedFlowsResult.summary.trim() : '',
+    architectureSummary: typeof architectureOverview.summary === 'string' ? architectureOverview.summary.trim() : '',
+    architectureWarnings: Array.isArray(architectureOverview.warnings) ? architectureOverview.warnings.slice(0, 5) : [],
+    architectureCommunities: Array.isArray(architectureOverview.communities) ? architectureOverview.communities.slice(0, 5) : []
+  };
+}
+
+async function runCodeReviewGraphEnrichmentAsync(reviewContext, options, cwd, cliRunner = null) {
+  const pythonRunner = resolveCodeReviewGraphPythonRunner(cliRunner);
+  if (!pythonRunner) {
+    return null;
+  }
+
+  const changedFiles = reviewContext.fileEntries.map((entry) => entry.path).filter(Boolean);
+  if (!changedFiles.length) {
+    return null;
+  }
+
+  const payload = {
+    repo_root: cwd,
+    base: reviewContext.baseRef || 'HEAD~1',
+    changed_files: changedFiles,
+    include_architecture: changedFiles.length > 1
+  };
+  const script = [
+    'import json, sys',
+    'from code_review_graph.tools.review import get_review_context, get_affected_flows_func',
+    'from code_review_graph.tools.community_tools import get_architecture_overview_func',
+    'payload = json.load(sys.stdin)',
+    'result = {}',
+    'try:',
+    "    result['review_context'] = get_review_context(",
+    "        changed_files=payload['changed_files'],",
+    "        max_depth=2,",
+    "        include_source=False,",
+    "        repo_root=payload['repo_root'],",
+    "        base=payload['base'],",
+    "        detail_level='standard'",
+    '    )',
+    'except Exception as exc:',
+    "    result['review_context'] = {'status': 'error', 'error': str(exc)}",
+    'try:',
+    "    result['affected_flows'] = get_affected_flows_func(",
+    "        changed_files=payload['changed_files'],",
+    "        base=payload['base'],",
+    "        repo_root=payload['repo_root']",
+    '    )',
+    'except Exception as exc:',
+    "    result['affected_flows'] = {'status': 'error', 'error': str(exc)}",
+    "if payload.get('include_architecture'):",
+    '    try:',
+    "        result['architecture_overview'] = get_architecture_overview_func(repo_root=payload['repo_root'])",
+    '    except Exception as exc:',
+    "        result['architecture_overview'] = {'status': 'error', 'error': str(exc)}",
+    'print(json.dumps(result))'
+  ].join('\n');
+
+  try {
+    const rawOutput = await runCommandAsync(pythonRunner.command, ['-c', script], {
+      cwd,
+      timeout: options.graphTimeoutMs || undefined,
+      maxBuffer: 32 * 1024 * 1024,
+      progressLabel: 'code-review-graph enrichment',
+      input: `${JSON.stringify(payload)}\n`
+    });
+    return normalizeCodeReviewGraphEnrichment(JSON.parse(rawOutput || '{}'), cwd);
+  } catch (error) {
+    return null;
+  }
+}
+
+function collectGraphSummaryBullets(summaryText) {
+  if (!summaryText) {
+    return [];
+  }
+
+  return String(summaryText)
+    .split('\n')
+    .map((line) => line.trim().replace(/^[*-]\s*/, ''))
+    .filter(Boolean)
+    .slice(0, 4);
+}
+
+function tokenizeGraphPath(filePath) {
+  return String(filePath || '')
+    .split(/[\/\\._-]+/)
+    .map((part) => part.trim().toLowerCase())
+    .filter((part) => part && part.length > 2 && !['src', 'app', 'lib', 'libs', 'assets', 'public', 'private', 'classes', 'components', 'modules', 'services', 'payment', 'payments', 'methods'].includes(part));
+}
+
+function selectCodeReviewGraphCompanionFiles(reviewContext, graphAnalysis, options, limit = 4) {
+  if (!graphAnalysis || !Array.isArray(graphAnalysis.impactedFiles) || !graphAnalysis.impactedFiles.length) {
+    return [];
+  }
+
+  const changedFiles = reviewContext.fileEntries.map((entry) => entry.path);
+  const changedSet = new Set(changedFiles);
+  const changedTokens = new Set(changedFiles.flatMap((filePath) => tokenizeGraphPath(filePath)));
+
+  const scored = graphAnalysis.impactedFiles
+    .filter((filePath) => filePath && !changedSet.has(filePath) && !isGeneratedOrBinaryPath(filePath) && !pathMatchesAnyPattern(filePath, options.ignorePaths || []))
+    .map((filePath) => {
+      const fileTokens = tokenizeGraphPath(filePath);
+      let score = 0;
+
+      fileTokens.forEach((token) => {
+        if (changedTokens.has(token)) {
+          score += 40;
+        }
+      });
+
+      if (isHighRiskPath(filePath, options.highRiskPaths)) {
+        score += 20;
+      }
+
+      if (changedFiles.some((changedFile) => {
+        const changedDir = path.dirname(changedFile);
+        return changedDir !== '.' && (filePath.startsWith(`${changedDir}/`) || changedDir.startsWith(path.dirname(filePath)));
+      })) {
+        score += 20;
+      }
+
+      if ((graphAnalysis.reviewPriorities || []).some((item) => (item.filePath || item.file) === filePath)) {
+        score += 25;
+      }
+
+      return { filePath, score };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score || left.filePath.localeCompare(right.filePath));
+
+  return scored.slice(0, limit).map((item) => item.filePath);
+}
+
 async function runCodeReviewGraphAnalysisAsync(reviewContext, options, cwd) {
   if (!options.graphEnabled) {
     return null;
@@ -1469,6 +1671,39 @@ async function runCodeReviewGraphAnalysisAsync(reviewContext, options, cwd) {
 
     if (analysis.testGaps.length) {
       notes.push(`code-review-graph reported ${analysis.testGaps.length} changed function/class test gap(s).`);
+    }
+
+    const enrichment = await runCodeReviewGraphEnrichmentAsync(reviewContext, options, cwd, runner);
+    if (enrichment) {
+      analysis.reviewContextSummary = enrichment.reviewContextSummary;
+      analysis.reviewGuidance = enrichment.reviewGuidance;
+      analysis.impactedFiles = enrichment.impactedFiles;
+      analysis.affectedFlows = (analysis.affectedFlows && analysis.affectedFlows.length)
+        ? analysis.affectedFlows
+        : enrichment.affectedFlowsFromContext;
+      analysis.affectedFlowsSummary = enrichment.affectedFlowsSummary;
+      analysis.architectureSummary = enrichment.architectureSummary;
+      analysis.architectureWarnings = enrichment.architectureWarnings;
+      analysis.architectureCommunities = enrichment.architectureCommunities;
+
+      const guidanceBullets = collectGraphSummaryBullets(enrichment.reviewGuidance);
+      if (guidanceBullets.length) {
+        notes.push(`code-review-graph review guidance: ${guidanceBullets.join(' | ')}.`);
+      }
+
+      if (analysis.affectedFlows && analysis.affectedFlows.length) {
+        const topFlows = analysis.affectedFlows
+          .slice(0, 3)
+          .map((item) => item.name || item.flow_name || item.entry_point || item.id)
+          .filter(Boolean);
+        if (topFlows.length) {
+          notes.push(`code-review-graph affected flows: ${topFlows.join(', ')}.`);
+        }
+      }
+
+      if (analysis.architectureWarnings && analysis.architectureWarnings.length) {
+        notes.push(`code-review-graph architecture warnings: ${analysis.architectureWarnings.slice(0, 2).join(' | ')}.`);
+      }
     }
 
     return {
@@ -2919,12 +3154,30 @@ function rankFindings(findings) {
   });
 }
 
+function getFindingKind(finding) {
+  return String((finding && finding.kind) || 'product').toLowerCase();
+}
+
+function isProcessFinding(finding) {
+  return getFindingKind(finding) === 'process';
+}
+
+function getSubstantiveFindings(findings) {
+  return (findings || []).filter((finding) => !isProcessFinding(finding));
+}
+
+function getProcessFindings(findings) {
+  return (findings || []).filter((finding) => isProcessFinding(finding));
+}
+
 function buildVerdict(findings) {
-  if (findings.some((item) => item.severity === 'critical')) {
+  const substantiveFindings = getSubstantiveFindings(findings);
+
+  if (substantiveFindings.some((item) => item.severity === 'critical')) {
     return 'REQUEST_CHANGES';
   }
 
-  if (findings.some((item) => item.severity === 'important' && item.confidence !== 'low')) {
+  if (substantiveFindings.some((item) => item.severity === 'important' && item.confidence !== 'low')) {
     return 'REQUEST_CHANGES';
   }
 
@@ -2936,7 +3189,9 @@ function buildVerdict(findings) {
 }
 
 function countBlockerFindings(findings) {
-  return findings.filter((item) => item.severity === 'critical' || (item.severity === 'important' && item.confidence !== 'low')).length;
+  return getSubstantiveFindings(findings)
+    .filter((item) => item.severity === 'critical' || (item.severity === 'important' && item.confidence !== 'low'))
+    .length;
 }
 
 function buildConfidence(findings) {
@@ -2944,7 +3199,13 @@ function buildConfidence(findings) {
     return 4;
   }
 
-  if (findings.some((item) => item.confidence === 'high')) {
+  const substantiveFindings = getSubstantiveFindings(findings);
+
+  if (!substantiveFindings.length) {
+    return 4;
+  }
+
+  if (substantiveFindings.some((item) => item.confidence === 'high')) {
     return 4;
   }
 
@@ -2958,9 +3219,10 @@ function clampConfidenceScore(score) {
 function normalizeConfidenceScore(rawScore, findings, context) {
   const reviewedFiles = context.reviewedFilesCount || 0;
   const deepReviewedFiles = context.codexReviewedFilesCount || 0;
-  const hasCriticalFinding = findings.some((item) => item.severity === 'critical');
-  const importantFindings = findings.filter((item) => item.severity === 'important');
-  const mediumFindings = findings.filter((item) => item.severity === 'medium');
+  const substantiveFindings = getSubstantiveFindings(findings);
+  const processFindings = getProcessFindings(findings);
+  const hasCriticalFinding = substantiveFindings.some((item) => item.severity === 'critical');
+  const importantFindings = substantiveFindings.filter((item) => item.severity === 'important');
   const isCodexReview = context.engine === 'codex' && !context.fallbackUsed;
   const isHeuristicOnly = context.engine === 'heuristic' || context.fallbackUsed;
   const touchedHighRiskPaths = Boolean(context.highRiskTouched);
@@ -2971,6 +3233,25 @@ function normalizeConfidenceScore(rawScore, findings, context) {
   }
 
   if (isHeuristicOnly) {
+    if (!substantiveFindings.length) {
+      if (processFindings.length) {
+        return 4;
+      }
+
+      if (!findings.length) {
+        if (
+          !touchedHighRiskPaths &&
+          reviewedFiles <= 2
+        ) {
+          return 5;
+        }
+
+        return 4;
+      }
+
+      return 4;
+    }
+
     if (!findings.length) {
       if (
         !touchedHighRiskPaths &&
@@ -2993,11 +3274,15 @@ function normalizeConfidenceScore(rawScore, findings, context) {
     return clampConfidenceScore(score);
   }
 
+  if (!substantiveFindings.length) {
+    return processFindings.length ? 4 : clampConfidenceScore(score);
+  }
+
   if (hasCriticalFinding || importantFindings.length >= 3) {
     return 2;
   }
 
-  if (findings.length) {
+  if (substantiveFindings.length) {
     return 3;
   }
 
@@ -3024,6 +3309,13 @@ function buildSummary(findings, scope, options) {
 
   if (!findings.length) {
     return `Reviewed ${scope.reviewedFiles.length} changed file(s) against ${options.base} with no blocker-level findings.`;
+  }
+
+  const substantiveFindings = getSubstantiveFindings(findings);
+  const processFindings = getProcessFindings(findings);
+
+  if (!substantiveFindings.length && processFindings.length) {
+    return `Reviewed ${scope.reviewedFiles.length} changed file(s) against ${options.base}. No confirmed product bugs; ${processFindings.length} process/risk note(s) remain.`;
   }
 
   const severities = findings.reduce((accumulator, finding) => {
@@ -3182,6 +3474,7 @@ function saveReviewState(repoRoot, report) {
     savedAt: new Date().toISOString(),
     findings: report.findings.map((finding) => ({
       fingerprint: finding.fingerprint || buildFindingFingerprint(finding),
+      kind: getFindingKind(finding),
       severity: finding.severity,
       confidence: finding.confidence,
       file: finding.file,
@@ -3223,7 +3516,7 @@ function deriveVerdictFromScore(report) {
   }
 
   if (report.findings && report.findings.length) {
-    return 'REQUEST_CHANGES';
+    return report.verdict || buildVerdict(report.findings);
   }
 
   return report.verdict || 'COMMENT';
@@ -3242,6 +3535,13 @@ function buildFindingSummary(findings) {
   });
 
   return counts;
+}
+
+function buildFindingKindSummary(findings) {
+  return {
+    substantive: getSubstantiveFindings(findings).length,
+    process: getProcessFindings(findings).length
+  };
 }
 
 function getSeverityDisplayLabel(severity) {
@@ -3417,6 +3717,7 @@ function buildRecheckState(previousState, findings, reviewedCommit, report) {
 
 function buildNarrativeSummary(report) {
   const counts = buildFindingSummary(report.findings);
+  const kindCounts = buildFindingKindSummary(report.findings);
 
   if (report.recheck) {
     const parts = [];
@@ -3444,6 +3745,10 @@ function buildNarrativeSummary(report) {
     return 'No meaningful issues were found in the reviewed changes.';
   }
 
+  if (!kindCounts.substantive && kindCounts.process) {
+    return `No confirmed product bugs were found; ${kindCounts.process} process/risk note(s) remain.`;
+  }
+
   const leading = [];
 
   if (counts.critical || counts.important) {
@@ -3461,6 +3766,7 @@ function buildNarrativeSummary(report) {
 
 function buildPrReviewSummary(report) {
   const blockerCount = countBlockerFindings(report.findings);
+  const kindCounts = buildFindingKindSummary(report.findings);
 
   if (report.recheck) {
     if (!report.findings.length) {
@@ -3475,6 +3781,10 @@ function buildPrReviewSummary(report) {
       return opening;
     }
 
+    if (!kindCounts.substantive && kindCounts.process) {
+      return 'The follow-up changes cleared the confirmed product bugs, but process/risk notes still remain.';
+    }
+
     return 'The follow-up changes clear the merge blockers, but there are still non-blocking issues worth addressing.';
   }
 
@@ -3484,6 +3794,10 @@ function buildPrReviewSummary(report) {
 
   if (report.confidenceScore <= 3 || blockerCount) {
     return 'The implementation is close, but there are merge-blocking issues to resolve before this PR is ready.';
+  }
+
+  if (!kindCounts.substantive && kindCounts.process) {
+    return 'No confirmed merge blockers remain, but there are still process/risk notes worth addressing.';
   }
 
   return 'The implementation is in good shape overall, but there are still issues worth resolving before merge.';
@@ -4693,6 +5007,7 @@ function shouldFail(report, failOn) {
 
 function normalizeCodexFinding(finding) {
   return {
+    kind: getFindingKind(finding),
     severity: finding.severity,
     confidence: finding.confidence,
     file: finding.file,
@@ -4708,6 +5023,7 @@ function normalizeCodexFinding(finding) {
 
 function normalizeOutsideDiffFinding(finding) {
   return {
+    kind: getFindingKind(finding),
     severity: finding.severity,
     file: finding.file,
     line: Math.max(1, parseInt(finding.line, 10) || 1),
@@ -5594,6 +5910,23 @@ function resolveExtraContextFiles(reviewContext, options) {
   };
 }
 
+function appendCodeReviewGraphContext(extraContext, reviewContext, graphAnalysis, options) {
+  if (!graphAnalysis || !graphAnalysis.available) {
+    return extraContext;
+  }
+
+  const graphFiles = selectCodeReviewGraphCompanionFiles(reviewContext, graphAnalysis, options);
+  if (!graphFiles.length) {
+    return extraContext;
+  }
+
+  return {
+    ...extraContext,
+    files: Array.from(new Set([...(extraContext.files || []), ...graphFiles])),
+    graphFiles
+  };
+}
+
 function chunkArray(items, size) {
   if (!Array.isArray(items) || !items.length) {
     return [];
@@ -5736,6 +6069,9 @@ function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entrie
     codeReviewGraph: graphAnalysis ? {
       riskScore: graphAnalysis.riskScore,
       summary: graphAnalysis.summary,
+      reviewContextSummary: graphAnalysis.reviewContextSummary || '',
+      reviewGuidance: graphAnalysis.reviewGuidance || '',
+      impactedFiles: (graphAnalysis.impactedFiles || []).slice(0, 10),
       topReviewPriorities: (graphAnalysis.reviewPriorities || []).slice(0, 8).map((item) => ({
         name: item.name || item.qualified_name || '',
         file: item.filePath || item.file || '',
@@ -5749,7 +6085,9 @@ function buildCodexPayload(reviewContext, resolvedOptions, heuristicSeed, entrie
         name: item.name || item.flow_name || item.id || '',
         file: item.file || item.filePath || '',
         criticality: item.criticality || null
-      }))
+      })),
+      architectureSummary: graphAnalysis.architectureSummary || '',
+      architectureWarnings: (graphAnalysis.architectureWarnings || []).slice(0, 4)
     } : null,
     workflow: resolvedOptions.workflow,
     passLabel,
@@ -6198,6 +6536,7 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
       ? graphAnalysis.testGaps[0]
       : null;
     pushFinding(findings, {
+      kind: 'process',
       severity: 'medium',
       confidence: 'low',
       file: (graphTestGap && (graphTestGap.file || graphTestGap.filePath)) || fileEntries.find((entry) => isHighRiskPath(entry.path, options.highRiskPaths)).path,
@@ -6280,6 +6619,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel, repoRoot, currentBranch } = reviewContext;
   const rankedFindings = rankFindings((reviewResult.findings || []).map((finding) => ({
     ...finding,
+    kind: getFindingKind(finding),
     severity: finding.severity,
     confidence: finding.confidence,
     file: finding.file,
@@ -6376,9 +6716,15 @@ function appendCodeReviewGraphMetadata(reviewResult, graphAnalysis) {
     codeReviewGraph: graphAnalysis.available ? {
       riskScore: graphAnalysis.riskScore,
       summary: graphAnalysis.summary,
+      reviewContextSummary: graphAnalysis.reviewContextSummary || '',
+      reviewGuidance: graphAnalysis.reviewGuidance || '',
+      impactedFiles: graphAnalysis.impactedFiles || [],
       reviewPriorities: graphAnalysis.reviewPriorities || [],
       testGaps: graphAnalysis.testGaps || [],
-      affectedFlows: graphAnalysis.affectedFlows || []
+      affectedFlows: graphAnalysis.affectedFlows || [],
+      architectureSummary: graphAnalysis.architectureSummary || '',
+      architectureWarnings: graphAnalysis.architectureWarnings || [],
+      companionFiles: graphAnalysis.companionFiles || []
     } : null,
     stageSummaries: (reviewResult.stageSummaries || []).concat(graphAnalysis.stage ? [graphAnalysis.stage] : [])
   };
@@ -6412,7 +6758,6 @@ async function createReviewReport(options, cwd = process.cwd()) {
   const reviewContext = createReviewContext(resolvedOptions, cwd);
   const scope = summarizeScope(reviewContext.fileEntries, reviewContext.instructions);
   const baseNotes = [];
-  const extraContext = resolveExtraContextFiles(reviewContext, resolvedOptions);
   const shouldRunRuntimeA11y = Boolean(resolvedOptions.a11yUrls && resolvedOptions.a11yUrls.length);
 
   if (loadedConfig.configPath) {
@@ -6441,9 +6786,6 @@ async function createReviewReport(options, cwd = process.cwd()) {
   }
   if (resolvedOptions.contextRules && resolvedOptions.contextRules.length) {
     baseNotes.push(`Loaded ${resolvedOptions.contextRules.length} repo context rule(s) for conditional companion tracing.`);
-  }
-  if (extraContext.matchedRules && extraContext.matchedRules.length) {
-    baseNotes.push(`Matched ${extraContext.matchedRules.length} context rule(s) for this diff and expanded companion context accordingly.`);
   }
   if (resolvedOptions.reviewSignals) {
     const signalCounts = [
@@ -6506,6 +6848,18 @@ async function createReviewReport(options, cwd = process.cwd()) {
   }
 
   const graphAnalysis = await runCodeReviewGraphAnalysisAsync(reviewContext, resolvedOptions, cwd);
+  let extraContext = resolveExtraContextFiles(reviewContext, resolvedOptions);
+  extraContext = appendCodeReviewGraphContext(extraContext, reviewContext, graphAnalysis, resolvedOptions);
+
+  if (extraContext.matchedRules && extraContext.matchedRules.length) {
+    baseNotes.push(`Matched ${extraContext.matchedRules.length} context rule(s) for this diff and expanded companion context accordingly.`);
+  }
+
+  if (graphAnalysis && Array.isArray(extraContext.graphFiles) && extraContext.graphFiles.length) {
+    graphAnalysis.companionFiles = extraContext.graphFiles.slice();
+    baseNotes.push(`code-review-graph selected ${extraContext.graphFiles.length} graph-impacted companion file(s) for Codex context.`);
+  }
+
   if (graphAnalysis && graphAnalysis.notes && graphAnalysis.notes.length) {
     baseNotes.push(...graphAnalysis.notes);
   }
