@@ -40,7 +40,15 @@ Now this should work from anywhere:
 codex-review --help
 ```
 
-## 4. Confirm Codex CLI is available
+## 4. Install the required graph companion
+
+```bash
+npm run install:graph
+```
+
+`codex-review` now requires `code-review-graph` on every diff review. The installer keeps it in a repo-local virtualenv so it does not depend on a global Python package install.
+
+## 5. Confirm Codex CLI is available
 
 ```bash
 codex --help
@@ -52,7 +60,7 @@ If Codex is not installed yet, heuristic mode still works:
 codex-review --engine heuristic
 ```
 
-## 5. Optional repo config in the target repo
+## 6. Optional repo config in the target repo
 
 Inside the repo you want to review:
 
@@ -76,7 +84,7 @@ Typical cases:
 - `fluent-crm`
   contact sync, automation state, campaign scheduling, and idempotent background processing
 
-## 6. Run the reviewer
+## 7. Run the reviewer
 
 Recommended command:
 
@@ -90,7 +98,7 @@ Fast first pass:
 codex-review --base origin/dev --engine heuristic
 ```
 
-## 7. Use it before PR and after fixes
+## 8. Use it before PR and after fixes
 
 Recommended workflow:
 
@@ -107,7 +115,7 @@ codex-review --base origin/dev --engine codex --thorough
 6. Read the `Recheck Status` section
 7. Push or request PR review after blockers are cleared
 
-## 8. Optional markdown report
+## 9. Optional markdown report
 
 ```bash
 codex-review --base origin/dev --engine codex --format markdown --report codex-review.md
@@ -129,4 +137,5 @@ codex-review --base origin/dev --engine codex --format markdown --report codex-r
 cd /path/to/codex-review
 git pull
 npm install
+npm run install:graph
 ```

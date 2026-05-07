@@ -7,7 +7,8 @@
     "codex-review": "bin/review.js"
   },
   "scripts": {
-    "test": "node bin/review.js --help"
+    "test": "node bin/review.js --help",
+    "install:graph": "node bin/install-code-review-graph.js"
   },
   "files": [
     ".codex/",

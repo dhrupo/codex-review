@@ -13,6 +13,19 @@ const DEFAULT_GRAPH_TIMEOUT_MS = 120000;
 const DEFAULT_SEMGREP_TIMEOUT_MS = 120000;
 const DEFAULT_PHPSTAN_TIMEOUT_MS = 120000;
 const DEFAULT_ESLINT_TIMEOUT_MS = 120000;
+const CODE_REVIEW_GRAPH_VENV_DIR = path.join(__dirname, '.venv-code-review-graph');
+const CODE_REVIEW_GRAPH_VENV_BIN_DIR = path.join(
+  CODE_REVIEW_GRAPH_VENV_DIR,
+  process.platform === 'win32' ? 'Scripts' : 'bin'
+);
+const CODE_REVIEW_GRAPH_LOCAL_CLI = path.join(
+  CODE_REVIEW_GRAPH_VENV_BIN_DIR,
+  process.platform === 'win32' ? 'code-review-graph.exe' : 'code-review-graph'
+);
+const CODE_REVIEW_GRAPH_LOCAL_PYTHON = path.join(
+  CODE_REVIEW_GRAPH_VENV_BIN_DIR,
+  process.platform === 'win32' ? 'python.exe' : 'python'
+);
 const WORKFLOW_PRESETS = {
   debugger: {
     format: 'markdown',
@@ -132,6 +145,23 @@ const CODEX_CONTEXT_BUDGETS = {
   }
 };
 const COMMAND_EXISTS_CACHE = new Map();
+const UNIVERSAL_FINDING_CATEGORIES = [
+  'contract-drift',
+  'output-safety',
+  'a11y-interaction',
+  'state-handling',
+  'authorization-scope',
+  'async-correctness',
+  'hot-path-performance',
+  'data-integrity',
+  'process-risk'
+];
+const UNIVERSAL_FINDING_ORIGINS = [
+  'direct-diff',
+  'companion-path',
+  'static-tool',
+  'runtime-scan'
+];
 const REVIEW_SCHEMA = {
   $schema: 'https://json-schema.org/draft/2020-12/schema',
   type: 'object',
@@ -166,6 +196,14 @@ const REVIEW_SCHEMA = {
           confidence: {
             type: 'string',
             enum: ['high', 'medium', 'low']
+          },
+          category: {
+            type: 'string',
+            enum: UNIVERSAL_FINDING_CATEGORIES
+          },
+          origin: {
+            type: 'string',
+            enum: UNIVERSAL_FINDING_ORIGINS
           },
           file: {
             type: 'string'
@@ -205,6 +243,18 @@ const REVIEW_SCHEMA = {
           severity: {
             type: 'string',
             enum: ['critical', 'important', 'medium', 'low']
+          },
+          confidence: {
+            type: 'string',
+            enum: ['high', 'medium', 'low']
+          },
+          category: {
+            type: 'string',
+            enum: UNIVERSAL_FINDING_CATEGORIES
+          },
+          origin: {
+            type: 'string',
+            enum: UNIVERSAL_FINDING_ORIGINS
           },
           file: {
             type: 'string'
@@ -1225,6 +1275,10 @@ function resolveOptions(rawOptions, repoConfig) {
   options.a11yTimeout = rawOptions._explicit.a11yTimeout ? rawOptions.a11yTimeout : repoConfig.a11yTimeout;
   options.a11yStorageState = rawOptions._explicit.a11yStorageState ? rawOptions.a11yStorageState : repoConfig.a11yStorageState;
 
+  if (!options.graphEnabled) {
+    throw new Error('code-review-graph is required for codex-review. Remove `--no-graph` and set `code_review_graph.enabled: true` in repo config.');
+  }
+
   return options;
 }
 
@@ -1305,6 +1359,22 @@ function resolveShebangPythonExecutable(scriptPath) {
 }
 
 function resolveCodeReviewGraphRunner() {
+  if (commandExists(CODE_REVIEW_GRAPH_LOCAL_CLI)) {
+    return {
+      command: CODE_REVIEW_GRAPH_LOCAL_CLI,
+      prefixArgs: [],
+      label: path.relative(__dirname, CODE_REVIEW_GRAPH_LOCAL_CLI) || CODE_REVIEW_GRAPH_LOCAL_CLI
+    };
+  }
+
+  if (commandExists(CODE_REVIEW_GRAPH_LOCAL_PYTHON) && pythonModuleExists('code_review_graph.cli', CODE_REVIEW_GRAPH_LOCAL_PYTHON)) {
+    return {
+      command: CODE_REVIEW_GRAPH_LOCAL_PYTHON,
+      prefixArgs: ['-m', 'code_review_graph.cli'],
+      label: `${path.relative(__dirname, CODE_REVIEW_GRAPH_LOCAL_PYTHON) || CODE_REVIEW_GRAPH_LOCAL_PYTHON} -m code_review_graph.cli`
+    };
+  }
+
   if (commandExists('code-review-graph')) {
     return {
       command: 'code-review-graph',
@@ -1325,6 +1395,13 @@ function resolveCodeReviewGraphRunner() {
 }
 
 function resolveCodeReviewGraphPythonRunner(cliRunner = null) {
+  if (commandExists(CODE_REVIEW_GRAPH_LOCAL_PYTHON) && pythonModuleExists('code_review_graph.cli', CODE_REVIEW_GRAPH_LOCAL_PYTHON)) {
+    return {
+      command: CODE_REVIEW_GRAPH_LOCAL_PYTHON,
+      label: path.relative(__dirname, CODE_REVIEW_GRAPH_LOCAL_PYTHON) || CODE_REVIEW_GRAPH_LOCAL_PYTHON
+    };
+  }
+
   if (commandExists('python3') && pythonModuleExists('code_review_graph.cli', 'python3')) {
     return {
       command: 'python3',
@@ -1332,8 +1409,8 @@ function resolveCodeReviewGraphPythonRunner(cliRunner = null) {
     };
   }
 
-  const cliPath = cliRunner && cliRunner.command === 'code-review-graph'
-    ? getCommandPath('code-review-graph')
+  const cliPath = cliRunner && path.isAbsolute(cliRunner.command)
+    ? cliRunner.command
     : getCommandPath('code-review-graph');
   const shebangPython = resolveShebangPythonExecutable(cliPath);
 
@@ -1599,21 +1676,12 @@ function selectCodeReviewGraphCompanionFiles(reviewContext, graphAnalysis, optio
 
 async function runCodeReviewGraphAnalysisAsync(reviewContext, options, cwd) {
   if (!options.graphEnabled) {
-    return null;
+    throw new Error('code-review-graph is required for codex-review and cannot be disabled.');
   }
 
   const runner = resolveCodeReviewGraphRunner();
   if (!runner) {
-    return {
-      available: false,
-      notes: ['code-review-graph integration was enabled, but the CLI/package was not available. Install `code-review-graph` to add blast-radius file impact scoring.'],
-      stage: {
-        name: 'code-review-graph',
-        status: 'unavailable',
-        durationMs: 0,
-        findings: 0
-      }
-    };
+    throw new Error('code-review-graph is required but was not found. Run `npm run install:graph` in the codex-review checkout.');
   }
 
   const startedAt = Date.now();
@@ -1719,16 +1787,7 @@ async function runCodeReviewGraphAnalysisAsync(reviewContext, options, cwd) {
       }
     };
   } catch (error) {
-    return {
-      available: false,
-      notes: [`code-review-graph analysis failed, so file impact scoring stayed on the built-in heuristics: ${error.message}`],
-      stage: {
-        name: 'code-review-graph',
-        status: 'failed',
-        durationMs: Date.now() - startedAt,
-        findings: 0
-      }
-    };
+    throw new Error(`code-review-graph analysis failed via ${runner.label}: ${error.message}`);
   }
 }
 
@@ -2183,6 +2242,98 @@ function pushOutsideDiffFinding(findings, finding) {
   findings.push(finding);
 }
 
+function extractPotentialContractKeys(changedLines) {
+  const keys = new Set();
+  const ignore = new Set([
+    'id', 'ids', 'name', 'label', 'labels', 'title', 'type', 'text', 'value', 'values', 'class',
+    'style', 'data', 'url', 'urls', 'path', 'paths', 'file', 'files', 'item', 'items', 'option',
+    'options', 'props', 'state', 'status', 'message', 'messages', 'success', 'error', 'errors',
+    'meta', 'config', 'settings', 'field', 'fields'
+  ]);
+
+  changedLines.forEach((entry) => {
+    const text = String(entry && entry.text || '');
+    [
+      /\b([A-Za-z_][A-Za-z0-9_]{2,})\s*:/g,
+      /['"]([A-Za-z_][A-Za-z0-9_.-]{2,})['"]\s*:/g,
+      /['"]([A-Za-z_][A-Za-z0-9_.-]{2,})['"]\s*=>/g,
+      /\[['"]([A-Za-z_][A-Za-z0-9_.-]{2,})['"]\]/g
+    ].forEach((pattern) => {
+      let match;
+      while ((match = pattern.exec(text)) !== null) {
+        const key = String(match[1] || '').toLowerCase();
+        if (!ignore.has(key) && !/^(is|has)[a-z0-9_]+$/.test(key)) {
+          keys.add(key);
+        }
+      }
+    });
+  });
+
+  return Array.from(keys).slice(0, 12);
+}
+
+function buildUniversalCrossFileFindings(reviewContext, options, graphAnalysis) {
+  const outsideDiffFindings = [];
+  const notes = [];
+  const consumerPathPattern = /(component|view|renderer|render|frontend|client|editor|form|model|store|consumer|type|schema|parser|shortcode|block)/i;
+  const producerPathPattern = /(converter|serializer|resource|response|payload|api|controller|service|transform|mapper|builder|integration)/i;
+  const changedPaths = reviewContext.fileEntries.map((entry) => entry.path);
+
+  reviewContext.fileEntries.forEach((entry) => {
+    if (!producerPathPattern.test(entry.path)) {
+      return;
+    }
+
+    const changedLines = getChangedLinesForContext(reviewContext, entry.path);
+    const contractKeys = extractPotentialContractKeys(changedLines);
+    if (contractKeys.length < 2) {
+      return;
+    }
+
+    const consumerTouched = reviewContext.fileEntries.some((otherEntry) => {
+      if (otherEntry.path === entry.path || !consumerPathPattern.test(otherEntry.path)) {
+        return false;
+      }
+
+      const otherContent = getCurrentContentForContext(reviewContext, otherEntry.path);
+      return contractKeys.some((key) => new RegExp(`\\b${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(otherContent));
+    });
+
+    if (consumerTouched) {
+      return;
+    }
+
+    const graphCompanions = graphAnalysis && graphAnalysis.available
+      ? (graphAnalysis.companionFiles || graphAnalysis.impactedFiles || []).filter((filePath) => filePath !== entry.path && consumerPathPattern.test(filePath))
+      : [];
+    const suggestedCompanion = graphCompanions[0] || null;
+
+    pushOutsideDiffFinding(outsideDiffFindings, {
+      kind: 'product',
+      severity: 'medium',
+      confidence: 'low',
+      category: 'contract-drift',
+      origin: 'companion-path',
+      file: suggestedCompanion || entry.path,
+      line: changedLines[0] ? changedLines[0].line : 1,
+      title: 'Changed producer contract without a clearly traced consumer update',
+      explanation: `The changed producer-style file introduces or reshapes likely contract keys (${contractKeys.slice(0, 5).join(', ')}), but the changed scope does not include an obvious consumer-side update.`,
+      verification: suggestedCompanion
+        ? `Inspect the companion path \`${suggestedCompanion}\` and confirm it accepts the new contract keys and payload shape.`
+        : 'Inspect the nearest consumer or renderer path and confirm it accepts the new contract keys and payload shape.',
+      fixDirection: suggestedCompanion
+        ? `Trace the producer/consumer contract and update \`${suggestedCompanion}\` or the producing path so both sides agree on the same payload shape.`
+        : 'Trace the producer/consumer contract and update the missing consumer path if the payload shape changed.'
+    });
+  });
+
+  if (outsideDiffFindings.length) {
+    notes.push(`Universal contract tracing flagged ${outsideDiffFindings.length} producer/consumer follow-up item(s).`);
+  }
+
+  return { outsideDiffFindings, notes };
+}
+
 function getChangedPathsSet(fileEntries) {
   return new Set(fileEntries.map((entry) => entry.path));
 }
@@ -2555,6 +2706,175 @@ function analyzeFile(context) {
     return findings;
   }
 
+  const changedText = changedLines.map((entry) => entry.text).join('\n');
+
+  if (isScriptFile) {
+    const loadingStateVars = Array.from(new Set([
+      ...Array.from(changedText.matchAll(/\b(?:this\.)?([A-Za-z0-9_]*(?:loading|saving|submitting|installing|fetching|pending|busy|processing|syncing)[A-Za-z0-9_]*)\s*=\s*true\b/gi)).map((match) => match[1]),
+      ...Array.from(changedText.matchAll(/\bset([A-Z][A-Za-z0-9_]*)\s*\(\s*true\s*\)/g)).map((match) => {
+        const base = match[1];
+        return base ? `${base.charAt(0).toLowerCase()}${base.slice(1)}` : '';
+      })
+    ].filter(Boolean)));
+
+    loadingStateVars.forEach((stateVar) => {
+      const resetPattern = new RegExp(`(?:this\\.)?${stateVar}\\s*=\\s*false\\b|set${stateVar.charAt(0).toUpperCase()}${stateVar.slice(1)}\\s*\\(\\s*false\\s*\\)|finally\\s*\\{`, 'i');
+      if (!resetPattern.test(currentContent)) {
+        pushFinding(findings, {
+          kind: 'product',
+          severity: 'important',
+          confidence: 'medium',
+          category: 'state-handling',
+          origin: 'direct-diff',
+          file: filePath,
+          line: findLineNumber(currentContent, new RegExp(`(?:this\\.)?${stateVar}\\s*=\\s*true\\b|set${stateVar.charAt(0).toUpperCase()}${stateVar.slice(1)}\\s*\\(\\s*true\\s*\\)`)),
+          title: 'Async state is set but does not show a guaranteed recovery path',
+          evidence: `The changed code sets \`${stateVar}\` to a busy/loading state, but the file does not show a clear false/finally recovery path for that same state.`,
+          impact: 'Failure, cancellation, or retry paths can leave the UI stuck in a disabled or loading state even when the underlying action has ended.',
+          explanation: 'This is a common async UI regression. Busy-state variables need a visible reset path across success, failure, and cancellation, or the component can become effectively dead after one error.',
+          verification: `Trigger the changed async flow through success, failure, and cancellation paths and confirm \`${stateVar}\` always returns to an interactive state.`,
+          fixDirection: `Add a guaranteed reset path for \`${stateVar}\`, ideally through a shared finally/cleanup branch that runs after success, failure, and cancellation.`
+        });
+      }
+    });
+
+    if (/catch\s*\(|try\s*\{/.test(changedText)) {
+      const catchBlocks = Array.from(currentContent.matchAll(/catch\s*\([^)]*\)\s*\{([\s\S]{0,240}?)\}/g));
+      catchBlocks.forEach((match) => {
+        const body = String(match[1] || '').trim();
+        if (!body) {
+          pushFinding(findings, {
+            kind: 'product',
+            severity: 'medium',
+            confidence: 'high',
+            category: 'state-handling',
+            origin: 'direct-diff',
+            file: filePath,
+            line: findLineNumber(currentContent, /catch\s*\(/),
+            title: 'Changed async path swallows failures without recovery behavior',
+            evidence: 'The file contains an empty catch block in the changed async path.',
+            impact: 'Runtime failures can silently leave stale UI state, missing retries, or inconsistent persistence behavior because the error path does not restore or surface anything.',
+            explanation: 'Empty catch blocks usually hide exactly the branch that needs the most explicit cleanup and user-visible recovery.',
+            verification: 'Force the async operation to fail and confirm the UI recovers cleanly and surfaces an actionable error state.',
+            fixDirection: 'Add explicit cleanup and user-visible recovery behavior inside the catch path, or rethrow when recovery is intentionally delegated.'
+          });
+          return;
+        }
+
+        if (/^(console\.[a-z]+\([^)]*\);?|logger\.[a-z]+\([^)]*\);?)$/im.test(body.replace(/\s+/g, ' ').trim())) {
+          pushFinding(findings, {
+            kind: 'product',
+            severity: 'medium',
+            confidence: 'medium',
+            category: 'state-handling',
+            origin: 'direct-diff',
+            file: filePath,
+            line: findLineNumber(currentContent, /catch\s*\(/),
+            title: 'Changed async path logs errors but does not show user-visible recovery',
+            evidence: 'The catch branch appears to only log the failure without restoring state, retrying, or surfacing an error path to the user.',
+            impact: 'The UI can fail silently while remaining stale, disabled, or out of sync after the request error.',
+            explanation: 'Logging is useful for developers, but it does not repair broken state or tell the user what happened. Async UI flows need an explicit recovery path as well as telemetry.',
+            verification: 'Force the request to fail and confirm the user sees a recoverable state instead of a silent console-only error.',
+            fixDirection: 'Add state reset and a user-visible recovery/error branch in addition to logging.'
+          });
+        }
+      });
+    }
+
+    if (/(keydown|onKeyDown|@keydown)/.test(changedText) && /Tab/.test(currentContent) && /preventDefault\s*\(/.test(currentContent)) {
+      const hasEscapePath = /Escape|Shift\+Tab|shiftKey|close|dismiss|returnFocus/.test(currentContent);
+      if (!hasEscapePath) {
+        pushFinding(findings, {
+          kind: 'product',
+          severity: 'important',
+          confidence: 'medium',
+          category: 'a11y-interaction',
+          origin: 'direct-diff',
+          file: filePath,
+          line: findLineNumber(currentContent, /preventDefault\s*\(/),
+          title: 'Keyboard handling can trap focus inside the changed interaction',
+          evidence: 'The changed keyboard path prevents default Tab navigation, but the file does not show a clear escape or focus handoff path.',
+          impact: 'Keyboard users can get trapped in the interaction and lose normal navigation across the rest of the screen.',
+          explanation: 'Any code that overrides Tab behavior needs a fully defined focus model. Without one, the feature becomes a focus trap instead of a guided interaction.',
+          verification: 'Tab and Shift+Tab through the changed interaction and confirm focus can both enter and leave the component normally.',
+          fixDirection: 'Restore normal Tab behavior or implement a complete focus-management path with explicit escape and reverse navigation.'
+        });
+      }
+    }
+
+    if (/(tooltip|popover|dropdown|menu)/i.test(changedText) && /trigger\s*=\s*["']hover["']/.test(currentContent) && !/trigger\s*=\s*["'][^"']*(click|focus)/.test(currentContent)) {
+      pushFinding(findings, {
+        kind: 'product',
+        severity: 'medium',
+        confidence: 'medium',
+        category: 'a11y-interaction',
+        origin: 'direct-diff',
+        file: filePath,
+        line: findLineNumber(currentContent, /trigger\s*=\s*["']hover["']/),
+        title: 'Changed interaction relies on hover-only disclosure',
+        evidence: 'The changed UI uses a hover-triggered interaction without a matching click or focus trigger.',
+        impact: 'Keyboard and touch users may not be able to reach the same content or action path that mouse-hover users can access.',
+        explanation: 'Hover-only disclosure works poorly outside pointer-driven desktop flows. Interactive content should be reachable through focus or click as well.',
+        verification: 'Check the changed interaction with keyboard-only and touch-style navigation and confirm the same disclosure path is available.',
+        fixDirection: 'Add focus and click parity for the disclosure path, or convert the interaction to an explicitly focusable control.'
+      });
+    }
+
+    if (/\.\s*innerHTML\s*=|dangerouslySetInnerHTML\s*[:=(]|\.insertAdjacentHTML\s*\(/.test(changedText)) {
+      pushFinding(findings, {
+        kind: 'product',
+        severity: 'important',
+        confidence: 'medium',
+        category: 'output-safety',
+        origin: 'direct-diff',
+        file: filePath,
+        line: findLineNumber(currentContent, /\.\s*innerHTML\s*=|dangerouslySetInnerHTML\s*[:=(]|\.insertAdjacentHTML\s*\(/),
+        title: 'Changed UI path injects HTML directly into the DOM',
+        evidence: 'The changed code introduces a direct HTML sink such as innerHTML, dangerouslySetInnerHTML, or insertAdjacentHTML.',
+        impact: 'If the inserted string is not strictly sanitized before the sink, user-controlled or translated content can become executable or structurally unsafe markup.',
+        explanation: 'Direct DOM HTML sinks are trust-boundary crossings. They require explicit proof that every dynamic segment is safe before insertion.',
+        verification: 'Trace every dynamic value reaching the sink and confirm the final string is sanitized or otherwise guaranteed safe.',
+        fixDirection: 'Prefer DOM-safe rendering APIs, or sanitize and escape dynamic content before the HTML sink.'
+      });
+    }
+
+    if (/(forEach|map|filter|reduce)\s*\([^)]*=>[\s\S]{0,220}\.(find|includes|filter|some)\(/.test(currentContent) && /find\s*\(|includes\s*\(/.test(changedText)) {
+      pushFinding(findings, {
+        kind: 'product',
+        severity: 'medium',
+        confidence: 'medium',
+        category: 'hot-path-performance',
+        origin: 'direct-diff',
+        file: filePath,
+        line: findLineNumber(currentContent, /(forEach|map|filter|reduce)\s*\(/),
+        title: 'Changed list-processing path performs repeated linear lookups',
+        evidence: 'The changed code performs list iteration and then repeatedly calls find/includes/filter/some inside that same processing path.',
+        impact: 'Initialization or interaction cost can scale poorly as collection sizes grow, which makes the UI increasingly sluggish on larger real-world datasets.',
+        explanation: 'Repeated linear lookups inside another loop often hide quadratic behavior even when each individual line looks harmless.',
+        verification: 'Exercise the changed path with larger datasets and confirm the interaction stays responsive without repeated scans over the same collections.',
+        fixDirection: 'Pre-index the lookup collection with a Map/Set or otherwise avoid repeated linear scans inside the outer loop.'
+      });
+    }
+  }
+
+  if (isPhpFile && isHighRiskPath(filePath, highRiskPaths) && /while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/.test(changedText)) {
+    pushFinding(findings, {
+      kind: 'product',
+      severity: 'important',
+      confidence: 'medium',
+      category: 'async-correctness',
+      origin: 'direct-diff',
+      file: filePath,
+      line: findLineNumber(currentContent, /while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\)/),
+      title: 'Changed high-risk path contains an unbounded processing loop',
+      evidence: 'The diff introduces or changes a while(true)/for(;;) loop in a high-risk path.',
+      impact: 'Request-driven background, migration, or admin flows can become unbounded, stall recovery, or process too much work in one pass when loop exit conditions are not tightly controlled.',
+      explanation: 'Unbounded loops are especially risky in persistence, migration, and scheduler paths because partial failure, empty batches, or stale cursors can convert them into long-running or stuck operations.',
+      verification: 'Review the loop exit, batch-size, and failure conditions and confirm the path always makes bounded forward progress.',
+      fixDirection: 'Use explicit batch limits, checkpoint guards, and clearly bounded exit conditions for the changed processing loop.'
+    });
+  }
+
   if (isPhpFile && /register_rest_route\s*\(/.test(currentContent) && !/permission_callback\s*=>/.test(currentContent)) {
     pushFinding(findings, {
       severity: 'important',
@@ -2757,10 +3077,13 @@ function analyzeFile(context) {
 
   if (mode !== 'security') {
     const addedLoop = changedLines.find((entry) => /for(each)?\s*\(|while\s*\(/.test(entry.text));
-    if (addedLoop && /(get_posts|wp_remote_get|wp_remote_post|query|find|fetch)/i.test(currentContent)) {
+    const loopWindow = addedLoop ? getLineWindow(currentContent, addedLoop.line, 8) : '';
+    if (addedLoop && /(get_posts|wp_remote_get|wp_remote_post|query\s*\(|find\s*\(|fetch\s*\()/i.test(loopWindow)) {
       pushFinding(findings, {
         severity: 'medium',
         confidence: 'low',
+        category: 'hot-path-performance',
+        origin: 'direct-diff',
         file: filePath,
         line: addedLoop.line,
         title: 'Review looped I/O or query work in changed logic',
@@ -3425,12 +3748,526 @@ function normalizeFingerprintPart(value) {
     .replace(/\s+/g, '-');
 }
 
+function normalizeFindingCategory(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  const aliasMap = {
+    contract: 'contract-drift',
+    'contract-drift': 'contract-drift',
+    'output-safety': 'output-safety',
+    'output-sanitization': 'output-safety',
+    'xss': 'output-safety',
+    accessibility: 'a11y-interaction',
+    'a11y-interaction': 'a11y-interaction',
+    'keyboard-accessibility': 'a11y-interaction',
+    'state-handling': 'state-handling',
+    state: 'state-handling',
+    lifecycle: 'state-handling',
+    'authorization-scope': 'authorization-scope',
+    authorization: 'authorization-scope',
+    auth: 'authorization-scope',
+    security: 'authorization-scope',
+    'async-correctness': 'async-correctness',
+    async: 'async-correctness',
+    'background-jobs': 'async-correctness',
+    performance: 'hot-path-performance',
+    'hot-path-performance': 'hot-path-performance',
+    'data-integrity': 'data-integrity',
+    data: 'data-integrity',
+    persistence: 'data-integrity',
+    process: 'process-risk',
+    'process-risk': 'process-risk'
+  };
+
+  return aliasMap[normalized] || null;
+}
+
+function normalizeFindingOrigin(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  const aliasMap = {
+    'direct-diff': 'direct-diff',
+    direct: 'direct-diff',
+    changed: 'direct-diff',
+    'companion-path': 'companion-path',
+    companion: 'companion-path',
+    adjacent: 'companion-path',
+    'static-tool': 'static-tool',
+    static: 'static-tool',
+    semgrep: 'static-tool',
+    phpstan: 'static-tool',
+    eslint: 'static-tool',
+    'runtime-scan': 'runtime-scan',
+    runtime: 'runtime-scan',
+    accessibility: 'runtime-scan',
+    axe: 'runtime-scan'
+  };
+
+  return aliasMap[normalized] || null;
+}
+
+function inferFindingCategory(finding) {
+  const normalized = normalizeFindingCategory(finding && finding.category);
+  if (normalized) {
+    return normalized;
+  }
+
+  if (getFindingKind(finding) === 'process') {
+    return 'process-risk';
+  }
+
+  const haystack = [
+    finding && finding.title,
+    finding && finding.evidence,
+    finding && finding.impact,
+    finding && finding.explanation,
+    finding && finding.verification,
+    finding && finding.fixDirection
+  ].filter(Boolean).join('\n').toLowerCase();
+
+  if (/permission|nonce|capabilit|authorization|authorize|auth|acl|scope|idor|policy|route param|body param/.test(haystack)) {
+    return 'authorization-scope';
+  }
+
+  if (/screen-reader|screen reader|keyboard|focus|hover-only|hover only|aria-|accessible|accessibility|tab key|focus trap|focus-visible|unlabeled/.test(haystack)) {
+    return 'a11y-interaction';
+  }
+
+  if (/sanitize|sanitiz|escape|escaped|escaping|v-html|innerhtml|markup|html injection|shortcode html|rendered output|header output|filesystem path|attachment path|url path/.test(haystack)) {
+    return 'output-safety';
+  }
+
+  if (/contract|schema|payload|consumer|producer|hook registration|hook bootstrap|serializer|converter|companion|mismatch|consumer update/.test(haystack)) {
+    return 'contract-drift';
+  }
+
+  if (/loading state|loading = true|saving = true|submitting = true|stale|reset|teardown|cleanup|retry|reopen|prop updates|failure branch|error path|disabled forever|console-only error/.test(haystack)) {
+    return 'state-handling';
+  }
+
+  if (/migration|webhook|queue|cron|scheduler|batch|checkpoint|idempot|retry safe|replay|lock|background|onload|cleanup state|teardown state/.test(haystack)) {
+    return 'async-correctness';
+  }
+
+  if (/n\+1|quadratic|linear scans|repeated lookup|full-table|hot path|performance|cache|uncached|loop|scaling|slow/.test(haystack)) {
+    return 'hot-path-performance';
+  }
+
+  if (/duplicate|normalize|normalization|round-trip|round trip|validation|persist|serialization|deserialize|label collision|grouped option|canonical/.test(haystack)) {
+    return 'data-integrity';
+  }
+
+  return 'data-integrity';
+}
+
+function inferFindingOrigin(finding, options = {}) {
+  const normalized = normalizeFindingOrigin(finding && finding.origin);
+  if (normalized) {
+    return normalized;
+  }
+
+  if (options.outsideDiff) {
+    return 'companion-path';
+  }
+
+  if (finding && finding.source && ['semgrep', 'phpstan', 'eslint'].includes(String(finding.source).toLowerCase())) {
+    return 'static-tool';
+  }
+
+  if (finding && finding.source && /accessibility|axe|playwright/i.test(String(finding.source))) {
+    return 'runtime-scan';
+  }
+
+  return 'direct-diff';
+}
+
+function normalizeFindingRecord(finding, options = {}) {
+  if (!finding) {
+    return null;
+  }
+
+  return {
+    ...finding,
+    category: inferFindingCategory(finding),
+    origin: inferFindingOrigin(finding, options)
+  };
+}
+
 function buildFindingFingerprint(finding) {
   return [
+    normalizeFingerprintPart(finding.category || inferFindingCategory(finding)),
     normalizeFingerprintPart(finding.severity),
     normalizeFingerprintPart(finding.title),
     normalizeFingerprintPart(finding.file)
   ].join('|');
+}
+
+function tokenizeFindingText(value) {
+  const stopWords = new Set([
+    'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'after', 'before',
+    'when', 'does', 'doesnt', 'show', 'shows', 'same', 'path', 'flow', 'code',
+    'logic', 'state', 'file', 'line', 'still', 'need', 'needs', 'using', 'used',
+    'over', 'under', 'nearby', 'clear', 'ensure', 'confirm', 'across', 'about'
+  ]);
+
+  return Array.from(new Set(
+    String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .split(/\s+/)
+      .map((token) => token.trim())
+      .filter((token) => token.length > 2 && !stopWords.has(token))
+  ));
+}
+
+function buildFindingTitleTokens(finding) {
+  return tokenizeFindingText(finding && finding.title);
+}
+
+function buildFindingComparableTokens(finding) {
+  const filePath = String((finding && finding.file) || '');
+  const fileLabel = filePath ? path.basename(filePath, path.extname(filePath)) : '';
+  return Array.from(new Set([
+    ...buildFindingTitleTokens(finding),
+    ...tokenizeFindingText(finding && finding.evidence),
+    ...tokenizeFindingText(finding && finding.impact),
+    ...tokenizeFindingText(finding && finding.fixDirection),
+    ...tokenizeFindingText(fileLabel),
+    ...tokenizeFindingText((finding && finding.category) || inferFindingCategory(finding))
+  ]));
+}
+
+function buildFindingSemanticKey(finding) {
+  return [
+    normalizeFingerprintPart((finding && finding.category) || inferFindingCategory(finding)),
+    normalizeFingerprintPart(getFindingKind(finding)),
+    normalizeFingerprintPart(finding && finding.title)
+  ].join('|');
+}
+
+function computeTokenOverlapScore(leftTokens, rightTokens) {
+  const left = new Set(Array.isArray(leftTokens) ? leftTokens : []);
+  const right = new Set(Array.isArray(rightTokens) ? rightTokens : []);
+
+  if (!left.size || !right.size) {
+    return 0;
+  }
+
+  let shared = 0;
+  left.forEach((token) => {
+    if (right.has(token)) {
+      shared += 1;
+    }
+  });
+
+  return shared / Math.max(left.size, right.size);
+}
+
+function buildFindingHistoryKey(finding) {
+  const normalized = normalizeStoredFindingRecord(finding);
+  const fileLabel = normalized && normalized.file
+    ? normalizeFingerprintPart(path.basename(normalized.file, path.extname(normalized.file)))
+    : '';
+  return [normalized ? normalized.semanticKey : '', fileLabel].join('|');
+}
+
+function normalizeStoredFindingRecord(finding, options = {}) {
+  if (!finding) {
+    return null;
+  }
+
+  const normalized = normalizeFindingRecord({
+    ...finding,
+    fixDirection: finding.fixDirection || finding.fix_direction
+  }, options);
+
+  return {
+    ...finding,
+    ...normalized,
+    kind: finding.kind || getFindingKind(normalized),
+    severity: normalized.severity,
+    confidence: normalized.confidence || 'low',
+    file: normalized.file,
+    line: Math.max(1, parseInt(normalized.line, 10) || 1),
+    title: normalized.title,
+    fingerprint: finding.fingerprint || buildFindingFingerprint(normalized),
+    semanticKey: finding.semanticKey || buildFindingSemanticKey(normalized),
+    titleKey: finding.titleKey || normalizeFingerprintPart(normalized.title),
+    titleTokens: Array.isArray(finding.titleTokens) && finding.titleTokens.length
+      ? finding.titleTokens.slice()
+      : buildFindingTitleTokens(normalized),
+    tokens: Array.isArray(finding.tokens) && finding.tokens.length
+      ? finding.tokens.slice()
+      : buildFindingComparableTokens(normalized),
+    firstSeenAt: finding.firstSeenAt || finding.savedAt || null,
+    firstSeenCommit: finding.firstSeenCommit || finding.reviewedCommit || null,
+    lastSeenAt: finding.lastSeenAt || finding.savedAt || null,
+    lastSeenCommit: finding.lastSeenCommit || finding.reviewedCommit || null,
+    occurrenceCount: Number.isFinite(finding.occurrenceCount) ? finding.occurrenceCount : 1,
+    regressionCount: Number.isFinite(finding.regressionCount) ? finding.regressionCount : 0
+  };
+}
+
+function buildStoredFindingRecord(finding, context = {}) {
+  const historySource = context.historySource
+    ? normalizeStoredFindingRecord(context.historySource, { outsideDiff: context.outsideDiff })
+    : null;
+  const normalized = normalizeFindingRecord(finding, { outsideDiff: context.outsideDiff });
+  const savedAt = context.savedAt || new Date().toISOString();
+  const reviewedCommit = context.reviewedCommit || null;
+
+  return {
+    fingerprint: normalized.fingerprint || buildFindingFingerprint(normalized),
+    semanticKey: buildFindingSemanticKey(normalized),
+    titleKey: normalizeFingerprintPart(normalized.title),
+    titleTokens: buildFindingTitleTokens(normalized),
+    tokens: buildFindingComparableTokens(normalized),
+    kind: getFindingKind(normalized),
+    category: normalized.category || inferFindingCategory(normalized),
+    origin: normalized.origin || inferFindingOrigin(normalized, { outsideDiff: context.outsideDiff }),
+    severity: normalized.severity,
+    confidence: normalized.confidence || 'low',
+    file: normalized.file,
+    line: Math.max(1, parseInt(normalized.line, 10) || 1),
+    title: normalized.title,
+    evidence: normalized.evidence || null,
+    impact: normalized.impact || null,
+    explanation: normalized.explanation || null,
+    verification: normalized.verification || null,
+    fixDirection: normalized.fixDirection || null,
+    firstSeenAt: historySource && historySource.firstSeenAt ? historySource.firstSeenAt : savedAt,
+    firstSeenCommit: historySource && historySource.firstSeenCommit ? historySource.firstSeenCommit : reviewedCommit,
+    lastSeenAt: savedAt,
+    lastSeenCommit: reviewedCommit,
+    occurrenceCount: historySource && Number.isFinite(historySource.occurrenceCount)
+      ? historySource.occurrenceCount + 1
+      : 1,
+    regressionCount: historySource && Number.isFinite(historySource.regressionCount)
+      ? historySource.regressionCount
+      : 0
+  };
+}
+
+function scoreFindingSimilarity(previousFinding, currentFinding) {
+  let score = 0;
+
+  if (previousFinding.semanticKey === currentFinding.semanticKey) {
+    score += 70;
+  } else if (previousFinding.category === currentFinding.category) {
+    score += 12;
+  }
+
+  if (previousFinding.kind === currentFinding.kind) {
+    score += 8;
+  }
+
+  score += Math.round(computeTokenOverlapScore(previousFinding.titleTokens, currentFinding.titleTokens) * 30);
+  score += Math.round(computeTokenOverlapScore(previousFinding.tokens, currentFinding.tokens) * 20);
+
+  if (previousFinding.file === currentFinding.file) {
+    score += 15;
+  } else if (path.basename(previousFinding.file || '') === path.basename(currentFinding.file || '')) {
+    score += 8;
+  } else if (path.dirname(previousFinding.file || '') === path.dirname(currentFinding.file || '')) {
+    score += 4;
+  }
+
+  if (previousFinding.severity === currentFinding.severity) {
+    score += 4;
+  }
+
+  if (previousFinding.confidence === currentFinding.confidence) {
+    score += 2;
+  }
+
+  return score;
+}
+
+function classifyFindingTransition(previousFinding, currentFinding, options = {}) {
+  if (options.forcePartial) {
+    return 'partially-addressed';
+  }
+
+  if (previousFinding.file !== currentFinding.file) {
+    return 'moved';
+  }
+
+  if (
+    previousFinding.severity !== currentFinding.severity ||
+    previousFinding.confidence !== currentFinding.confidence ||
+    previousFinding.titleKey !== currentFinding.titleKey
+  ) {
+    return 'partially-addressed';
+  }
+
+  return 'unchanged';
+}
+
+function summarizeFindingTransitionItem(match) {
+  if (!match || !match.current) {
+    return null;
+  }
+
+  return {
+    title: match.current.title,
+    category: match.current.category,
+    currentFingerprint: match.current.fingerprint,
+    currentLocation: `${match.current.file}:${match.current.line}`,
+    previousFingerprint: match.previous ? match.previous.fingerprint : null,
+    previousLocation: match.previous ? `${match.previous.file}:${match.previous.line}` : null,
+    previousSeverity: match.previous ? match.previous.severity : null,
+    currentSeverity: match.current.severity,
+    status: match.status
+  };
+}
+
+function analyzeFindingTransitions(previousFindings, currentFindings, resolvedFindings = []) {
+  const previous = (previousFindings || []).map((finding) => normalizeStoredFindingRecord(finding)).filter(Boolean);
+  const current = (currentFindings || []).map((finding) => normalizeStoredFindingRecord(finding)).filter(Boolean);
+  const resolved = (resolvedFindings || []).map((finding) => normalizeStoredFindingRecord(finding)).filter(Boolean);
+  const unmatchedPrevious = new Set(previous.map((_, index) => index));
+  const unmatchedCurrent = new Set(current.map((_, index) => index));
+  const matches = [];
+
+  const previousByFingerprint = new Map();
+  previous.forEach((finding, index) => {
+    if (!previousByFingerprint.has(finding.fingerprint)) {
+      previousByFingerprint.set(finding.fingerprint, []);
+    }
+    previousByFingerprint.get(finding.fingerprint).push(index);
+  });
+
+  current.forEach((currentFinding, currentIndex) => {
+    const candidates = previousByFingerprint.get(currentFinding.fingerprint) || [];
+    const previousIndex = candidates.find((index) => unmatchedPrevious.has(index));
+    if (previousIndex === undefined) {
+      return;
+    }
+
+    unmatchedPrevious.delete(previousIndex);
+    unmatchedCurrent.delete(currentIndex);
+    matches.push({
+      status: 'unchanged',
+      previous: previous[previousIndex],
+      current: currentFinding,
+      score: 100
+    });
+  });
+
+  const previousBySemanticKey = new Map();
+  Array.from(unmatchedPrevious).forEach((index) => {
+    const semanticKey = previous[index].semanticKey;
+    if (!previousBySemanticKey.has(semanticKey)) {
+      previousBySemanticKey.set(semanticKey, []);
+    }
+    previousBySemanticKey.get(semanticKey).push(index);
+  });
+
+  Array.from(unmatchedCurrent).forEach((currentIndex) => {
+    const currentFinding = current[currentIndex];
+    const candidates = previousBySemanticKey.get(currentFinding.semanticKey) || [];
+    const available = candidates.filter((index) => unmatchedPrevious.has(index));
+    if (!available.length) {
+      return;
+    }
+
+    const previousIndex = available
+      .map((index) => ({
+        index,
+        score: scoreFindingSimilarity(previous[index], currentFinding)
+      }))
+      .sort((left, right) => right.score - left.score || left.index - right.index)[0].index;
+
+    unmatchedPrevious.delete(previousIndex);
+    unmatchedCurrent.delete(currentIndex);
+    matches.push({
+      status: classifyFindingTransition(previous[previousIndex], currentFinding),
+      previous: previous[previousIndex],
+      current: currentFinding,
+      score: scoreFindingSimilarity(previous[previousIndex], currentFinding)
+    });
+  });
+
+  const fuzzyCandidates = [];
+  Array.from(unmatchedPrevious).forEach((previousIndex) => {
+    Array.from(unmatchedCurrent).forEach((currentIndex) => {
+      const previousFinding = previous[previousIndex];
+      const currentFinding = current[currentIndex];
+      if (previousFinding.kind !== currentFinding.kind && previousFinding.category !== currentFinding.category) {
+        return;
+      }
+
+      const score = scoreFindingSimilarity(previousFinding, currentFinding);
+      if (score < 68) {
+        return;
+      }
+
+      fuzzyCandidates.push({
+        previousIndex,
+        currentIndex,
+        score
+      });
+    });
+  });
+
+  fuzzyCandidates
+    .sort((left, right) => right.score - left.score || left.previousIndex - right.previousIndex || left.currentIndex - right.currentIndex)
+    .forEach((candidate) => {
+      if (!unmatchedPrevious.has(candidate.previousIndex) || !unmatchedCurrent.has(candidate.currentIndex)) {
+        return;
+      }
+
+      unmatchedPrevious.delete(candidate.previousIndex);
+      unmatchedCurrent.delete(candidate.currentIndex);
+      matches.push({
+        status: 'partially-addressed',
+        previous: previous[candidate.previousIndex],
+        current: current[candidate.currentIndex],
+        score: candidate.score
+      });
+    });
+
+  const regressions = [];
+  const introduced = [];
+
+  Array.from(unmatchedCurrent).forEach((currentIndex) => {
+    const currentFinding = current[currentIndex];
+    const regressionMatch = resolved
+      .map((resolvedFinding) => ({
+        previous: resolvedFinding,
+        score: scoreFindingSimilarity(resolvedFinding, currentFinding)
+      }))
+      .filter((item) => item.previous.semanticKey === currentFinding.semanticKey || item.score >= 72)
+      .sort((left, right) => right.score - left.score)[0];
+
+    if (regressionMatch) {
+      regressions.push({
+        status: 'regressed',
+        previous: regressionMatch.previous,
+        current: currentFinding,
+        score: regressionMatch.score
+      });
+      return;
+    }
+
+    introduced.push(currentFinding);
+  });
+
+  const unchanged = matches.filter((item) => item.status === 'unchanged');
+  const moved = matches.filter((item) => item.status === 'moved');
+  const partiallyAddressed = matches.filter((item) => item.status === 'partially-addressed');
+
+  return {
+    previous,
+    current,
+    resolved,
+    matches,
+    unchanged,
+    moved,
+    partiallyAddressed,
+    regressions,
+    remaining: matches.map((item) => item.current),
+    cleared: Array.from(unmatchedPrevious).map((index) => previous[index]),
+    introduced
+  };
 }
 
 function encodeMetadataComment(payload) {
@@ -3451,9 +4288,56 @@ function loadPreviousReviewState(repoRoot) {
   }
 }
 
-function saveReviewState(repoRoot, report) {
+function saveReviewState(repoRoot, report, previousState = null) {
   const stateDir = getStateDirectory();
   fs.mkdirSync(stateDir, { recursive: true });
+  const savedAt = new Date().toISOString();
+  const transitionState = analyzeFindingTransitions(
+    previousState && previousState.findings ? previousState.findings : [],
+    report.findings,
+    previousState && previousState.tracking && previousState.tracking.resolvedFindings
+      ? previousState.tracking.resolvedFindings
+      : []
+  );
+  const currentFindingMatches = new Map();
+  transitionState.matches.forEach((match) => {
+    currentFindingMatches.set(match.current.fingerprint, match.previous);
+  });
+  transitionState.regressions.forEach((match) => {
+    currentFindingMatches.set(match.current.fingerprint, match.previous);
+  });
+  const storedFindings = report.findings.map((finding) => {
+    const previousFinding = currentFindingMatches.get(finding.fingerprint || buildFindingFingerprint(finding)) || null;
+    const stored = buildStoredFindingRecord(finding, {
+      savedAt,
+      reviewedCommit: report.reviewedCommit,
+      historySource: previousFinding
+    });
+
+    if (transitionState.regressions.some((match) => match.current.fingerprint === stored.fingerprint)) {
+      stored.regressionCount = (previousFinding && Number.isFinite(previousFinding.regressionCount) ? previousFinding.regressionCount : 0) + 1;
+    }
+
+    return stored;
+  });
+  const resolvedMap = new Map();
+  (previousState && previousState.tracking && Array.isArray(previousState.tracking.resolvedFindings)
+    ? previousState.tracking.resolvedFindings
+    : [])
+    .map((finding) => normalizeStoredFindingRecord(finding))
+    .filter(Boolean)
+    .forEach((finding) => {
+      resolvedMap.set(buildFindingHistoryKey(finding), finding);
+    });
+  transitionState.cleared.forEach((finding) => {
+    const normalized = normalizeStoredFindingRecord(finding);
+    resolvedMap.set(buildFindingHistoryKey(normalized), {
+      ...normalized,
+      status: 'resolved',
+      resolvedAt: savedAt,
+      resolvedCommit: report.reviewedCommit || null
+    });
+  });
 
   const state = {
     repoRoot,
@@ -3471,16 +4355,22 @@ function saveReviewState(repoRoot, report) {
       reviewedFiles: report.scope.reviewedFiles,
       codexReviewedFiles: report.scope.codexReviewedFiles || []
     },
-    savedAt: new Date().toISOString(),
-    findings: report.findings.map((finding) => ({
-      fingerprint: finding.fingerprint || buildFindingFingerprint(finding),
-      kind: getFindingKind(finding),
-      severity: finding.severity,
-      confidence: finding.confidence,
-      file: finding.file,
-      line: finding.line,
-      title: finding.title
-    }))
+    savedAt,
+    findings: storedFindings,
+    tracking: {
+      schemaVersion: 1,
+      transitionSummary: {
+        unchanged: transitionState.unchanged.length,
+        moved: transitionState.moved.length,
+        partiallyAddressed: transitionState.partiallyAddressed.length,
+        regressed: transitionState.regressions.length,
+        cleared: transitionState.cleared.length,
+        introduced: transitionState.introduced.length
+      },
+      resolvedFindings: Array.from(resolvedMap.values())
+        .sort((left, right) => String(right.resolvedAt || right.lastSeenAt || '').localeCompare(String(left.resolvedAt || left.lastSeenAt || '')))
+        .slice(0, 500)
+    }
   };
 
   writeJsonFile(getStatePath(repoRoot), state);
@@ -3535,6 +4425,19 @@ function buildFindingSummary(findings) {
   });
 
   return counts;
+}
+
+function buildFindingCategorySummary(findings) {
+  const counts = new Map();
+
+  (findings || []).forEach((finding) => {
+    const category = finding.category || inferFindingCategory(finding);
+    counts.set(category, (counts.get(category) || 0) + 1);
+  });
+
+  return Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([category, count]) => ({ category, count }));
 }
 
 function buildFindingKindSummary(findings) {
@@ -3604,6 +4507,118 @@ function buildPrioritizedBacklog(findings) {
   }));
 }
 
+function buildRecheckStatusMap(recheck) {
+  const statusMap = new Map();
+
+  if (!recheck) {
+    return statusMap;
+  }
+
+  (recheck.unchanged || []).forEach((item) => {
+    if (item && item.currentFingerprint) {
+      statusMap.set(item.currentFingerprint, 'unchanged');
+    }
+  });
+  (recheck.moved || []).forEach((item) => {
+    if (item && item.currentFingerprint) {
+      statusMap.set(item.currentFingerprint, 'moved');
+    }
+  });
+  (recheck.partiallyAddressed || []).forEach((item) => {
+    if (item && item.currentFingerprint) {
+      statusMap.set(item.currentFingerprint, 'partially-addressed');
+    }
+  });
+  (recheck.regressed || []).forEach((item) => {
+    if (item && item.currentFingerprint) {
+      statusMap.set(item.currentFingerprint, 'regressed');
+    }
+  });
+  (recheck.introduced || []).forEach((item) => {
+    if (item && item.fingerprint) {
+      statusMap.set(item.fingerprint, 'introduced');
+    }
+  });
+
+  return statusMap;
+}
+
+function buildIssueTrackingFinding(report, finding, options = {}) {
+  const normalized = normalizeStoredFindingRecord(finding, { outsideDiff: options.outsideDiff });
+  const recheckStatus = options.recheckStatus || (options.outsideDiff ? 'manual-follow-up' : 'open');
+
+  return {
+    id: normalized.fingerprint,
+    dedupeKey: normalized.semanticKey,
+    issueTitle: `[${normalized.category}] ${normalized.title}`,
+    title: normalized.title,
+    kind: normalized.kind,
+    category: normalized.category,
+    severity: normalized.severity,
+    confidence: normalized.confidence || 'low',
+    origin: normalized.origin,
+    status: options.status || (options.outsideDiff ? 'manual-follow-up' : 'open'),
+    recheckStatus,
+    location: {
+      path: normalized.file,
+      line: normalized.line
+    },
+    repo: report.repoLabel,
+    workflow: report.workflow || null,
+    engine: report.engine,
+    baseRef: report.baseRef,
+    reviewedCommit: report.reviewedCommit || null,
+    evidence: normalized.evidence || null,
+    impact: normalized.impact || null,
+    explanation: normalized.explanation || null,
+    verification: normalized.verification || null,
+    fixHint: normalized.fixDirection || null
+  };
+}
+
+function buildIssueTrackingPayload(report) {
+  const recheckStatusMap = buildRecheckStatusMap(report.recheck);
+  const findings = report.findings.map((finding) => buildIssueTrackingFinding(report, finding, {
+    recheckStatus: recheckStatusMap.get(finding.fingerprint) || 'open'
+  }));
+  const manualFollowUp = report.outsideDiffFindings.map((finding) => buildIssueTrackingFinding(report, finding, {
+    outsideDiff: true,
+    status: 'manual-follow-up',
+    recheckStatus: 'manual-follow-up'
+  }));
+
+  return {
+    schemaVersion: 'codex-review.issue-tracking.v1',
+    generatedAt: report.generatedAt,
+    repo: report.repoLabel,
+    workflow: report.workflow || null,
+    baseRef: report.baseRef,
+    reviewedCommit: report.reviewedCommit || null,
+    review: {
+      verdict: report.verdict,
+      confidenceScore: report.confidenceScore,
+      engine: report.engine,
+      reviewDepth: report.reviewDepth
+    },
+    counts: {
+      confirmed: findings.length,
+      manualFollowUp: manualFollowUp.length,
+      severity: buildFindingSummary(report.findings),
+      categories: buildFindingCategorySummary(report.findings),
+      recheck: report.recheck ? {
+        unchanged: (report.recheck.unchanged || []).length,
+        moved: (report.recheck.moved || []).length,
+        partiallyAddressed: (report.recheck.partiallyAddressed || []).length,
+        regressed: (report.recheck.regressed || []).length,
+        cleared: (report.recheck.cleared || []).length,
+        introduced: (report.recheck.introduced || []).length
+      } : null
+    },
+    findings,
+    manualFollowUp
+  };
+}
+
 function slugifyHeading(text) {
   return String(text || '')
     .trim()
@@ -3619,6 +4634,8 @@ function buildFixPrompt(report, finding) {
     `This is a local pre-PR review comment for ${report.repoLabel}.`,
     `Path: ${finding.file}`,
     `Line: ${finding.line}`,
+    `Category: ${finding.category || inferFindingCategory(finding)}`,
+    `Origin: ${finding.origin || inferFindingOrigin(finding)}`,
     '',
     `Issue: ${finding.title}`,
     `What is wrong: ${finding.evidence}`,
@@ -3644,6 +4661,8 @@ function buildFixAllPrompt(report) {
 
   const issues = report.findings.map((finding, index) => [
     `${index + 1}. ${finding.title}`,
+    `Category: ${finding.category || inferFindingCategory(finding)}`,
+    `Origin: ${finding.origin || inferFindingOrigin(finding)}`,
     `What: ${finding.evidence}`,
     `Why: ${finding.impact}`,
     `Explanation: ${finding.explanation || 'Review the changed logic carefully and confirm the current behavior is still correct.'}`,
@@ -3659,6 +4678,8 @@ function buildOutsideDiffPrompt(report, finding) {
   return [
     `This is a follow-up review item for ${report.repoLabel}${report.reviewedCommit ? ` at commit ${report.reviewedCommit}` : ''}.`,
     `Location: ${finding.file}:${finding.line}`,
+    `Category: ${finding.category || inferFindingCategory(finding)}`,
+    `Origin: ${finding.origin || inferFindingOrigin(finding, { outsideDiff: true })}`,
     `Issue: ${finding.title}`,
     `Why it matters: ${finding.explanation}`,
     `What to verify: ${finding.verification}`,
@@ -3669,7 +4690,14 @@ function buildOutsideDiffPrompt(report, finding) {
 }
 
 function buildRecheckState(previousState, findings, reviewedCommit, report) {
-  if (!previousState || !previousState.findings || !previousState.findings.length) {
+  const previousOpenFindings = previousState && Array.isArray(previousState.findings)
+    ? previousState.findings
+    : [];
+  const previousResolvedFindings = previousState && previousState.tracking && Array.isArray(previousState.tracking.resolvedFindings)
+    ? previousState.tracking.resolvedFindings
+    : [];
+
+  if (!previousState || (!previousOpenFindings.length && !previousResolvedFindings.length)) {
     return null;
   }
 
@@ -3684,14 +4712,25 @@ function buildRecheckState(previousState, findings, reviewedCommit, report) {
     return null;
   }
 
-  const previousMap = new Map(previousState.findings.map((finding) => [finding.fingerprint, finding]));
-  const currentMap = new Map(findings.map((finding) => [finding.fingerprint, finding]));
-  const cleared = previousState.findings.filter((finding) => !currentMap.has(finding.fingerprint));
-  const remaining = findings.filter((finding) => previousMap.has(finding.fingerprint));
-  const introduced = findings.filter((finding) => !previousMap.has(finding.fingerprint));
+  const transitions = analyzeFindingTransitions(
+    previousOpenFindings,
+    findings,
+    previousResolvedFindings
+  );
+  const cleared = transitions.cleared;
+  const remaining = transitions.remaining;
+  const introduced = transitions.introduced;
   const commitChanged = Boolean(previousState.reviewedCommit && reviewedCommit && previousState.reviewedCommit !== reviewedCommit);
 
-  if (!commitChanged && !cleared.length && !remaining.length && !introduced.length) {
+  if (
+    !commitChanged &&
+    !cleared.length &&
+    !remaining.length &&
+    !introduced.length &&
+    !transitions.moved.length &&
+    !transitions.partiallyAddressed.length &&
+    !transitions.regressions.length
+  ) {
     return null;
   }
 
@@ -3704,6 +4743,10 @@ function buildRecheckState(previousState, findings, reviewedCommit, report) {
     commitChanged,
     cleared,
     remaining,
+    unchanged: transitions.unchanged.map(summarizeFindingTransitionItem).filter(Boolean),
+    moved: transitions.moved.map(summarizeFindingTransitionItem).filter(Boolean),
+    partiallyAddressed: transitions.partiallyAddressed.map(summarizeFindingTransitionItem).filter(Boolean),
+    regressed: transitions.regressions.map(summarizeFindingTransitionItem).filter(Boolean),
     introduced,
     verdictChanged: Boolean(previousState.verdict && previousState.verdict !== report.verdict),
     confidenceDelta: typeof previousState.confidenceScore === 'number'
@@ -3724,6 +4767,18 @@ function buildNarrativeSummary(report) {
 
     if (report.recheck.cleared.length) {
       parts.push(`${report.recheck.cleared.length} previous finding(s) cleared`);
+    }
+
+    if (report.recheck.partiallyAddressed && report.recheck.partiallyAddressed.length) {
+      parts.push(`${report.recheck.partiallyAddressed.length} finding(s) partially addressed`);
+    }
+
+    if (report.recheck.moved && report.recheck.moved.length) {
+      parts.push(`${report.recheck.moved.length} finding(s) moved with the code path`);
+    }
+
+    if (report.recheck.regressed && report.recheck.regressed.length) {
+      parts.push(`${report.recheck.regressed.length} regression(s) returned`);
     }
 
     if (report.recheck.introduced.length) {
@@ -3976,6 +5031,9 @@ function createWorkflowRejectedCandidate(finding, reviewContext, reason) {
 function createWorkflowManualCandidate(finding, reviewContext, reason) {
   return {
     ...finding,
+    confidence: finding.confidence || 'low',
+    category: finding.category || inferFindingCategory(finding),
+    origin: finding.origin || inferFindingOrigin(finding, { outsideDiff: true }),
     area: inferFindingArea(finding),
     entryPoint: buildEntryPoint(reviewContext, finding),
     taskStatement: buildTaskStatement(finding),
@@ -3986,6 +5044,8 @@ function createWorkflowManualCandidate(finding, reviewContext, reason) {
 function enrichWorkflowFinding(finding, workflow, reviewContext) {
   return {
     ...finding,
+    category: finding.category || inferFindingCategory(finding),
+    origin: finding.origin || inferFindingOrigin(finding),
     area: inferFindingArea(finding),
     riskClassification: inferRiskClassification(finding),
     entryPoint: buildEntryPoint(reviewContext, finding),
@@ -4156,6 +5216,7 @@ function applyWorkflowPostProcessing(options, reviewContext, reviewResult) {
 function renderText(report) {
   const lines = [];
   const counts = buildFindingSummary(report.findings);
+  const categoryCounts = buildFindingCategorySummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
   const displayFindings = getFindingDisplayEntries(report.findings);
   const groupedFindings = groupFindingsBySeverity(displayFindings);
@@ -4197,6 +5258,11 @@ function renderText(report) {
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
+  if (categoryCounts.length) {
+    lines.push('', 'Issue Categories:');
+    categoryCounts.forEach((item) => lines.push(`- ${item.category}: ${item.count}`));
+  }
+
   if (report.stageSummaries && report.stageSummaries.length) {
     lines.push('', 'Engine Stages:');
     report.stageSummaries.forEach((stage) => lines.push(`- ${stage.name}: ${stage.status}, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`));
@@ -4227,6 +5293,18 @@ function renderText(report) {
     if (report.recheck.cleared.length) {
       lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
       report.recheck.cleared.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.file}:${finding.line})`));
+    }
+    if (report.recheck.partiallyAddressed && report.recheck.partiallyAddressed.length) {
+      lines.push(`- Partially addressed: ${report.recheck.partiallyAddressed.length}`);
+      report.recheck.partiallyAddressed.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.previousLocation} -> ${finding.currentLocation})`));
+    }
+    if (report.recheck.moved && report.recheck.moved.length) {
+      lines.push(`- Moved with the code path: ${report.recheck.moved.length}`);
+      report.recheck.moved.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.previousLocation} -> ${finding.currentLocation})`));
+    }
+    if (report.recheck.regressed && report.recheck.regressed.length) {
+      lines.push(`- Regressed after being cleared: ${report.recheck.regressed.length}`);
+      report.recheck.regressed.slice(0, 5).forEach((finding) => lines.push(`  - ${finding.title} (${finding.currentLocation})`));
     }
     if (report.recheck.remaining.length) {
       lines.push(`- Still present: ${report.recheck.remaining.length}`);
@@ -4266,6 +5344,8 @@ function renderText(report) {
       severityFindings.forEach((finding) => {
         lines.push(`${finding.severityKey}: ${finding.title}`);
         lines.push(`   Confidence: ${finding.confidence}`);
+        lines.push(`   Category: ${finding.category}`);
+        lines.push(`   Origin: ${finding.origin}`);
         lines.push(`   Fingerprint: ${finding.fingerprint}`);
         lines.push(`   File: ${finding.file}:${finding.line}`);
         lines.push(`   Evidence: ${finding.evidence}`);
@@ -4293,6 +5373,9 @@ function renderText(report) {
     report.outsideDiffFindings.forEach((finding, index) => {
       lines.push(`${index + 1}. ${finding.title}`);
       lines.push(`   Severity: ${finding.severity}`);
+      lines.push(`   Confidence: ${finding.confidence || 'low'}`);
+      lines.push(`   Category: ${finding.category}`);
+      lines.push(`   Origin: ${finding.origin}`);
       lines.push(`   Fingerprint: ${finding.fingerprint}`);
       lines.push(`   Location: ${finding.file}:${finding.line}`);
       lines.push(`   Why this needs follow-up: ${finding.explanation}`);
@@ -4557,6 +5640,7 @@ function renderMarkdown(report) {
   }
 
   const counts = buildFindingSummary(report.findings);
+  const categoryCounts = buildFindingCategorySummary(report.findings);
   const blockerCount = countBlockerFindings(report.findings);
   const displayFindings = getFindingDisplayEntries(report.findings);
   const groupedFindings = groupFindingsBySeverity(displayFindings);
@@ -4604,6 +5688,11 @@ function renderMarkdown(report) {
     report.notes.forEach((note) => lines.push(`- ${note}`));
   }
 
+  if (categoryCounts.length) {
+    lines.push('', '## Issue Categories', '');
+    categoryCounts.forEach((item) => lines.push(`- \`${item.category}\`: ${item.count}`));
+  }
+
   if (report.stageSummaries && report.stageSummaries.length) {
     lines.push('', '## Engine Stages', '');
     report.stageSummaries.forEach((stage) => lines.push(`- \`${stage.name}\`: \`${stage.status}\`, ${stage.findings} finding(s), ${formatDurationMs(stage.durationMs || 0)}`));
@@ -4632,6 +5721,18 @@ function renderMarkdown(report) {
     if (report.recheck.cleared.length) {
       lines.push(`- Cleared since last review: ${report.recheck.cleared.length}`);
       report.recheck.cleared.slice(0, 5).forEach((finding) => lines.push(`- Cleared: \`${finding.title}\` at \`${finding.file}:${finding.line}\``));
+    }
+    if (report.recheck.partiallyAddressed && report.recheck.partiallyAddressed.length) {
+      lines.push(`- Partially addressed: ${report.recheck.partiallyAddressed.length}`);
+      report.recheck.partiallyAddressed.slice(0, 5).forEach((finding) => lines.push(`- Partial: \`${finding.title}\` moved from \`${finding.previousLocation}\` to \`${finding.currentLocation}\``));
+    }
+    if (report.recheck.moved && report.recheck.moved.length) {
+      lines.push(`- Moved with the code path: ${report.recheck.moved.length}`);
+      report.recheck.moved.slice(0, 5).forEach((finding) => lines.push(`- Moved: \`${finding.title}\` from \`${finding.previousLocation}\` to \`${finding.currentLocation}\``));
+    }
+    if (report.recheck.regressed && report.recheck.regressed.length) {
+      lines.push(`- Regressed after being cleared: ${report.recheck.regressed.length}`);
+      report.recheck.regressed.slice(0, 5).forEach((finding) => lines.push(`- Regressed: \`${finding.title}\` at \`${finding.currentLocation}\``));
     }
     if (report.recheck.remaining.length) {
       lines.push(`- Still present: ${report.recheck.remaining.length}`);
@@ -4676,6 +5777,8 @@ function renderMarkdown(report) {
       lines.push(`#### ${finding.severityKey}: ${finding.title}`);
       lines.push('');
       lines.push(`- Confidence: \`${finding.confidence}\``);
+      lines.push(`- Category: \`${finding.category}\``);
+      lines.push(`- Origin: \`${finding.origin}\``);
       lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
       lines.push(`- File: \`${finding.file}:${finding.line}\``);
       lines.push(`- Evidence: ${finding.evidence}`);
@@ -4713,6 +5816,9 @@ function renderMarkdown(report) {
       lines.push(`### ${index + 1}. ${finding.title}`);
       lines.push('');
       lines.push(`- Severity: \`${finding.severity}\``);
+      lines.push(`- Confidence: \`${finding.confidence || 'low'}\``);
+      lines.push(`- Category: \`${finding.category}\``);
+      lines.push(`- Origin: \`${finding.origin}\``);
       lines.push(`- Fingerprint: \`${finding.fingerprint}\``);
       lines.push(`- Location: \`${finding.file}:${finding.line}\``);
       lines.push(`- Why this needs follow-up: ${finding.explanation}`);
@@ -4794,16 +5900,22 @@ function renderGitHub(report) {
     workflow: report.workflow || null,
     commitId: report.reviewedCommit,
     state: report.verdict,
+    issueTracking: report.issueTracking ? {
+      schemaVersion: report.issueTracking.schemaVersion,
+      counts: report.issueTracking.counts
+    } : null,
     blockers: report.findings
       .filter((finding) => finding.severity === 'critical' || (finding.severity === 'important' && finding.confidence !== 'low'))
       .map((finding) => ({
         fingerprint: finding.fingerprint,
+        dedupeKey: finding.semanticKey || buildFindingSemanticKey(finding),
         severity: finding.severity,
         label: finding.title,
         location: `${finding.file}:${finding.line}`
       })),
     relatedBlockers: report.outsideDiffFindings.map((finding) => ({
       fingerprint: finding.fingerprint,
+      dedupeKey: finding.semanticKey || buildFindingSemanticKey(finding),
       severity: finding.severity,
       label: finding.title,
       location: `${finding.file}:${finding.line}`
@@ -4938,6 +6050,7 @@ function renderGitHub(report) {
 
 function renderRdjson(report) {
   const displayFindings = getFindingDisplayEntries(report.findings);
+  const recheckStatusMap = buildRecheckStatusMap(report.recheck);
   const diagnostics = displayFindings.map((finding) => {
     const severity = finding.severity === 'critical' || finding.severity === 'important'
       ? 'ERROR'
@@ -4948,6 +6061,10 @@ function renderRdjson(report) {
     return {
       message: [
         finding.title,
+        '',
+        `Category: ${finding.category}`,
+        `Origin: ${finding.origin}`,
+        `Tracking status: ${recheckStatusMap.get(finding.fingerprint) || 'open'}`,
         '',
         finding.evidence,
         '',
@@ -4972,7 +6089,7 @@ function renderRdjson(report) {
         name: 'codex-review'
       },
       code: {
-        value: finding.severityKey || finding.fingerprint || finding.title
+        value: finding.fingerprint || finding.severityKey || finding.title
       }
     };
   });
@@ -5006,10 +6123,12 @@ function shouldFail(report, failOn) {
 }
 
 function normalizeCodexFinding(finding) {
-  return {
+  return normalizeFindingRecord({
     kind: getFindingKind(finding),
     severity: finding.severity,
     confidence: finding.confidence,
+    category: finding.category,
+    origin: finding.origin,
     file: finding.file,
     line: Math.max(1, parseInt(finding.line, 10) || 1),
     title: finding.title,
@@ -5018,20 +6137,23 @@ function normalizeCodexFinding(finding) {
     explanation: finding.explanation,
     verification: finding.verification,
     fixDirection: finding.fix_direction
-  };
+  });
 }
 
 function normalizeOutsideDiffFinding(finding) {
-  return {
+  return normalizeFindingRecord({
     kind: getFindingKind(finding),
     severity: finding.severity,
+    confidence: finding.confidence || 'low',
+    category: finding.category,
+    origin: finding.origin,
     file: finding.file,
     line: Math.max(1, parseInt(finding.line, 10) || 1),
     title: finding.title,
     explanation: finding.explanation,
     verification: finding.verification,
     fixDirection: finding.fix_direction
-  };
+  }, { outsideDiff: true });
 }
 
 function lineTouchesChangedDiff(reviewContext, filePath, lineNumber, radius = 2) {
@@ -5734,18 +6856,26 @@ function buildPrompt(payload) {
     'Do not emit style-only feedback.',
     'Do not speculate without evidence from the provided diff or file contents.',
     'If there are no meaningful findings, return an empty findings array and APPROVE.',
+    'Every confirmed finding and outside_diff_findings item should use a universal category when possible: contract-drift, output-safety, a11y-interaction, state-handling, authorization-scope, async-correctness, hot-path-performance, data-integrity, or process-risk.',
+    'Set origin to direct-diff when the evidence is inside the changed lines, companion-path when the risk depends on an adjacent or consumer path, static-tool when the finding is best framed as deterministic tool output, and runtime-scan for rendered accessibility/runtime evidence.',
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
+    'When payload keys, option identifiers, hook names, event names, or response fields change, trace likely producer/consumer contracts before approving.',
+    'When a changed file looks like a producer but the consumer is not clearly shown in the changed scope, prefer outside_diff_findings instead of silently assuming the contract is still satisfied.',
+    'When a change touches auth, scope, IDs, nonces, permission callbacks, or policy helpers, verify the same identifier is used for lookup, authorization, and mutation before approving.',
     'When a frontend diff adds state-sync helpers, CSS state classes, or input/change/blur listeners, trace reset, clear, success, and teardown paths in the same file before approving.',
     'When a frontend diff introduces interactive grid, card, or multi-column choice layouts, check mobile breakpoints and narrow-viewport usability before approving.',
     'When a Vue admin/editor component derives local mutable state from props, check whether prop updates after mount will resynchronize that state before approving.',
     'When a changed mounted/load path performs async status updates or resource loads, trace each branch and check for duplicate fetches before approving.',
     'When a change adds or modifies setup/initialize/mounted/onload/onOpen/onClose/reset/save/success handlers, trace the full lifecycle: first load, async completion, retry, reset, teardown, reopen, and prop/data refresh.',
+    'When async UI state is introduced, confirm loading, saving, disabled, and error states all have a recovery path after failure and cancellation.',
     'When a frontend initializer rebuilds ordered lists from answers and options, check for repeated find/includes scans that can make mount or rehydration quadratic as option counts grow.',
     'When drag/drop UI is added, inspect dragover and pointer-move hot paths for repeated full-list DOM queries or class resets that can cause interaction jank.',
     'When drag/drop reorder logic adjusts target indexes after removing the source item, test adjacent forward moves explicitly so the immediate-next drop case does not collapse into a no-op.',
     'When a change touches persistence or validation contracts, trace save -> sanitize -> load -> render -> submit paths and look for values that can be accepted in the editor but later rejected or dropped.',
     'When a change introduces loops, mapping, sorting, filtering, repeated lookups, remote fetches, or DOM queries, estimate worst-case scaling on real data sizes instead of assuming the current diff is small.',
+    'When a change adds keyboard handlers, hover-triggered UI, custom buttons, icon-only controls, or focus styling changes, check for keyboard parity, focus visibility, and accessible naming before approving.',
+    'When unescaped markup insertion, HTML string composition, innerHTML, v-html, or translated/user-controlled output appears, trace the full trust boundary to the render sink before approving.',
     'Use repo-local review_signals as concrete prompts for which lifecycle handlers, hot paths, persistence boundaries, security boundaries, and accessibility checks deserve extra scrutiny.',
     'Always populate key_changes with 1-2 concise bullets about what the patch appears to do correctly or safely when the diff supports that.',
     'Use outside_diff_findings for closely related blocker-level follow-ups that are not directly part of the changed lines but are necessary to validate the same workflow.',
@@ -6523,6 +7653,10 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
     notes.push('Graph-backed conservative heuristic mode suppressed generic pattern findings; only deterministic bug checks, graph-backed verification notes, and external tool findings were kept.');
   }
 
+  const universalCrossFileReview = buildUniversalCrossFileFindings(reviewContext, options, graphAnalysis);
+  universalCrossFileReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
+  notes.push(...(universalCrossFileReview.notes || []));
+
   const graphTestGap = graphAnalysis && graphAnalysis.available && graphAnalysis.testGaps && graphAnalysis.testGaps.length
     ? graphAnalysis.testGaps[0]
     : null;
@@ -6617,21 +7751,34 @@ function createReviewContext(options, cwd) {
 
 function buildFinalReport(options, reviewContext, reviewResult) {
   const { baseRef, fileEntries, instructions, reviewedCommit, repoLabel, repoRoot, currentBranch } = reviewContext;
-  const rankedFindings = rankFindings((reviewResult.findings || []).map((finding) => ({
-    ...finding,
-    kind: getFindingKind(finding),
-    severity: finding.severity,
-    confidence: finding.confidence,
-    file: finding.file,
-    line: finding.line,
-    title: finding.title,
-    evidence: finding.evidence,
-    impact: finding.impact,
-    explanation: finding.explanation,
-    verification: finding.verification,
-    fixDirection: finding.fixDirection,
-    fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
-  }))).slice(0, options.maxFindings);
+  const normalizedFindings = (reviewResult.findings || [])
+    .map((finding) => normalizeFindingRecord(finding))
+    .filter(Boolean)
+    .map((finding) => ({
+      ...finding,
+      kind: getFindingKind(finding),
+      severity: finding.severity,
+      confidence: finding.confidence,
+      file: finding.file,
+      line: finding.line,
+      title: finding.title,
+      evidence: finding.evidence,
+      impact: finding.impact,
+      explanation: finding.explanation,
+      verification: finding.verification,
+      fixDirection: finding.fixDirection,
+      fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
+    }));
+  const rankedFindings = rankFindings(normalizedFindings).slice(0, options.maxFindings);
+  const normalizedOutsideDiffFindings = (reviewResult.outsideDiffFindings || [])
+    .map((finding) => normalizeFindingRecord(finding, { outsideDiff: true }))
+    .filter(Boolean)
+    .map((finding) => ({
+      ...finding,
+      kind: getFindingKind(finding),
+      confidence: finding.confidence || 'low',
+      fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
+    }));
   const scope = summarizeScope(fileEntries, instructions);
   const previousState = loadPreviousReviewState(repoRoot);
   const report = {
@@ -6659,7 +7806,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     repoRoot,
     scope,
     findings: rankedFindings,
-    outsideDiffFindings: reviewResult.outsideDiffFindings || [],
+    outsideDiffFindings: normalizedOutsideDiffFindings,
     codeReviewGraph: reviewResult.codeReviewGraph || null,
     runtimeAccessibility: reviewResult.runtimeAccessibility || null,
     stageSummaries: reviewResult.stageSummaries || [],
@@ -6684,6 +7831,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   report.verdict = deriveVerdictFromScore(report);
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit, report);
+  report.issueTracking = buildIssueTrackingPayload(report);
 
   report.reviewdogRendered = renderRdjson(report);
 
@@ -6702,7 +7850,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   }
 
   report.exitCode = shouldFail(report, options.failOn) ? 2 : 0;
-  saveReviewState(repoRoot, report);
+  saveReviewState(repoRoot, report, previousState);
   return report;
 }
 

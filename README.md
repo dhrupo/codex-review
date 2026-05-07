@@ -27,7 +27,7 @@ By default, `codex-review` aims to:
 - print PR-review style output to stdout
 - use Codex when available
 - fall back safely when Codex is unavailable
-- use `code-review-graph` for file impact and scoping when installed
+- use `code-review-graph` for file impact and scoping on every review
 
 ## Install
 
@@ -44,10 +44,10 @@ Then from any supported repo:
 codex-review
 ```
 
-Optional but recommended:
+Install the required graph companion once in the `codex-review` checkout:
 
 ```bash
-pip install code-review-graph
+npm run install:graph
 ```
 
 ## Daily Workflow
@@ -76,6 +76,8 @@ The default output is intentionally short and PR-like:
 - `Confidence Score`
 - merge stance
 
+JSON output now also includes a universal `issueTracking` payload with stable finding IDs, categories, severities, origins, fix hints, and re-review status such as `introduced`, `moved`, `partially-addressed`, and `regressed`.
+
 ## Repo Config
 
 Each target repo can define local defaults in `.codex/reviewer.yml`.
@@ -87,7 +89,7 @@ Start from:
 Repo-local config is where you tune:
 
 - base branch
-- code-review-graph usage and timeout
+- code-review-graph timeout
 - accessibility URLs
 - high-risk paths
 - critical paths
@@ -110,5 +112,6 @@ Typical WPManageNinja repos include:
 ## Notes
 
 - Most users should stop at `codex-review`.
+- `code-review-graph` is required; if it is missing, run `npm run install:graph` from the `codex-review` checkout.
 - Saving to Markdown does not need a separate flag; shell redirection is the simplest pattern.
 - If you need compact notes on config, fallback behavior, or advanced modes, use [docs.md](./docs.md).

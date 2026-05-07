@@ -29,7 +29,7 @@ By default, `codex-review` tries to:
 - review the current diff against the configured base branch
 - print PR-review style output to stdout
 - use Codex for deeper review when available
-- use `code-review-graph` for impact scoping when installed
+- use `code-review-graph` for impact scoping on every diff review
 - fall back to local review logic when Codex is unavailable or fails
 - include extra configured checks when the repo enables them
 
@@ -45,6 +45,8 @@ The normal output is intentionally short:
 - `Confidence Score`
 - merge stance
 
+If you run `--format json`, the report now includes an `issueTracking` section designed for universal issue ingestion. Each exported finding carries a stable ID, dedupe key, category, severity, confidence, origin, fix hint, and re-review status.
+
 ## Installation
 
 ```bash
@@ -57,10 +59,10 @@ npm link
 Recommended:
 
 ```bash
-pip install code-review-graph
+npm run install:graph
 ```
 
-`code-review-graph` is optional, but it improves changed-file scoping and file-level impact context.
+`code-review-graph` is required. The install command provisions it in a repo-local virtualenv so linked `codex-review` runs can always find the same CLI.
 
 ## Recommended Workflow
 
@@ -122,7 +124,7 @@ accessibility:
 - If you want to force local-only review, `--engine heuristic` is the main escape hatch.
 - If you want to change the base branch, set `base` in `.codex/reviewer.yml` or pass `--base`.
 - If you need machine-readable output, `--format json` exists, but it is not the normal day-to-day mode.
-- If you need to disable graph scoping for troubleshooting, use `--no-graph`.
+- If `code-review-graph` is missing or broken, rerun `npm run install:graph` in the `codex-review` checkout before reviewing again.
 
 ## Re-Review State
 
@@ -133,6 +135,13 @@ Local state is stored in:
 ```
 
 This lets later runs compare what was cleared, what remains, and what is newly introduced.
+
+Re-review memory now also tracks:
+
+- unchanged findings
+- findings that moved with the code path
+- partially addressed findings
+- regressions that were previously cleared and later reintroduced
 
 The comparison is only used for compatible runs, so unrelated workflow/scope changes do not get mixed into follow-up reviews.
 

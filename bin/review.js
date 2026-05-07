@@ -31,6 +31,7 @@ function printHelp() {
     Default output format is pr-review.
     Advanced flags still exist, but the normal workflow should stay on the two commands above.
     If you prefer built-in file writing over shell redirection, --report <path> is still available.
+    Run npm run install:graph once in the codex-review checkout; code-review-graph is required.
     Repo-specific defaults belong in .codex/reviewer.yml.
 `);
 }
