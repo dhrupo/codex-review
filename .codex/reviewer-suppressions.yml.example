@@ -1,0 +1,14 @@
+suppressions:
+  rules:
+    - id: accepted-risk-example
+      match:
+        dedupe_key: process-risk|process|high-risk-changes-landed-without-matching-test-changes
+      reason: accepted-risk
+      note: Manual verification is documented outside codex-review for this workflow.
+
+    - id: noisy-path-example
+      match:
+        path: src/legacy/**
+        category: process-risk
+      reason: false-positive
+      note: Legacy path is handled by a separate manual checklist until migrated.

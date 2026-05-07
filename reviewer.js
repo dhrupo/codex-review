@@ -115,6 +115,13 @@ const DEFAULT_CONFIG = {
   eslintEnabled: true,
   eslintConfig: 'auto',
   eslintTimeoutMs: DEFAULT_ESLINT_TIMEOUT_MS,
+  suppressionFile: null,
+  suppressionRules: [],
+  suppressedReport: true,
+  backlogReport: null,
+  ciEnabled: false,
+  ciFailOnSeverity: 'important',
+  ciFailOnRegression: true,
   reviewdogReport: null,
   a11yUrls: [],
   a11yWaitFor: null,
@@ -525,6 +532,12 @@ function parseArgs(argv) {
     eslintEnabled: true,
     eslintConfig: DEFAULT_CONFIG.eslintConfig,
     eslintTimeoutMs: DEFAULT_CONFIG.eslintTimeoutMs,
+    suppressionFile: null,
+    suppressedReport: DEFAULT_CONFIG.suppressedReport,
+    backlogReport: null,
+    ciEnabled: false,
+    ciFailOnSeverity: DEFAULT_CONFIG.ciFailOnSeverity,
+    ciFailOnRegression: DEFAULT_CONFIG.ciFailOnRegression,
     reviewdogReport: null,
     a11yUrls: [],
     a11yWaitFor: null,
@@ -651,6 +664,19 @@ function parseArgs(argv) {
       continue;
     }
 
+    if (arg === '--backlog-report' && argv[i + 1]) {
+      options.backlogReport = argv[i + 1];
+      options._explicit.backlogReport = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--backlog-report=')) {
+      options.backlogReport = arg.slice('--backlog-report='.length);
+      options._explicit.backlogReport = true;
+      continue;
+    }
+
     if (arg === '--max-findings' && argv[i + 1]) {
       options.maxFindings = Math.max(1, parseInt(argv[i + 1], 10) || DEFAULT_MAX_FINDINGS);
       options._explicit.maxFindings = true;
@@ -674,6 +700,31 @@ function parseArgs(argv) {
     if (arg.startsWith('--fail-on=')) {
       options.failOn = arg.slice('--fail-on='.length);
       options._explicit.failOn = true;
+      continue;
+    }
+
+    if (arg === '--ci') {
+      options.ciEnabled = true;
+      options._explicit.ciEnabled = true;
+      continue;
+    }
+
+    if (arg === '--no-ci') {
+      options.ciEnabled = false;
+      options._explicit.ciEnabled = true;
+      continue;
+    }
+
+    if (arg === '--ci-fail-on' && argv[i + 1]) {
+      options.ciFailOnSeverity = argv[i + 1];
+      options._explicit.ciFailOnSeverity = true;
+      i += 1;
+      continue;
+    }
+
+    if (arg.startsWith('--ci-fail-on=')) {
+      options.ciFailOnSeverity = arg.slice('--ci-fail-on='.length);
+      options._explicit.ciFailOnSeverity = true;
       continue;
     }
 
@@ -1019,6 +1070,90 @@ function normalizeContextRules(value) {
   }).filter(Boolean);
 }
 
+function normalizeOptionalStringArray(value) {
+  if (typeof value === 'string') {
+    return [value.trim()].filter(Boolean);
+  }
+
+  return normalizeStringArray(value);
+}
+
+function normalizeSuppressionRules(value, sourceLabel = 'inline-config') {
+  if (!isArray(value)) {
+    return [];
+  }
+
+  return value.map((rule, index) => {
+    if (!rule || typeof rule !== 'object') {
+      return null;
+    }
+
+    const match = rule.match && typeof rule.match === 'object' ? rule.match : rule;
+    const fingerprint = normalizeOptionalStringArray(match.fingerprint || match.fingerprints);
+    const dedupeKey = normalizeOptionalStringArray(
+      match.dedupe_key || match.dedupe_keys || match.dedupeKey || match.dedupeKeys || match.semantic_key || match.semanticKey
+    );
+    const pathPatterns = normalizePatternArray(match.path || match.paths || match.file || match.files);
+    const titleContains = normalizeOptionalStringArray(match.title_contains || match.titleContains || match.title);
+    const category = normalizeFindingCategory(match.category);
+    const severity = typeof match.severity === 'string' ? match.severity.trim().toLowerCase() : null;
+    const origin = normalizeFindingOrigin(match.origin);
+    const kind = typeof match.kind === 'string' ? match.kind.trim().toLowerCase() : null;
+    const reason = typeof rule.reason === 'string' ? rule.reason.trim() : 'false-positive';
+    const note = typeof rule.note === 'string' ? rule.note.trim() : '';
+    const expiresOn = typeof (rule.expires_on || rule.expiresOn) === 'string'
+      ? String(rule.expires_on || rule.expiresOn).trim()
+      : null;
+    const hasSelectors = fingerprint.length || dedupeKey.length || pathPatterns.length || titleContains.length || category || severity || origin || kind;
+
+    if (!hasSelectors) {
+      return null;
+    }
+
+    return {
+      id: typeof rule.id === 'string' && rule.id.trim()
+        ? rule.id.trim()
+        : `${sourceLabel}-${index + 1}`,
+      fingerprint,
+      dedupeKey,
+      pathPatterns,
+      titleContains,
+      category,
+      severity,
+      origin,
+      kind,
+      reason,
+      note: note || null,
+      expiresOn,
+      source: sourceLabel
+    };
+  }).filter(Boolean);
+}
+
+function loadSuppressionRulesFromFile(cwd, relativeFilePath) {
+  if (!relativeFilePath) {
+    return [];
+  }
+
+  const absolutePath = path.resolve(cwd, relativeFilePath);
+  if (!fileExists(absolutePath)) {
+    return [];
+  }
+
+  let parsed = {};
+  try {
+    parsed = yaml.load(safeReadFile(absolutePath)) || {};
+  } catch (error) {
+    throw new Error(`Invalid suppression file "${relativeFilePath}": ${error.message}`);
+  }
+
+  const rules = parsed.suppressions && parsed.suppressions.rules
+    ? parsed.suppressions.rules
+    : (parsed.rules || parsed.items || []);
+
+  return normalizeSuppressionRules(rules, path.relative(cwd, absolutePath) || relativeFilePath);
+}
+
 function normalizeReviewSignals(value) {
   const source = value && typeof value === 'object' ? value : {};
   return {
@@ -1115,6 +1250,19 @@ function loadRepoConfig(cwd) {
     throw new Error(`Invalid .codex/reviewer.yml: ${error.message}`);
   }
 
+  const suppressionConfig = parsed.suppressions && typeof parsed.suppressions === 'object' ? parsed.suppressions : {};
+  const defaultSuppressionFile = fileExists(path.join(cwd, '.codex', 'reviewer-suppressions.yml'))
+    ? '.codex/reviewer-suppressions.yml'
+    : DEFAULT_CONFIG.suppressionFile;
+  const suppressionFile = typeof (suppressionConfig.file || suppressionConfig.path || parsed.suppression_file || parsed.suppressionFile) === 'string'
+    ? String(suppressionConfig.file || suppressionConfig.path || parsed.suppression_file || parsed.suppressionFile).trim()
+    : defaultSuppressionFile;
+  const inlineSuppressionRules = normalizeSuppressionRules(
+    suppressionConfig.rules || parsed.suppression_rules || parsed.suppressionRules,
+    '.codex/reviewer.yml'
+  );
+  const fileSuppressionRules = loadSuppressionRulesFromFile(cwd, suppressionFile);
+
   return {
     configPath,
     config: {
@@ -1179,6 +1327,26 @@ function loadRepoConfig(cwd) {
       eslintTimeoutMs: normalizeInteger(
         (parsed.eslint && (parsed.eslint.timeout_ms || parsed.eslint.timeoutMs)) || parsed.eslint_timeout || parsed.eslintTimeout,
         DEFAULT_CONFIG.eslintTimeoutMs
+      ),
+      suppressionFile,
+      suppressionRules: inlineSuppressionRules.concat(fileSuppressionRules),
+      suppressedReport: normalizeBoolean(
+        (suppressionConfig.report_suppressed || suppressionConfig.reportSuppressed || parsed.report_suppressed || parsed.reportSuppressed),
+        DEFAULT_CONFIG.suppressedReport
+      ),
+      backlogReport: typeof ((parsed.backlog && (parsed.backlog.report || parsed.backlog.path)) || parsed.backlog_report || parsed.backlogReport) === 'string'
+        ? String((parsed.backlog && (parsed.backlog.report || parsed.backlog.path)) || parsed.backlog_report || parsed.backlogReport).trim()
+        : DEFAULT_CONFIG.backlogReport,
+      ciEnabled: normalizeBoolean(
+        (parsed.ci && parsed.ci.enabled) || parsed.ci_enabled || parsed.ciEnabled,
+        DEFAULT_CONFIG.ciEnabled
+      ),
+      ciFailOnSeverity: typeof ((parsed.ci && (parsed.ci.fail_on_severity || parsed.ci.failOnSeverity)) || parsed.ci_fail_on || parsed.ciFailOnSeverity) === 'string'
+        ? String((parsed.ci && (parsed.ci.fail_on_severity || parsed.ci.failOnSeverity)) || parsed.ci_fail_on || parsed.ciFailOnSeverity).trim().toLowerCase()
+        : DEFAULT_CONFIG.ciFailOnSeverity,
+      ciFailOnRegression: normalizeBoolean(
+        (parsed.ci && (parsed.ci.fail_on_regression || parsed.ci.failOnRegression)) || parsed.ci_fail_on_regression || parsed.ciFailOnRegression,
+        DEFAULT_CONFIG.ciFailOnRegression
       ),
       reviewdogReport: typeof ((parsed.reviewdog && (parsed.reviewdog.report)) || parsed.reviewdog_report || parsed.reviewdogReport) === 'string'
         ? ((parsed.reviewdog && (parsed.reviewdog.report)) || parsed.reviewdog_report || parsed.reviewdogReport)
@@ -1263,6 +1431,13 @@ function resolveOptions(rawOptions, repoConfig) {
   options.eslintEnabled = rawOptions._explicit.eslintEnabled ? rawOptions.eslintEnabled : repoConfig.eslintEnabled;
   options.eslintConfig = rawOptions._explicit.eslintConfig ? rawOptions.eslintConfig : repoConfig.eslintConfig;
   options.eslintTimeoutMs = rawOptions._explicit.eslintTimeoutMs ? rawOptions.eslintTimeoutMs : repoConfig.eslintTimeoutMs;
+  options.suppressionFile = repoConfig.suppressionFile;
+  options.suppressionRules = repoConfig.suppressionRules || DEFAULT_CONFIG.suppressionRules;
+  options.suppressedReport = repoConfig.suppressedReport;
+  options.backlogReport = rawOptions._explicit.backlogReport ? rawOptions.backlogReport : repoConfig.backlogReport;
+  options.ciEnabled = rawOptions._explicit.ciEnabled ? rawOptions.ciEnabled : repoConfig.ciEnabled;
+  options.ciFailOnSeverity = rawOptions._explicit.ciFailOnSeverity ? rawOptions.ciFailOnSeverity : repoConfig.ciFailOnSeverity;
+  options.ciFailOnRegression = repoConfig.ciFailOnRegression;
   options.reviewdogReport = rawOptions._explicit.reviewdogReport ? rawOptions.reviewdogReport : repoConfig.reviewdogReport;
   options.configNotes = repoConfig.notes;
   options.criticalPaths = repoConfig.criticalPaths || DEFAULT_CONFIG.criticalPaths;
@@ -4586,6 +4761,14 @@ function buildIssueTrackingPayload(report) {
     status: 'manual-follow-up',
     recheckStatus: 'manual-follow-up'
   }));
+  const suppressed = (report.suppressedFindings || []).map((entry) => ({
+    ...buildIssueTrackingFinding(report, entry.finding, {
+      outsideDiff: entry.scope === 'manual-follow-up',
+      status: 'suppressed',
+      recheckStatus: 'suppressed'
+    }),
+    suppression: entry.suppression
+  }));
 
   return {
     schemaVersion: 'codex-review.issue-tracking.v1',
@@ -4615,8 +4798,174 @@ function buildIssueTrackingPayload(report) {
       } : null
     },
     findings,
-    manualFollowUp
+    manualFollowUp,
+    suppressed
   };
+}
+
+function isSuppressionExpired(rule) {
+  if (!rule || !rule.expiresOn) {
+    return false;
+  }
+
+  const timestamp = Date.parse(rule.expiresOn);
+  if (!Number.isFinite(timestamp)) {
+    return false;
+  }
+
+  return timestamp < Date.now();
+}
+
+function findMatchingSuppression(finding, rules, options = {}) {
+  const normalized = normalizeStoredFindingRecord(finding, { outsideDiff: options.outsideDiff });
+  const dedupeKey = buildFindingSemanticKey(normalized);
+
+  for (const rule of (rules || [])) {
+    if (!rule || isSuppressionExpired(rule)) {
+      continue;
+    }
+
+    if (rule.kind && rule.kind !== getFindingKind(normalized)) {
+      continue;
+    }
+
+    if (rule.category && rule.category !== normalized.category) {
+      continue;
+    }
+
+    if (rule.severity && rule.severity !== normalized.severity) {
+      continue;
+    }
+
+    if (rule.origin && rule.origin !== normalized.origin) {
+      continue;
+    }
+
+    if (rule.fingerprint.length && !rule.fingerprint.includes(normalized.fingerprint)) {
+      continue;
+    }
+
+    if (rule.dedupeKey.length && !rule.dedupeKey.includes(dedupeKey)) {
+      continue;
+    }
+
+    if (rule.pathPatterns.length && !pathMatchesAnyPattern(normalized.file, rule.pathPatterns)) {
+      continue;
+    }
+
+    if (rule.titleContains.length) {
+      const title = String(normalized.title || '').toLowerCase();
+      if (!rule.titleContains.some((item) => title.includes(String(item).toLowerCase()))) {
+        continue;
+      }
+    }
+
+    return {
+      id: rule.id,
+      reason: rule.reason,
+      note: rule.note || null,
+      expiresOn: rule.expiresOn || null,
+      source: rule.source
+    };
+  }
+
+  return null;
+}
+
+function applyFindingSuppressions(findings, rules, options = {}) {
+  const visible = [];
+  const suppressed = [];
+
+  (findings || []).forEach((finding) => {
+    const suppression = findMatchingSuppression(finding, rules, options);
+    if (suppression) {
+      suppressed.push({
+        finding: normalizeStoredFindingRecord(finding, { outsideDiff: options.outsideDiff }),
+        suppression,
+        scope: options.outsideDiff ? 'manual-follow-up' : 'confirmed'
+      });
+      return;
+    }
+
+    visible.push(finding);
+  });
+
+  return {
+    visible,
+    suppressed
+  };
+}
+
+function buildBacklogPayload(report) {
+  return {
+    schemaVersion: 'codex-review.backlog.v1',
+    generatedAt: report.generatedAt,
+    repo: report.repoLabel,
+    workflow: report.workflow || null,
+    baseRef: report.baseRef,
+    reviewedCommit: report.reviewedCommit || null,
+    review: {
+      verdict: report.verdict,
+      confidenceScore: report.confidenceScore,
+      engine: report.engine,
+      reviewDepth: report.reviewDepth
+    },
+    issueTracking: report.issueTracking,
+    ci: report.ci || null,
+    notes: report.notes || []
+  };
+}
+
+function buildSeverityRankMap() {
+  return {
+    low: 0,
+    medium: 1,
+    important: 2,
+    critical: 3
+  };
+}
+
+function buildCiSummary(report, options) {
+  if (!options.ciEnabled) {
+    return {
+      enabled: false,
+      status: 'disabled',
+      failOnSeverity: options.ciFailOnSeverity || null,
+      failOnRegression: Boolean(options.ciFailOnRegression),
+      reasons: []
+    };
+  }
+
+  const reasons = [];
+  const order = buildSeverityRankMap();
+  const threshold = options.ciFailOnSeverity && order[options.ciFailOnSeverity] !== undefined
+    ? options.ciFailOnSeverity
+    : DEFAULT_CONFIG.ciFailOnSeverity;
+
+  if (options.ciFailOnRegression && report.recheck && report.recheck.regressed && report.recheck.regressed.length) {
+    reasons.push(`${report.recheck.regressed.length} previously cleared finding(s) regressed.`);
+  }
+
+  const blockingCount = report.findings.filter((finding) => order[finding.severity] >= order[threshold]).length;
+  if (blockingCount) {
+    reasons.push(`${blockingCount} open finding(s) met the CI severity threshold (${threshold}).`);
+  }
+
+  return {
+    enabled: true,
+    status: reasons.length ? 'fail' : 'pass',
+    failOnSeverity: threshold,
+    failOnRegression: Boolean(options.ciFailOnRegression),
+    reasons
+  };
+}
+
+function computeExitCode(report, options) {
+  if (report.ci && report.ci.enabled && report.ci.status === 'fail') {
+    return 2;
+  }
+
+  return shouldFail(report, options.failOn) ? 2 : 0;
 }
 
 function slugifyHeading(text) {
@@ -5276,6 +5625,14 @@ function renderText(report) {
     });
   }
 
+  if (report.ci && report.ci.enabled) {
+    lines.push('', 'CI Status:');
+    lines.push(`- Status: ${report.ci.status}`);
+    lines.push(`- Fail on severity: ${report.ci.failOnSeverity}`);
+    lines.push(`- Fail on regression: ${report.ci.failOnRegression ? 'yes' : 'no'}`);
+    (report.ci.reasons || []).forEach((reason) => lines.push(`- ${reason}`));
+  }
+
   if (report.recheck) {
     lines.push('', 'Recheck Status:');
     if (report.recheck.previousCommit) {
@@ -5385,6 +5742,20 @@ function renderText(report) {
       lines.push('');
       buildOutsideDiffPrompt(report, finding).split('\n').forEach((line) => lines.push(`   ${line}`));
       lines.push('');
+    });
+  }
+
+  if (report.suppressedReport && report.suppressedFindings && report.suppressedFindings.length) {
+    lines.push('', 'Suppressed Findings', '');
+    report.suppressedFindings.forEach((entry, index) => {
+      lines.push(`${index + 1}. ${entry.finding.title}`);
+      lines.push(`   Scope: ${entry.scope}`);
+      lines.push(`   Location: ${entry.finding.file}:${entry.finding.line}`);
+      lines.push(`   Suppression reason: ${entry.suppression.reason}`);
+      if (entry.suppression.note) {
+        lines.push(`   Note: ${entry.suppression.note}`);
+      }
+      lines.push(`   Rule: ${entry.suppression.id}`);
     });
   }
 
@@ -5704,6 +6075,14 @@ function renderMarkdown(report) {
     report.runtimeAccessibility.pages.forEach((page) => lines.push(`- ${page.url} (${page.violations} violation(s))`));
   }
 
+  if (report.ci && report.ci.enabled) {
+    lines.push('', '## CI Status', '');
+    lines.push(`- Status: \`${report.ci.status}\``);
+    lines.push(`- Fail on severity: \`${report.ci.failOnSeverity}\``);
+    lines.push(`- Fail on regression: ${report.ci.failOnRegression ? 'yes' : 'no'}`);
+    (report.ci.reasons || []).forEach((reason) => lines.push(`- ${reason}`));
+  }
+
   if (report.recheck) {
     lines.push('', '## Recheck Status', '');
     if (report.recheck.previousCommit) {
@@ -5832,6 +6211,23 @@ function renderMarkdown(report) {
       lines.push(buildOutsideDiffPrompt(report, finding));
       lines.push('```');
       lines.push('</details>');
+      lines.push('');
+    });
+  }
+
+  if (report.suppressedReport && report.suppressedFindings && report.suppressedFindings.length) {
+    lines.push('## Suppressed Findings', '');
+    report.suppressedFindings.forEach((entry, index) => {
+      lines.push(`### ${index + 1}. ${entry.finding.title}`);
+      lines.push('');
+      lines.push(`- Scope: \`${entry.scope}\``);
+      lines.push(`- Location: \`${entry.finding.file}:${entry.finding.line}\``);
+      lines.push(`- Category: \`${entry.finding.category}\``);
+      lines.push(`- Suppression reason: \`${entry.suppression.reason}\``);
+      lines.push(`- Rule: \`${entry.suppression.id}\``);
+      if (entry.suppression.note) {
+        lines.push(`- Note: ${entry.suppression.note}`);
+      }
       lines.push('');
     });
   }
@@ -7769,8 +8165,10 @@ function buildFinalReport(options, reviewContext, reviewResult) {
       fixDirection: finding.fixDirection,
       fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
     }));
-  const rankedFindings = rankFindings(normalizedFindings).slice(0, options.maxFindings);
-  const normalizedOutsideDiffFindings = (reviewResult.outsideDiffFindings || [])
+  const rankedCandidateFindings = rankFindings(normalizedFindings).slice(0, options.maxFindings);
+  const confirmedSuppressionResult = applyFindingSuppressions(rankedCandidateFindings, options.suppressionRules || []);
+  const rankedFindings = confirmedSuppressionResult.visible;
+  const normalizedOutsideDiffCandidates = (reviewResult.outsideDiffFindings || [])
     .map((finding) => normalizeFindingRecord(finding, { outsideDiff: true }))
     .filter(Boolean)
     .map((finding) => ({
@@ -7779,6 +8177,12 @@ function buildFinalReport(options, reviewContext, reviewResult) {
       confidence: finding.confidence || 'low',
       fingerprint: finding.fingerprint || buildFindingFingerprint(finding)
     }));
+  const outsideDiffSuppressionResult = applyFindingSuppressions(
+    normalizedOutsideDiffCandidates,
+    options.suppressionRules || [],
+    { outsideDiff: true }
+  );
+  const normalizedOutsideDiffFindings = outsideDiffSuppressionResult.visible;
   const scope = summarizeScope(fileEntries, instructions);
   const previousState = loadPreviousReviewState(repoRoot);
   const report = {
@@ -7786,6 +8190,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     confidenceScore: 0,
     workflow: options.workflow || null,
     reportPath: options.report || null,
+    backlogReportPath: options.backlogReport || null,
     reviewdogReportPath: options.reviewdogReport || null,
     workflowData: reviewResult.workflowData || null,
     currentBranch,
@@ -7807,6 +8212,8 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     scope,
     findings: rankedFindings,
     outsideDiffFindings: normalizedOutsideDiffFindings,
+    suppressedFindings: confirmedSuppressionResult.suppressed.concat(outsideDiffSuppressionResult.suppressed),
+    suppressedReport: options.suppressedReport,
     codeReviewGraph: reviewResult.codeReviewGraph || null,
     runtimeAccessibility: reviewResult.runtimeAccessibility || null,
     stageSummaries: reviewResult.stageSummaries || [],
@@ -7831,9 +8238,15 @@ function buildFinalReport(options, reviewContext, reviewResult) {
   report.verdict = deriveVerdictFromScore(report);
 
   report.recheck = buildRecheckState(previousState, rankedFindings, reviewedCommit, report);
+  if (report.suppressedFindings.length) {
+    report.notes = report.notes.concat(`Suppressed ${report.suppressedFindings.length} finding(s) using configured suppression rules.`);
+  }
   report.issueTracking = buildIssueTrackingPayload(report);
+  report.ci = buildCiSummary(report, options);
+  report.backlog = buildBacklogPayload(report);
 
   report.reviewdogRendered = renderRdjson(report);
+  report.backlogRendered = JSON.stringify(report.backlog, null, 2);
 
   if (options.format === 'json') {
     report.rendered = JSON.stringify(report, null, 2);
@@ -7849,7 +8262,7 @@ function buildFinalReport(options, reviewContext, reviewResult) {
     report.rendered = renderText(report);
   }
 
-  report.exitCode = shouldFail(report, options.failOn) ? 2 : 0;
+  report.exitCode = computeExitCode(report, options);
   saveReviewState(repoRoot, report, previousState);
   return report;
 }

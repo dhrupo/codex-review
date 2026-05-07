@@ -90,6 +90,16 @@ codex:
 code_review_graph:
   enabled: true
   timeout_ms: 120000
+suppressions:
+  report_suppressed: true
+  file: .codex/reviewer-suppressions.yml
+  rules: []
+backlog:
+  report: codex-review-backlog.json
+ci:
+  enabled: false
+  fail_on_severity: important
+  fail_on_regression: true
 semgrep:
   enabled: true
   config: auto

@@ -24,6 +24,8 @@ function printHelp() {
     --base <ref>              Base ref to diff against
     --engine <name>           Review engine: auto, codex, heuristic
     --fail-on <severity>      Exit non-zero for low, medium, important, or critical findings
+    --backlog-report <path>   Write universal issue backlog JSON
+    --ci                      Enable CI gating on regressions and severity
     -h, --help                Show help
     -v, --version             Show version
 
@@ -75,6 +77,11 @@ async function main() {
     if (report.reviewdogReportPath) {
       const resolvedReviewdogPath = path.resolve(process.cwd(), report.reviewdogReportPath);
       fs.writeFileSync(resolvedReviewdogPath, report.reviewdogRendered);
+    }
+
+    if (report.backlogReportPath) {
+      const resolvedBacklogPath = path.resolve(process.cwd(), report.backlogReportPath);
+      fs.writeFileSync(resolvedBacklogPath, report.backlogRendered);
     }
 
     console.log(report.rendered);

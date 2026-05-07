@@ -89,6 +89,7 @@ Each target repo can include `.codex/reviewer.yml`.
 Start from:
 
 - [`.codex/reviewer.yml.example`](./.codex/reviewer.yml.example)
+- [`.codex/reviewer-suppressions.yml.example`](./.codex/reviewer-suppressions.yml.example)
 
 Typical bootstrap:
 
@@ -101,6 +102,9 @@ Useful config areas:
 
 - `base`
 - `code_review_graph`
+- `suppressions`
+- `backlog`
+- `ci`
 - `accessibility`
 
 Example:
@@ -111,6 +115,18 @@ base: origin/dev
 code_review_graph:
   enabled: true
   timeout_ms: 120000
+
+suppressions:
+  report_suppressed: true
+  file: .codex/reviewer-suppressions.yml
+
+backlog:
+  report: codex-review-backlog.json
+
+ci:
+  enabled: true
+  fail_on_severity: important
+  fail_on_regression: true
 
 accessibility:
   urls:
@@ -124,6 +140,8 @@ accessibility:
 - If you want to force local-only review, `--engine heuristic` is the main escape hatch.
 - If you want to change the base branch, set `base` in `.codex/reviewer.yml` or pass `--base`.
 - If you need machine-readable output, `--format json` exists, but it is not the normal day-to-day mode.
+- If you want a persistent universal backlog file, use `--backlog-report <path>` or `backlog.report` in repo config.
+- If you want CI-safe exit codes based on regressions and severity, use `--ci`.
 - If `code-review-graph` is missing or broken, rerun `npm run install:graph` in the `codex-review` checkout before reviewing again.
 
 ## Re-Review State

@@ -78,6 +78,12 @@ The default output is intentionally short and PR-like:
 
 JSON output now also includes a universal `issueTracking` payload with stable finding IDs, categories, severities, origins, fix hints, and re-review status such as `introduced`, `moved`, `partially-addressed`, and `regressed`.
 
+You can also:
+
+- suppress known false positives or accepted risks through repo config
+- write a universal backlog JSON file with `--backlog-report <path>`
+- enable CI gating with `--ci`
+
 ## Repo Config
 
 Each target repo can define local defaults in `.codex/reviewer.yml`.
@@ -85,11 +91,15 @@ Each target repo can define local defaults in `.codex/reviewer.yml`.
 Start from:
 
 - [`.codex/reviewer.yml.example`](./.codex/reviewer.yml.example)
+- [`.codex/reviewer-suppressions.yml.example`](./.codex/reviewer-suppressions.yml.example)
 
 Repo-local config is where you tune:
 
 - base branch
 - code-review-graph timeout
+- suppression rules and reporting
+- backlog export path
+- CI thresholds
 - accessibility URLs
 - high-risk paths
 - critical paths
