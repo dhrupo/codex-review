@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Volumes/Dev/Plugins/fluent-player-pro/app/Services/**)",
+      "Read(//Volumes/Dev/Plugins/fluent-player-pro/app/Services/PluginManager/**)",
+      "Read(//Volumes/Dev/Plugins/fluent-player-pro/**)",
+      "Bash(/Volumes/Dev/Utils/codex-review/bin/review.js --engine heuristic --base origin/dev)",
+      "Bash(node -c /Volumes/Dev/Utils/codex-review/reviewer.js)",
+      "Read(//Volumes/Dev/Plugins/fluent-player-dev/**)",
+      "Bash(npm test *)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "fluent-dev"
+  ]
+}

@@ -2448,6 +2448,7 @@ function extractPotentialContractKeys(changedLines) {
 }
 
 function buildUniversalCrossFileFindings(reviewContext, options, graphAnalysis) {
+  const findings = [];
   const outsideDiffFindings = [];
   const notes = [];
   const consumerPathPattern = /(component|view|renderer|render|frontend|client|editor|form|model|store|consumer|type|schema|parser|shortcode|block)/i;
@@ -2502,11 +2503,115 @@ function buildUniversalCrossFileFindings(reviewContext, options, graphAnalysis) 
     });
   });
 
+  const filterToVHtmlFindings = detectFilterFedVHtmlSinks(reviewContext);
+  filterToVHtmlFindings.forEach((finding) => findings.push(finding));
+
   if (outsideDiffFindings.length) {
     notes.push(`Universal contract tracing flagged ${outsideDiffFindings.length} producer/consumer follow-up item(s).`);
   }
+  if (findings.length) {
+    notes.push(`Universal cross-file tracing flagged ${findings.length} confirmed cross-file issue(s) (e.g. filter-fed v-html sinks).`);
+  }
 
-  return { outsideDiffFindings, notes };
+  return { findings, outsideDiffFindings, notes };
+}
+
+function detectFilterFedVHtmlSinks(reviewContext) {
+  const findings = [];
+  const phpEntries = reviewContext.fileEntries.filter((entry) => /\.php$/i.test(entry.path));
+  const vueEntries = reviewContext.fileEntries.filter((entry) => /\.vue$/i.test(entry.path));
+  if (!phpEntries.length || !vueEntries.length) {
+    return findings;
+  }
+
+  const seenSinks = new Set();
+  const localizationProducers = [];
+  phpEntries.forEach((entry) => {
+    const content = getCurrentContentForContext(reviewContext, entry.path);
+    if (!content) {
+      return;
+    }
+
+    const localizeKeys = [];
+    const localizeRegex = /wp_localize_script\s*\(\s*[^,]+,\s*['"]([^'"]+)['"]/g;
+    let localizeMatch;
+    while ((localizeMatch = localizeRegex.exec(content)) !== null) {
+      localizeKeys.push(localizeMatch[1]);
+    }
+    if (!localizeKeys.length) {
+      return;
+    }
+
+    const filterFieldRegex = /['"]([a-zA-Z0-9_\-]+)['"]\s*=>\s*apply_filters\s*\(\s*['"]([^'"]+)['"]/g;
+    let fieldMatch;
+    const fileMentionsKses = /\bwp_kses[a-z_]*\s*\(/.test(content);
+    while ((fieldMatch = filterFieldRegex.exec(content)) !== null) {
+      const fieldKey = fieldMatch[1];
+      const filterName = fieldMatch[2];
+      localizeKeys.forEach((localizeKey) => {
+        localizationProducers.push({
+          phpFile: entry.path,
+          localizeKey,
+          fieldKey,
+          filterName,
+          fileMentionsKses
+        });
+      });
+    }
+  });
+
+  if (!localizationProducers.length) {
+    return findings;
+  }
+
+  vueEntries.forEach((entry) => {
+    const content = getCurrentContentForContext(reviewContext, entry.path);
+    if (!content || !/v-html\s*=/.test(content)) {
+      return;
+    }
+    const vHtmlRegex = /v-html\s*=\s*["']([^"']+)["']/g;
+    let vHtmlMatch;
+    while ((vHtmlMatch = vHtmlRegex.exec(content)) !== null) {
+      const binding = vHtmlMatch[1].trim();
+      localizationProducers.forEach((producer) => {
+        const localizeKeyTouched = new RegExp(`window\\.?\\??\\.?${producer.localizeKey}\\b`).test(content)
+          || content.includes(producer.localizeKey);
+        const fieldKeyTouched = new RegExp(`\\b${producer.fieldKey}\\b`).test(content);
+        if (!localizeKeyTouched || !fieldKeyTouched) {
+          return;
+        }
+        const bindingLooksHtmlShaped = /\b(html|content|message|markup|notice|body)\b/i.test(binding);
+        if (!bindingLooksHtmlShaped) {
+          return;
+        }
+        if (producer.fileMentionsKses) {
+          return;
+        }
+        const sinkKey = `${entry.path}|${binding}|${producer.phpFile}|${producer.fieldKey}`;
+        if (seenSinks.has(sinkKey)) {
+          return;
+        }
+        seenSinks.add(sinkKey);
+        findings.push({
+          kind: 'product',
+          severity: 'critical',
+          confidence: 'high',
+          category: 'output-safety',
+          origin: 'companion-path',
+          file: entry.path,
+          line: findLineNumber(content, /v-html\s*=/) || 1,
+          title: 'Filter-fed HTML rendered through v-html without server-side sanitization',
+          evidence: `\`${producer.phpFile}\` localizes \`apply_filters('${producer.filterName}', ...)\` under field \`${producer.fieldKey}\` via \`wp_localize_script('${producer.localizeKey}', ...)\` without wp_kses_*, and \`${entry.path}\` renders \`v-html="${binding}"\` against the same window key.`,
+          impact: 'Any plugin or theme hooked into this filter can inject arbitrary markup or script into the admin SPA — a confirmed admin XSS sink.',
+          explanation: 'Filters are extension points: by default the producer cannot assume the returned payload is safe HTML. Combined with v-html, the rendered SPA executes whatever a third-party hook returns.',
+          verification: 'Hook into the filter from a sibling plugin, return a string containing `<script>alert(1)</script>` or an event-handling attribute, and confirm the markup is rendered into the admin DOM.',
+          fixDirection: 'Sanitize each entry server-side with wp_kses_post (or stricter) before localizing, or replace the v-html binding with text rendering and a separate, schema-validated rich-content channel.'
+        });
+      });
+    }
+  });
+
+  return findings;
 }
 
 function getChangedPathsSet(fileEntries) {
@@ -3423,6 +3528,30 @@ function analyzeFile(context) {
         fixDirection: 'Stop using v-html for dynamic preview strings, or escape every dynamic segment before composing HTML and injecting it.'
       });
     }
+
+    const newVHtmlLine = changedLines.find((entry) => /v-html\s*=\s*["'][^"']+["']/.test(entry.text));
+    if (newVHtmlLine && !unsafePreviewBinding) {
+      const bindingMatch = newVHtmlLine.text.match(/v-html\s*=\s*["']([^"']+)["']/);
+      const binding = bindingMatch ? bindingMatch[1].trim() : '';
+      const usesClientSanitizer = /\b(DOMPurify\.sanitize|sanitizeHtml|escapeHtml|escape\()/i.test(binding)
+        || /\b(DOMPurify\.sanitize|sanitizeHtml)\s*\(/i.test(currentContent);
+      if (binding && !usesClientSanitizer) {
+        pushFinding(findings, {
+          severity: 'important',
+          confidence: 'medium',
+          category: 'output-safety',
+          origin: 'direct-diff',
+          file: filePath,
+          line: newVHtmlLine.line,
+          title: 'New v-html binding rendered without a visible client-side sanitizer',
+          evidence: `The changed template adds \`v-html="${binding}"\` and the bound expression is not piped through DOMPurify/sanitizeHtml/escapeHtml in this file.`,
+          impact: 'If the bound value originates from a server filter, REST response, translation, or any consumer-extensible source, the admin/frontend page becomes an XSS sink.',
+          explanation: 'Vue escapes normal interpolation by default; v-html bypasses that. Adding a v-html binding without a visible sanitizer requires the producer to guarantee every byte of the string is already safe HTML, which is rare for filter/hook-fed payloads.',
+          verification: 'Trace the producer of the bound expression (REST response, wp_localize_script payload, prop chain, store) and confirm it runs through wp_kses_post or an equivalent sanitizer before reaching this binding.',
+          fixDirection: 'Either sanitize the bound value server-side with wp_kses_post (or a stricter allowlist), sanitize client-side with DOMPurify before rendering, or replace v-html with text interpolation.'
+        });
+      }
+    }
   }
 
   if (runAccessibilityChecks && isFrontendFile) {
@@ -3578,7 +3707,48 @@ function analyzeFile(context) {
 
 function collectDeterministicFindings(context) {
   const findings = [];
-  const { filePath, currentContent } = context;
+  const { filePath, currentContent, changedLines } = context;
+
+  if (currentContent && /\.php$/i.test(filePath) && Array.isArray(changedLines) && changedLines.length) {
+    const sensitiveKeys = /^(item_id|product_id|store_id|license_id|api_key|api_url|store_url|client_id|client_secret|webhook_secret|stripe_secret|webhook_url|gateway_id|app_id|merchant_id|tenant_id)$/i;
+    const sentinelValueRegex = /=>\s*(0|''|""|'TODO'|"TODO"|'REPLACE_ME'|"REPLACE_ME"|'xxx'|"xxx"|'changeme'|"changeme")(\s*,)?\s*(\/\/.*)?$/;
+    const placeholderHit = changedLines.find((entry, index, list) => {
+      if (!sentinelValueRegex.test(entry.text)) {
+        return false;
+      }
+      const keyMatch = entry.text.match(/['"]([a-zA-Z0-9_\-]+)['"]\s*=>/);
+      if (!keyMatch || !sensitiveKeys.test(keyMatch[1])) {
+        return false;
+      }
+      const before = list
+        .slice(Math.max(0, index - 3), index)
+        .map((line) => line.text)
+        .join('\n');
+      const adjacentTodo = /\/\/\s*(TODO|FIXME|XXX)\b|#\s*(TODO|FIXME|XXX)\b/.test(before)
+        || /\/\/\s*(TODO|FIXME|XXX)\b/.test(entry.text);
+      const onSelfSentinelLiteral = /TODO|REPLACE_ME|xxx|changeme/i.test(entry.text);
+      return adjacentTodo || onSelfSentinelLiteral;
+    });
+    if (placeholderHit) {
+      const keyMatch = placeholderHit.text.match(/['"]([a-zA-Z0-9_\-]+)['"]\s*=>/);
+      const fieldKey = keyMatch ? keyMatch[1] : 'placeholder';
+      pushFinding(findings, {
+        kind: 'product',
+        severity: 'critical',
+        confidence: 'high',
+        category: 'process-risk',
+        origin: 'direct-diff',
+        file: filePath,
+        line: placeholderHit.line,
+        title: `Placeholder value still wired into \`${fieldKey}\` registration`,
+        evidence: `The changed line registers \`${fieldKey}\` with a placeholder/sentinel value (\`${placeholderHit.text.trim()}\`) and either carries an adjacent TODO/FIXME marker or uses an unmistakable sentinel literal.`,
+        impact: 'Activation, licensing, integration, or REST handshake calls inherit this value at runtime, so requests fail to identify the product, hit the wrong endpoint, or never authenticate correctly until it is replaced.',
+        explanation: 'Sentinel values in registration code are usually placed during refactors with a "replace before shipping" note. Shipping them ships a broken integration even though every surrounding line looks normal.',
+        verification: `Replace the placeholder with the real \`${fieldKey}\` value and exercise every consumer (activation, status refresh, deactivation, update checks, REST handshake) end-to-end.`,
+        fixDirection: `Resolve the TODO and substitute the real \`${fieldKey}\` value before merging; remove the placeholder marker once the value is set.`
+      });
+    }
+  }
 
   if (!currentContent || !/\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)) {
     return findings;
@@ -4568,7 +4738,16 @@ function buildConfidenceLabel(score) {
 }
 
 function isSafeToMerge(report) {
-  return Boolean(report && report.confidenceScore >= 4 && !report.findings.length);
+  if (!report || report.confidenceScore < 4) {
+    return false;
+  }
+  if ((report.findings || []).length) {
+    return false;
+  }
+  const blockingOutside = (report.outsideDiffFindings || []).filter(
+    (finding) => finding && (finding.severity === 'critical' || finding.severity === 'important')
+  );
+  return blockingOutside.length === 0;
 }
 
 function deriveVerdictFromScore(report) {
@@ -4580,8 +4759,20 @@ function deriveVerdictFromScore(report) {
     return 'APPROVE';
   }
 
+  const outsideHasBlocker = (report.outsideDiffFindings || []).some(
+    (finding) => finding && (finding.severity === 'critical' || (finding.severity === 'important' && finding.confidence !== 'low'))
+  );
+
   if (report.findings && report.findings.length) {
-    return report.verdict || buildVerdict(report.findings);
+    const baseVerdict = report.verdict || buildVerdict(report.findings);
+    if (outsideHasBlocker && baseVerdict === 'COMMENT') {
+      return 'REQUEST_CHANGES';
+    }
+    return baseVerdict;
+  }
+
+  if (outsideHasBlocker) {
+    return 'REQUEST_CHANGES';
   }
 
   return report.verdict || 'COMMENT';
@@ -6241,11 +6432,18 @@ function renderMarkdown(report) {
 
 function renderPrReview(report) {
   const counts = buildFindingSummary(report.findings);
-  const blockerCount = countBlockerFindings(report.findings);
+  const outsideBlockerFindings = (report.outsideDiffFindings || []).filter(
+    (finding) => finding && (finding.severity === 'critical' || finding.severity === 'important')
+  );
+  const outsideCounts = buildFindingSummary(outsideBlockerFindings);
+  const blockerCount = countBlockerFindings(report.findings) + outsideBlockerFindings.length;
   const allDisplayFindings = getFindingDisplayEntries(report.findings);
-  const displayFindings = blockerCount
+  const inDiffDisplay = blockerCount
     ? allDisplayFindings.filter((finding) => finding.severity === 'critical' || finding.severity === 'important')
     : allDisplayFindings.slice(0, 2);
+  const displayFindings = inDiffDisplay.concat(
+    outsideBlockerFindings.map((finding) => ({ ...finding, _outsideDiff: true }))
+  );
   const lines = [
     '### Summary',
     '',
@@ -6270,13 +6468,20 @@ function renderPrReview(report) {
   if (displayFindings.length) {
     lines.push('');
     displayFindings.forEach((finding) => {
-      lines.push(`  * ${finding.title} (\`${finding.file}:${finding.line}\`)`);
+      const suffix = finding._outsideDiff ? ' [outside diff]' : '';
+      lines.push(`  * ${finding.title} (\`${finding.file}:${finding.line}\`)${suffix}`);
     });
   }
 
+  const totalCritical = counts.critical + outsideCounts.critical;
+  const totalImportant = counts.important + outsideCounts.important;
+  const outsideSuffix = outsideBlockerFindings.length
+    ? ` (${outsideCounts.critical} Critical + ${outsideCounts.important} Important outside the changed lines).`
+    : '';
+
   lines.push('', `### Confidence Score: ${report.confidenceScore}/5`, '');
   lines.push(`  * Merge stance: \`${report.verdict.replace('_', ' ')}\`${(report.confidenceScore <= 3 || blockerCount) ? ' because the current review is not safe to merge.' : (isSafeToMerge(report) ? ' and the current review is safe to merge.' : ' with no confirmed blocker-level findings.')}`);
-  lines.push(`  * Verification confirmed ${counts.critical} Critical and ${counts.important} Important finding(s) in the changed files.${report.keyChanges.length ? ` ${report.keyChanges[0]}` : ''}`);
+  lines.push(`  * Verification confirmed ${totalCritical} Critical and ${totalImportant} Important finding(s) in the changed files.${outsideSuffix}${report.keyChanges.length ? ` ${report.keyChanges[0]}` : ''}`);
 
   if (report.reviewedCommit) {
     lines.push(`Last reviewed commit: \`${report.reviewedCommit}\``);
@@ -7239,7 +7444,8 @@ function buildPrompt(payload) {
       'Workflow: plugin-audit.',
       'Emulate five workstreams: security, performance/optimization, dead code/duplication, UI-to-handler traceability, and handler-to-service/database traceability.',
       'Re-verify every critical or important candidate before returning it as a confirmed finding.',
-      'If the exploitability or operational impact is not proven strongly enough, move it to outside_diff_findings instead of overstating severity.'
+      'Keep confirmed XSS sinks, auth/nonce/capability bugs, contract regressions, and placeholder/TODO values that ship in registration code in findings — not outside_diff_findings — even when the producer/consumer split spans files in the same diff.',
+      'Reserve outside_diff_findings for follow-ups that cannot be proven from the supplied diff and file contexts at all, e.g. behavior depending on code or runtime state not present in this review.'
     );
   }
 
@@ -7257,7 +7463,7 @@ function buildPrompt(payload) {
     'Make the review explanatory. For each finding, explain the concrete failure mode or regression scenario, why the changed code creates that risk, and what the developer should verify next.',
     'Prefer explanations that mention the affected workflow, such as payment acceptance, webhook verification, option persistence, route access, or rendering behavior.',
     'When payload keys, option identifiers, hook names, event names, or response fields change, trace likely producer/consumer contracts before approving.',
-    'When a changed file looks like a producer but the consumer is not clearly shown in the changed scope, prefer outside_diff_findings instead of silently assuming the contract is still satisfied.',
+    'When a changed file looks like a producer but the consumer is not clearly shown in the changed scope, prefer outside_diff_findings instead of silently assuming the contract is still satisfied. If both the producer and the consumer are visible in the supplied diff or file contexts, keep the finding in findings with the correct severity.',
     'When a change touches auth, scope, IDs, nonces, permission callbacks, or policy helpers, verify the same identifier is used for lookup, authorization, and mutation before approving.',
     'When a frontend diff adds state-sync helpers, CSS state classes, or input/change/blur listeners, trace reset, clear, success, and teardown paths in the same file before approving.',
     'When a frontend diff introduces interactive grid, card, or multi-column choice layouts, check mobile breakpoints and narrow-viewport usability before approving.',
@@ -7477,11 +7683,11 @@ function getCodexBatchSize(reviewDepth, changedFileCount) {
 }
 
 function getCodexDeepFileLimit(reviewDepth, changedFileCount) {
-  if (changedFileCount <= 3) {
+  if (changedFileCount <= 8) {
     return changedFileCount;
   }
 
-  return reviewDepth === 'thorough' ? 3 : 2;
+  return reviewDepth === 'thorough' ? Math.min(changedFileCount, 12) : Math.min(changedFileCount, 8);
 }
 
 function shouldRunDeepCodexPass(entry, reviewContext, heuristicSeed, resolvedOptions, graphAnalysis) {
@@ -7884,6 +8090,7 @@ async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolv
     notes.push(`Deep Codex passes focused on ${deepEntries.length} highest-signal file(s); the overview pass still covered all ${changedEntries.length} scoped file(s).`);
   }
 
+  const overviewIncludesContent = changedEntries.length <= 8;
   const overviewPayload = buildCodexPayload(
     reviewContext,
     resolvedOptions,
@@ -7894,7 +8101,7 @@ async function runCodexMultiPassReviewAsync(reviewContext, heuristicSeed, resolv
     extraContext.matchedRules,
     {
       ...CODEX_CONTEXT_BUDGETS.overview,
-      includeContent: false
+      includeContent: overviewIncludesContent
     },
     'overview',
     'Cross-file workflow, persistence, lifecycle, and blocker-level contract analysis across the full diff.',
@@ -8050,6 +8257,7 @@ function runHeuristicReview(options, reviewContext, notes = [], engine = 'heuris
   }
 
   const universalCrossFileReview = buildUniversalCrossFileFindings(reviewContext, options, graphAnalysis);
+  (universalCrossFileReview.findings || []).forEach((finding) => pushFinding(findings, finding));
   universalCrossFileReview.outsideDiffFindings.forEach((finding) => pushOutsideDiffFinding(outsideDiffFindings, finding));
   notes.push(...(universalCrossFileReview.notes || []));
 
