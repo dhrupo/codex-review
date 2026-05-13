@@ -2442,6 +2442,48 @@ function changedLinesOverlapRange(changedLines, startLine, endLine) {
   return changedLines.some((entry) => entry.line >= startLine && entry.line <= endLine);
 }
 
+function getPhpEnclosingFunctionName(content, lineNumber) {
+  const lines = content.split('\n');
+  const startIndex = Math.max(0, (lineNumber || 1) - 1);
+
+  for (let index = startIndex; index >= 0; index -= 1) {
+    const match = lines[index].match(/\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return '';
+}
+
+function getPhpStatementWindow(content, lineNumber, radius = 10) {
+  const lines = content.split('\n');
+  const index = Math.max(0, (lineNumber || 1) - 1);
+  let start = index;
+  let end = index;
+
+  for (let scanIndex = index; scanIndex >= Math.max(0, index - radius); scanIndex -= 1) {
+    start = scanIndex;
+    if (scanIndex !== index && /;\s*$/.test(lines[scanIndex])) {
+      start = scanIndex + 1;
+      break;
+    }
+  }
+
+  for (let scanIndex = index; scanIndex < Math.min(lines.length, index + radius + 1); scanIndex += 1) {
+    end = scanIndex;
+    if (/;\s*$/.test(lines[scanIndex])) {
+      break;
+    }
+  }
+
+  return {
+    startLine: start + 1,
+    endLine: end + 1,
+    text: lines.slice(start, end + 1).join('\n')
+  };
+}
+
 function hasNearbyAccessibleLabel(content, lineNumber) {
   const window = getLineWindow(content, lineNumber, 3);
   return /<label\b|aria-label\s*=|aria-labelledby\s*=|for\s*=/.test(window);
@@ -3839,6 +3881,42 @@ function collectDeterministicFindings(context) {
         explanation: 'This is the classic per-row upsert shape: each field/item does its own SELECT-style lookup and then a write. In WordPress and WPFluent-style persistence paths, that turns one request into a 2N database pattern instead of one preload plus bounded writes.',
         verification: 'Count queries for the changed path with multiple mapped fields/items and confirm existing rows are loaded once before the loop.',
         fixDirection: 'Preload existing rows for the parent object in one query, index them in memory by key, update only existing records, and batch insert new records when the local model layer supports it.'
+      });
+    });
+
+    const groupedQueryLines = findAllLineNumbers(currentContent, /->groupBy\s*\(/g);
+    groupedQueryLines.forEach((lineNumber) => {
+      const statement = getPhpStatementWindow(currentContent, lineNumber, 12);
+      if (!changedLinesOverlapRange(changedLines, statement.startLine, statement.endLine)) {
+        return;
+      }
+
+      const groupedCollectionQuery = /(?:[A-Z][A-Za-z0-9_\\]*::query\s*\(\)|\$wpdb->get_results\s*\()[\s\S]{0,1200}->select\s*\([\s\S]{0,1200}->groupBy\s*\([\s\S]{0,1200}->(?:orderBy\s*\([\s\S]{0,500})?get\s*\(/m.test(statement.text);
+      const hasScopeOrBound = /->(?:where|whereIn|whereNotIn|whereRaw|limit|take|paginate|simplePaginate)\s*\(/.test(statement.text);
+      const surroundingFunction = getPhpEnclosingFunctionName(currentContent, lineNumber);
+      const likelySettingsLoad = /(settings|options|fields|config|form|feed)/i.test(surroundingFunction)
+        || /(settings|options|fields|config|form|feed)/i.test(filePath);
+      const surroundingContext = getLineWindow(currentContent, lineNumber, 30);
+      const hasCacheGuard = /\b(?:wp_cache_get|wp_cache_set|get_transient|set_transient|Cache::|remember\s*\()\b/.test(surroundingContext);
+
+      if (!groupedCollectionQuery || hasScopeOrBound || hasCacheGuard || !likelySettingsLoad) {
+        return;
+      }
+
+      pushFinding(findings, {
+        kind: 'product',
+        severity: 'important',
+        confidence: 'high',
+        category: 'hot-path-performance',
+        origin: 'direct-diff',
+        file: filePath,
+        line: lineNumber,
+        title: 'Unbounded grouped query can slow settings load',
+        evidence: 'The changed PHP settings/options path runs a grouped collection query with select/groupBy/orderBy/get but no visible scope, limit, or cache guard.',
+        impact: 'Large meta or activity tables can force repeated full-table aggregation during admin/settings rendering, making routine configuration screens slow under customer data volume.',
+        explanation: 'Grouped option discovery is useful, but it is expensive when it scans an entire persistence table every time a settings builder runs. Settings and feed configuration screens should not repeatedly execute uncached, unbounded aggregation queries.',
+        verification: 'Load the changed settings/options screen against a large table and inspect the query plan/count to confirm the aggregation is scoped, bounded, or cached.',
+        fixDirection: 'Add a narrow scope such as object_type, cap the result set, and cache the computed options with object cache or a transient so the aggregation is not repeated on every load.'
       });
     });
   }
@@ -7569,6 +7647,7 @@ function buildPrompt(payload) {
     'When drag/drop reorder logic adjusts target indexes after removing the source item, test adjacent forward moves explicitly so the immediate-next drop case does not collapse into a no-op.',
     'When a change touches persistence or validation contracts, trace save -> sanitize -> load -> render -> submit paths and look for values that can be accepted in the editor but later rejected or dropped.',
     'When PHP persistence code loops over fields/items/entries/meta and performs ORM/meta lookups such as query()->where()->first()/get()/find() plus save/create/insert/update inside the same loop, treat it as a likely N+1/per-row upsert bug unless the diff preloads and indexes existing rows first.',
+    'When settings/options builders query large persistence tables with select/groupBy/orderBy/get, check for a narrow scope, result limit, and cache guard; uncached full-table aggregation on admin settings load is a blocker-level performance regression.',
     'When a change introduces loops, mapping, sorting, filtering, repeated lookups, remote fetches, or DOM queries, estimate worst-case scaling on real data sizes instead of assuming the current diff is small.',
     'When a change adds keyboard handlers, hover-triggered UI, custom buttons, icon-only controls, or focus styling changes, check for keyboard parity, focus visibility, and accessible naming before approving.',
     'When unescaped markup insertion, HTML string composition, innerHTML, v-html, or translated/user-controlled output appears, trace the full trust boundary to the render sink before approving.',
