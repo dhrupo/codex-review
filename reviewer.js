@@ -2396,6 +2396,52 @@ function getLineWindow(content, lineNumber, radius = 2) {
   return lines.slice(start, end).join('\n');
 }
 
+function countPhpBlockBraces(line) {
+  const withoutQuotedStrings = String(line || '').replace(/(['"])(?:\\.|(?!\1).)*\1/g, '');
+  return {
+    open: (withoutQuotedStrings.match(/\{/g) || []).length,
+    close: (withoutQuotedStrings.match(/\}/g) || []).length
+  };
+}
+
+function extractPhpLoopBlocks(content) {
+  const lines = content.split('\n');
+  const loopBlocks = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    if (!/\b(?:foreach|for|while)\s*\(/.test(lines[index])) {
+      continue;
+    }
+
+    let braceBalance = 0;
+    let sawOpeningBrace = false;
+    let endIndex = index;
+
+    for (let scanIndex = index; scanIndex < Math.min(lines.length, index + 120); scanIndex += 1) {
+      const counts = countPhpBlockBraces(lines[scanIndex]);
+      braceBalance += counts.open - counts.close;
+      sawOpeningBrace = sawOpeningBrace || counts.open > 0;
+      endIndex = scanIndex;
+
+      if (sawOpeningBrace && braceBalance <= 0) {
+        break;
+      }
+    }
+
+    loopBlocks.push({
+      line: index + 1,
+      endLine: endIndex + 1,
+      body: lines.slice(index, endIndex + 1).join('\n')
+    });
+  }
+
+  return loopBlocks;
+}
+
+function changedLinesOverlapRange(changedLines, startLine, endLine) {
+  return changedLines.some((entry) => entry.line >= startLine && entry.line <= endLine);
+}
+
 function hasNearbyAccessibleLabel(content, lineNumber) {
   const window = getLineWindow(content, lineNumber, 3);
   return /<label\b|aria-label\s*=|aria-labelledby\s*=|for\s*=/.test(window);
@@ -3707,7 +3753,7 @@ function analyzeFile(context) {
 
 function collectDeterministicFindings(context) {
   const findings = [];
-  const { filePath, currentContent, changedLines } = context;
+  const { filePath, currentContent, changedLines = [] } = context;
 
   if (currentContent && /\.php$/i.test(filePath) && Array.isArray(changedLines) && changedLines.length) {
     const sensitiveKeys = /^(item_id|product_id|store_id|license_id|api_key|api_url|store_url|client_id|client_secret|webhook_secret|stripe_secret|webhook_url|gateway_id|app_id|merchant_id|tenant_id)$/i;
@@ -3750,7 +3796,54 @@ function collectDeterministicFindings(context) {
     }
   }
 
-  if (!currentContent || !/\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)) {
+  if (!currentContent) {
+    return findings;
+  }
+
+  if (filePath.endsWith('.php') && changedLines.length) {
+    const phpLoopBlocks = extractPhpLoopBlocks(currentContent);
+    const loopedOrmReadPattern = /(?:[A-Z][A-Za-z0-9_\\]*::query\s*\(\)|[A-Z][A-Za-z0-9_\\]*::where\s*\(|\$wpdb->(?:get_results|get_row|get_var|query)\s*\(|\b(?:get_post_meta|get_user_meta|get_term_meta|get_comment_meta|get_option)\s*\()[\s\S]{0,900}(?:->(?:first|get|find|value|pluck|count)\s*\(|\$wpdb->(?:get_results|get_row|get_var|query)\s*\()/m;
+    const loopedOrmWritePattern = /(?:->(?:save|create|insert|update|delete)\s*\(|::(?:create|insert|update|upsert)\s*\(|\b(?:update|add|delete)_(?:post|user|term|comment)_meta\s*\(|\bupdate_option\s*\()/m;
+    const loopedDataSourcePattern = /\$(?:fields?|items?|entries|submissions|products|orders|coupons|metas?|rows|records|feeds?|users?|forms?|payments?|transactions)\b/i;
+    const hotPathPattern = /(?:feed|integration|submission|payment|webhook|hook|controller|service|processor|scheduler|queue|render|checkout)/i;
+    const batchingHintPattern = /\b(?:whereIn|where_in|pluck|keyBy|groupBy|chunk|insertMany|batch|upsert)\b/i;
+
+    phpLoopBlocks.forEach((loopBlock) => {
+      if (!changedLinesOverlapRange(changedLines, loopBlock.line, loopBlock.endLine)) {
+        return;
+      }
+
+      if (!loopedOrmReadPattern.test(loopBlock.body) || !loopedOrmWritePattern.test(loopBlock.body)) {
+        return;
+      }
+
+      const likelyUnboundedLoop = loopedDataSourcePattern.test(loopBlock.body);
+      const likelyHotPath = hotPathPattern.test(filePath) || hotPathPattern.test(currentContent);
+      const hasBatchingHint = batchingHintPattern.test(loopBlock.body);
+
+      if (hasBatchingHint && !likelyHotPath) {
+        return;
+      }
+
+      pushFinding(findings, {
+        kind: 'product',
+        severity: likelyHotPath || likelyUnboundedLoop ? 'important' : 'medium',
+        confidence: likelyHotPath || likelyUnboundedLoop ? 'high' : 'medium',
+        category: 'hot-path-performance',
+        origin: 'direct-diff',
+        file: filePath,
+        line: loopBlock.line,
+        title: 'Per-row ORM/meta upsert inside loop can create N+1 queries',
+        evidence: 'The changed PHP loop performs an ORM/meta lookup and then saves, creates, inserts, or updates rows inside the same iteration.',
+        impact: 'Query count scales with mapped item count, so submission, feed, integration, or payment execution can become slow under real customer data sizes.',
+        explanation: 'This is the classic per-row upsert shape: each field/item does its own SELECT-style lookup and then a write. In WordPress and WPFluent-style persistence paths, that turns one request into a 2N database pattern instead of one preload plus bounded writes.',
+        verification: 'Count queries for the changed path with multiple mapped fields/items and confirm existing rows are loaded once before the loop.',
+        fixDirection: 'Preload existing rows for the parent object in one query, index them in memory by key, update only existing records, and batch insert new records when the local model layer supports it.'
+      });
+    });
+  }
+
+  if (!/\/Payments\/PaymentMethods\/.+\.php$/.test(filePath)) {
     return findings;
   }
 
@@ -7475,6 +7568,7 @@ function buildPrompt(payload) {
     'When drag/drop UI is added, inspect dragover and pointer-move hot paths for repeated full-list DOM queries or class resets that can cause interaction jank.',
     'When drag/drop reorder logic adjusts target indexes after removing the source item, test adjacent forward moves explicitly so the immediate-next drop case does not collapse into a no-op.',
     'When a change touches persistence or validation contracts, trace save -> sanitize -> load -> render -> submit paths and look for values that can be accepted in the editor but later rejected or dropped.',
+    'When PHP persistence code loops over fields/items/entries/meta and performs ORM/meta lookups such as query()->where()->first()/get()/find() plus save/create/insert/update inside the same loop, treat it as a likely N+1/per-row upsert bug unless the diff preloads and indexes existing rows first.',
     'When a change introduces loops, mapping, sorting, filtering, repeated lookups, remote fetches, or DOM queries, estimate worst-case scaling on real data sizes instead of assuming the current diff is small.',
     'When a change adds keyboard handlers, hover-triggered UI, custom buttons, icon-only controls, or focus styling changes, check for keyboard parity, focus visibility, and accessible naming before approving.',
     'When unescaped markup insertion, HTML string composition, innerHTML, v-html, or translated/user-controlled output appears, trace the full trust boundary to the render sink before approving.',
